@@ -42,10 +42,10 @@ To install EasyDist, you can use pip and install from PyPI:
 
 ```shell
 # For PyTorch users
-pip install easydist[torch]
+pip install pai-easydist[torch]
 
 # For Jax users
-pip install easydist[jax] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install pai-easydist[jax] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 
 If you prefer to install EasyDist from source, you can clone the GitHub repository and then install it with the appropriate extras:
