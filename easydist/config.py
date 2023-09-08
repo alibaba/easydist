@@ -39,6 +39,10 @@ all_to_all_punish_factor = 3.
 enable_graph_coarsen = os.environ.get("ENABLE_GRAPH_COARSEN", "True").upper() in ["1", "TRUE"]
 coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
 
+# PyTorch
+
+comm_optimization = False
+
 # runtime
 
 use_contiguous_buffer = False

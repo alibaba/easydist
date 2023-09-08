@@ -24,7 +24,9 @@ from .device_mesh import set_device_mesh, get_device_mesh
 from .sharding_interpreter import EDTorchShardingAnn
 from .spmd_prop_rule import *
 
-config.use_fake_tensor = False
+# disable with torch <= 2.0.1
+if hasattr(config, "use_fake_tensor"):
+    config.use_fake_tensor = False
 
 __all__ = [
     'EDTorchShardingAnn', 'sharding_transform', 'set_device_mesh', 'get_device_mesh',
