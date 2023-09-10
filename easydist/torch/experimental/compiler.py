@@ -41,7 +41,7 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    fix_embedding, fix_meta_device, sharding_transform)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.mem_anaylize import mem_anaylize
-from easydist.torch.passes.comm_optimize import comm_optimize
+from easydist.torch.passes import comm_optimize, rule_override_by_graph
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -253,6 +253,10 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     if mdconfig.comm_optimization is True:
         sharded_graph = comm_optimize(sharded_graph, opt_strategy)
+
+    # override pytorch dtensor propagate rules to optimize dispater behavior
+    if mdconfig.override_dtensor_rule is True:
+        sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()

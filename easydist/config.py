@@ -42,6 +42,7 @@ coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
 # PyTorch
 
 comm_optimization = False
+override_dtensor_rule = False
 
 # runtime
 

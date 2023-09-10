@@ -17,8 +17,10 @@ from .fix_bias import fix_addmm_bias, fix_convoluation_bias
 from .fix_meta_device import fix_meta_device
 from .eliminate_detach import eliminate_detach
 from .sharding import sharding_transform
+from .comm_optimize import comm_optimize
+from .rule_override import rule_override_by_graph
 
 __all__ = [
     "fix_embedding", "fix_addmm_bias", "fix_convoluation_bias", "eliminate_detach",
-    "sharding_transform", "fix_meta_device"
+    "sharding_transform", "fix_meta_device", "comm_optimize", "rule_override_by_graph"
 ]
