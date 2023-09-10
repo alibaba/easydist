@@ -66,8 +66,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule, opt_strategy=None, grouping=F
                             from_node = ppredecesor[0]
                             comm_node = predecesor
                             to_node = node
-                            comm_queue.add((from_node, comm_node, to_node))
-                            '''
+
                             # code needed to eliminate redundant comm node
                             if opt_strategy is not None and from_node.op == 'call_function':
                                 target_node = from_node
@@ -85,7 +84,6 @@ def comm_optimize(fx_module: torch.fx.GraphModule, opt_strategy=None, grouping=F
                                     to_node.replace_input_with(comm_node, from_node)
                                     continue
                             comm_queue.add((from_node, comm_node, to_node))
-                            '''
 
     # node just computed -> commnications followed
     comm_map = {}

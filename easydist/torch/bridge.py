@@ -133,6 +133,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
                 if compact_out_idx > 0:
                     outvars = [None] * compact_out_idx
             else:
+                compact_out_idx_tbl = [0]
                 meta_var = MetaVar(name=node.name,
                                    shape=meta_info[node.name]["shape"],
                                    dtype=ABSTRACT_DTYPE[meta_info[node.name]["dtype"]])

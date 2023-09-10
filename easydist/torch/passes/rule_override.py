@@ -16,6 +16,7 @@ import logging
 from typing import Dict, Tuple
 
 import torch
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed._tensor.api import DTensor
 from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
 from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate,
@@ -50,7 +51,7 @@ def _transform_to_Placemnet(varstrtg):
     return res
 
 
-def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, fwd_shape_info):
+def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_info):
 
     def operator_rule_factory(op_name, graph_rules):
 
@@ -62,6 +63,9 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, fwd_sh
             tot_kwargs = graph_rules[op_name][current_cnt]
 
             for kwargs in tot_kwargs:
+                if kwargs is None:
+                    dtensor_specs.append(None)
+                    continue
                 kwargs['mesh'] = mesh
                 dtensor_specs.append(DTensorSpec(**kwargs))
 
@@ -85,13 +89,12 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, fwd_sh
             op_name = _get_qualified_name(node.target)
 
             if node.name.__contains__('redist_tensor_func') \
-                    or node.name.__contains__('getitem') \
-                    or node.name.__contains__('native_layer_norm_backward'):
+                    or node.name.__contains__('getitem'):
                 continue
             strategy = opt_strategy[node.name]['strategy']
             output_spec_list = []
 
-            output_shapes = fwd_shape_info[node.name]
+            output_shapes = shape_info[node.name]
             if not isinstance(output_shapes, tuple):
                 if isinstance(output_shapes, list):
                     graph_output_struct[op_name] = 'list'
@@ -103,8 +106,13 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, fwd_sh
                 graph_output_struct[op_name] = 'tuple'
                 tot_info = output_shapes
 
+            tensor_args_idx = 0
+            assert len(strategy.out_strtg_group) == len(tot_info)
             for var_strtg, tensor_info in zip(strategy.out_strtg_group,
                                               tot_info):
+                if tensor_info == {} or var_strtg is None:
+                    output_spec_list.append(None)
+                    continue
                 spec = _transform_to_Placemnet(var_strtg.var_spmd_strategy)
                 shape = tensor_info['shape']
                 cur_kwargs = {
