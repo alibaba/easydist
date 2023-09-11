@@ -41,6 +41,7 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    fix_embedding, fix_meta_device, sharding_transform)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.mem_anaylize import mem_anaylize
+from easydist.torch.passes import comm_optimize, rule_override_by_graph
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -225,19 +226,22 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
         os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
         compiled_cache_file = os.path.join(mdconfig.compile_cache_dir, f"./{input_signature}.pkl")
 
-    if mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file):
+    args_strategy = None
+    find_cache = mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file)
+
+    if find_cache:
         logger.info(f"load compiled result from {compiled_cache_file}.")
         shape_info, sharding_strategy, opt_strategy, args_strategy = pickle.load(
             open(compiled_cache_file, "rb"))
-        # mem_anaylize(traced_graph, shape_info, opt_strategy)
-        sharded_graph = sharding_transform(traced_graph, sharding_strategy)
-        sharded_graph = fix_embedding(sharded_graph, recover=True)
     else:
         shape_info, meta_graph, opt_strategy, sharding_strategy = easydist_shard(
             traced_graph, state_tensor_num, params, buffers, named_states, args, kwargs)
-        # mem_anaylize(traced_graph, shape_info, opt_strategy)
-        sharded_graph = sharding_transform(traced_graph, sharding_strategy)
-        sharded_graph = fix_embedding(sharded_graph, recover=True)
+
+    # mem_anaylize(traced_graph, shape_info, opt_strategy)
+    sharded_graph = sharding_transform(traced_graph, sharding_strategy)
+    sharded_graph = fix_embedding(sharded_graph, recover=True)
+    
+    if args_strategy is None:
         args_strategy = meta_graph.get_input_strategy(opt_strategy)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
@@ -246,6 +250,16 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             pickle.dump([shape_info, sharding_strategy, opt_strategy, args_strategy],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
+
+    if mdconfig.comm_optimization is True:
+        sharded_graph = comm_optimize(sharded_graph, opt_strategy)
+
+    # override pytorch dtensor propagate rules to optimize dispater behavior
+    if mdconfig.override_dtensor_rule is True:
+        sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
+
+    if mdconfig.log_level <= logging.DEBUG:
+        sharded_graph.print_readable()
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()

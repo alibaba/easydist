@@ -566,6 +566,8 @@ class AutoFlowSolver:
                     opt_ = s_
             optimal_stratey[unique_key_] = {'node': node, 'strategy': opt_}
 
+        optimal_stratey = self.strategies_compact_output(optimal_stratey)
+
         if mdconfig.log_level <= logging.DEBUG:
             print("optimal_stratey:")
             pprint(optimal_stratey)
@@ -698,6 +700,21 @@ class AutoFlowSolver:
 
         return self.get_strategies()
 
+    def strategies_compact_output(self, optimal_strategies):
+
+        for node_name in optimal_strategies:
+            nstrtgy = optimal_strategies[node_name]
+            out_strategies_compact = []
+            for idx in nstrtgy['node'].compact_out_idx_tbl:
+                if idx < 0:
+                    out_strategies_compact.append(None)
+                else:
+                    out_strategies_compact.append(nstrtgy['strategy'].out_strtg_group[idx])
+            
+            nstrtgy['strategy'].out_strtg_group = VarSPMDStrategyGroup(*out_strategies_compact)
+
+        return optimal_strategies
+
     def get_strategies(self):
         optimal_strategies = {}
 
@@ -718,7 +735,7 @@ class AutoFlowSolver:
             print("optimal_strategies:")
             pprint(optimal_strategies)
 
-        return optimal_strategies
+        return self.strategies_compact_output(optimal_strategies)
 
     def beam_search(self, candidate_num=100):
 
