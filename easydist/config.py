@@ -37,11 +37,12 @@ max_seconds_same_incumbent = float('inf')
 all_to_all_punish_factor = 3.
 
 enable_graph_coarsen = os.environ.get("ENABLE_GRAPH_COARSEN", "True").upper() in ["1", "TRUE"]
-coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
+#coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
+coarsen_level = int(os.environ.get("COARSEN_LEVEL", "0"))
 
 # PyTorch
 
-comm_optimization = False
+comm_optimization = True
 override_dtensor_rule = False
 
 # runtime

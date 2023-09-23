@@ -31,8 +31,8 @@ class Foo(torch.nn.Module):
     def __init__(self, enable_checkpoint=False):
         super().__init__()
         self.enable_checkpoint = enable_checkpoint
-        self.norm = torch.nn.LayerNorm(5)
-        self.linear = torch.nn.Linear(5, 5)
+        self.norm = torch.nn.LayerNorm(1024)
+        self.linear = torch.nn.Linear(1024, 1024)
 
     def forward(self, x):
         x = self.norm(x)
@@ -109,7 +109,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
-        randn_input = torch.randn(16, 5)
+        randn_input = torch.randn(1024, 1024)
 
         # broadcast the parameter and input
         model = broadcast_module(model)
@@ -129,7 +129,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
 
     # need real input for compiled func
     if fake_init:
-        randn_input = torch.randn(3, 5).cuda()
+        randn_input = torch.randn(1024, 1024).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:

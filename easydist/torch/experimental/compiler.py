@@ -119,6 +119,10 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, *args, **k
     if mdconfig.log_level <= logging.DEBUG:
         rich.print(opt_strategy)
 
+    #g = passes.graph_drawer.FxGraphDrawer(sharded_fx_module, 'lol')
+    #with open("trial.svg", "wb") as f:
+    #    f.write(g.get_dot_graph().create_svg())
+
     sharding_strategies = get_torch_sharding_strategy(fx_module, opt_strategy)
 
     if mdconfig.log_level <= logging.DEBUG:
@@ -252,7 +256,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             logger.info(f"compiled result saved in {compiled_cache_file}.")
 
     if mdconfig.comm_optimization is True:
-        sharded_graph = comm_optimize(sharded_graph, opt_strategy)
+        sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
 
     # override pytorch dtensor propagate rules to optimize dispater behavior
     if mdconfig.override_dtensor_rule is True:

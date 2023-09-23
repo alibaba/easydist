@@ -29,10 +29,11 @@ def main():
     model_id = "stabilityai/stable-diffusion-2"
 
     # Use the Euler scheduler here instead
-    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
+    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler", cache_dir='/scratch/08694/hpccsg/.cache_lsj')
     pipe = StableDiffusionPipeline.from_pretrained(model_id,
                                                    scheduler=scheduler,
-                                                   torch_dtype=torch.float16)
+                                                   torch_dtype=torch.float16,
+                                                   cache_dir='/scratch/08694/hpccsg/.cache_lsj')
     pipe = pipe.to("cuda")
 
     @easydist_compile(use_hint=True)
@@ -43,6 +44,7 @@ def main():
     pipe.unet.forward = functools.partial(sharded_unet, copy.copy(pipe.unet))
 
     prompt = "a photo of Pride and Prejudice"
+    prompt = "a dog wearing subglasses surfing"
     image = pipe(prompt, width=1024, height=1024).images[0]
     image.save("pride_and_prejudice.png")
 
