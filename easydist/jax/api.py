@@ -196,9 +196,19 @@ def get_opt_strategy(func, *args, **kwargs):
 
     device_mesh = get_device_mesh()
     solver = AutoFlowSolver(device_mesh.device_ids.shape)
-    solver.add_graph(meta_graph)
+
+    if mdconfig.enable_graph_coarsen:
+        logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
+        solver.add_coarsen_graph(meta_graph)
+    else:
+        solver.add_graph(meta_graph)
+
     start_t = time.perf_counter()
-    opt_strategy = solver.ilp_optimize()
+    if mdconfig.enable_graph_coarsen:
+        opt_strategy = solver.ilp_solve()
+    else:
+        opt_strategy = solver.ilp_optimize()
+
     logger.info(f"[AutoFlowSolver.ilp_optimize]: {time.perf_counter() - start_t} s.")
     # start_t = time.perf_counter()
     # beam_search_strategy = solver.beam_search()
