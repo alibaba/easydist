@@ -41,6 +41,9 @@ def jax2md_bridge(jaxpr: jax.core.Jaxpr, sharding_info, meta_info) -> MetaGraph:
                              outvars=[meta_var],
                              sharding_info=node_sharding_info,
                              is_placeholder=True)
+        meta_node.compact_out_idx_tbl = [0]
+        meta_node.compact_in_idx_tbl = []
+
         meta_graph.add_node(meta_node)
         meta_graph.add_input(meta_node)
 
@@ -85,6 +88,18 @@ def jax2md_bridge(jaxpr: jax.core.Jaxpr, sharding_info, meta_info) -> MetaGraph:
                              ],
                              outvars=outvars_,
                              sharding_info=node_sharding_info)
+
+        meta_node.compact_out_idx_tbl = list(range(len(outvars_)))
+
+        compact_in_idx_tbl = []
+        compact_in_idx = 0
+        for var in eqn.invars:
+            if isinstance(var, jax.core.Var):
+                compact_in_idx_tbl.append(compact_in_idx)
+                compact_in_idx = compact_in_idx + 1
+            else:
+                compact_in_idx_tbl.append(-1)
+        meta_node.compact_in_idx_tbl = compact_in_idx_tbl
         meta_graph.add_node(meta_node)
 
     for var in jaxpr.outvars:
