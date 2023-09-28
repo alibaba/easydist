@@ -15,6 +15,7 @@
 import jax
 
 from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar
+import easydist.config as mdconfig
 
 
 def jax2md_bridge(jaxpr: jax.core.Jaxpr, sharding_info, meta_info) -> MetaGraph:
@@ -104,5 +105,7 @@ def jax2md_bridge(jaxpr: jax.core.Jaxpr, sharding_info, meta_info) -> MetaGraph:
 
     for var in jaxpr.outvars:
         meta_graph.add_output(meta_var_map[var.__str__()])
+
+    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level)
 
     return meta_graph

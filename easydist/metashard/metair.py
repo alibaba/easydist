@@ -910,3 +910,4 @@ class MetaGraph:
                      SPMD(SPMD.REPLICATE)])
 
         return partial_strategy_list
+
