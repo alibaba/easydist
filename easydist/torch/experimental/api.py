@@ -37,7 +37,8 @@ class CompiledFuncWrapper:
                  func,
                  tracing_mode="fake",
                  cuda_graph=True,
-                 enable_mono_graph=False) -> None:
+                 enable_mono_graph=False,
+                 compile_only=False) -> None:
         update_wrapper(self, func)
         self.original_func = func
 
@@ -45,6 +46,7 @@ class CompiledFuncWrapper:
         self.tracing_mode = tracing_mode
         self.enable_cuda_graph = cuda_graph
         self.enable_mono_graph = enable_mono_graph
+        self.compile_only = compile_only
 
         self.init_helper = SetParaInitHelper()
 
@@ -99,6 +101,8 @@ class CompiledFuncWrapper:
             self.graph_list[input_signature] = self.compiled_func.graph
             # release the cpu module when finised pre-shard in _compiler
             self.init_helper = None
+        if self.compile_only:
+            return self.compiled_func
 
         def run_func(*args, **kwargs):
             if self.compiled_func:
@@ -175,17 +179,18 @@ def easydist_compile(func=None,
                      enable_mono_graph=False,
                      use_hint=False,
                      liveness_only_input=False,
-                     max_solver_time=float("inf")):
+                     max_solver_time=float("inf"),
+                     compile_only=False):
 
     mdconfig.use_hint = use_hint
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
     if func:
-        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph)
+        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph)
+            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
 
         return wrapper
