@@ -698,7 +698,11 @@ class AutoFlowSolver:
         logger.info(f'[AutoFlowSolver.status]:\t {status}')
         logger.info(f'[AutoFlowSolver.solution_cost]:\t {self.m.objective_value}')
 
-        return self.get_strategies()
+        graph_strategy = self.get_strategies()
+        total_comm_cost = self.calc_graph_comm_cost(graph_strategy)
+        logger.info(f'[Communication Cost]:\t {total_comm_cost}')
+
+        return self.strategies_compact_output(graph_strategy)
 
     def strategies_compact_output(self, optimal_strategies):
 
@@ -735,7 +739,34 @@ class AutoFlowSolver:
             print("optimal_strategies:")
             pprint(optimal_strategies)
 
-        return self.strategies_compact_output(optimal_strategies)
+        return optimal_strategies
+
+    def calc_graph_comm_cost(self, graph_strategy):
+        total_comm_cost = 0
+        default_strtg = [SPMD(SPMD.REPLICATE) for _ in range(len(self.device_mesh))]
+        for node in self.graph.op_list:
+            for in_idx, in_var in enumerate(node.invars):
+                if in_var.up_node.unique_key() in graph_strategy:
+                    up_node_strtg = graph_strategy[in_var.up_node.unique_key()]['strategy']
+                    var_up_strtg = up_node_strtg.get_outvar_strtg(in_var.idx_for_up)
+                else:
+                    var_up_strtg = VarSPMDStrategy(*default_strtg)
+
+                if node.unique_key() in graph_strategy:
+                    node_strtg = graph_strategy[node.unique_key()]['strategy']
+                    var_down_strtg = node_strtg.get_invar_strtg(in_idx)
+                else:
+                    var_down_strtg = VarSPMDStrategy(*default_strtg)
+
+                comm_cost = calculate_resharding_cost(in_var, var_up_strtg, var_down_strtg,
+                                                      self.device_mesh)
+
+                total_comm_cost += comm_cost
+                if mdconfig.log_level <= logging.DEBUG:
+                    if comm_cost > 0:
+                        print(("cost between {} and {} is {}").format(in_var.up_node.name, node.name, comm_cost))
+
+        return total_comm_cost
 
     def beam_search(self, candidate_num=100):
 
