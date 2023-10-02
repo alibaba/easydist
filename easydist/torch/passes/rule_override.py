@@ -110,7 +110,7 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
     #    'mul',
     #    'div',
     #    'exp',
-    #    'slice',
+    #    'group_norm',
     #    'permute'
     ]
     for node in fx_module.graph.nodes:

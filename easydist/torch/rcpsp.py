@@ -50,11 +50,6 @@ def RCPSP(jobs_data, dependencies):
         model.AddNoOverlap(machine_to_intervals[machine])
 
     # Precedences inside a job.
-    #for job_id, job in enumerate(jobs_data):
-    #    for task_id in range(len(job) - 1):
-    #        model.Add(
-    #            all_tasks[job_id, task_id + 1].start >= all_tasks[job_id, task_id].end
-    #        )
     for (pre_job_id, pre_task_id), (suc_job_id, suc_task_id) in dependencies:
         model.Add(all_tasks[pre_job_id, pre_task_id].end <= 
                   all_tasks[suc_job_id, suc_task_id].start)
@@ -72,7 +67,6 @@ def RCPSP(jobs_data, dependencies):
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        #print("Solution:")
         # Create one list of assigned tasks per machine.
         assigned_jobs = collections.defaultdict(list)
         for job_id, job in enumerate(jobs_data):
@@ -87,7 +81,6 @@ def RCPSP(jobs_data, dependencies):
                     )
                 )
 
-        #print(assigned_jobs)
         '''
         # Create per machine output lines.
         output = ""
@@ -120,12 +113,6 @@ def RCPSP(jobs_data, dependencies):
         print("No solution found.")
     '''
 
-    # Statistics.
-    print("\nStatistics")
-    print(f"  - conflicts: {solver.NumConflicts()}")
-    print(f"  - branches : {solver.NumBranches()}")
-    print(f"  - wall time: {solver.WallTime()}s")
-
     assigned_jobs[all_machines[0]].sort()
     assigned_jobs[all_machines[1]].sort()
     idx_0 = 0
@@ -134,17 +121,17 @@ def RCPSP(jobs_data, dependencies):
 
     while idx_0 < len(assigned_jobs[0]) and idx_1 < len(assigned_jobs[1]):
         if assigned_jobs[0][idx_0].start <= assigned_jobs[1][idx_1].start:
-            schedule.append(('comm', assigned_jobs[0][idx_0].job))
+            schedule.append((0, assigned_jobs[0][idx_0].job))
             idx_0 += 1
         else:
-            schedule.append(('comp', assigned_jobs[1][idx_1].job))
+            schedule.append((1, assigned_jobs[1][idx_1].job))
             idx_1 += 1
 
     if idx_0 < len(assigned_jobs[0]):
         for j in assigned_jobs[0][idx_0:]:
-            schedule.append(('comm', j.job))
+            schedule.append((0, j.job))
     else:
         for j in assigned_jobs[1][idx_1:]:
-            schedule.append(('comp', j.job))
+            schedule.append((1, j.job))
 
     return schedule
