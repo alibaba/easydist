@@ -1,4 +1,3 @@
-# mpirun -np 2 python ./examples/jax/simple_function.py
 
 import logging
 
