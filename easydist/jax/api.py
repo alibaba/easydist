@@ -287,29 +287,37 @@ def _compile(func, args, kwargs):
 
 class CompiledFuncWrapper:
 
-    def __init__(self, func) -> None:
+    def __init__(self,
+                 func,
+                 compile_only=False) -> None:
         self.original_func = func
         self.compiled_func = None
+        self.compile_only = compile_only
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.compiled_func is None:
-
             self.compiled_func = _compile(self.original_func, args, kwargs)
+
+        if self.compile_only:
+            return self.compiled_func
 
         return self.compiled_func(*args, **kwargs)
 
 
-def easydist_compile(func=None, max_solver_time=float("inf"), liveness_only_input=False):
+def easydist_compile(func=None,
+                     max_solver_time=float("inf"),
+                     liveness_only_input=False,
+                     compile_only=False):
 
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
     if func:
-        return CompiledFuncWrapper(func)
+        return CompiledFuncWrapper(func, compile_only)
 
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func)
+            return CompiledFuncWrapper(func, compile_only)
 
         return wrapper
