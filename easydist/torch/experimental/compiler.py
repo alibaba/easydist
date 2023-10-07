@@ -69,7 +69,7 @@ def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     return fx_module
 
 
-def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, *args, **kwargs):
+def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_signature, *args, **kwargs):
     # only called by rank 0
     if mdconfig.enable_compile_cache:
         os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
@@ -246,7 +246,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     global sharding_solution
     if rank == 0:
         shape_info, opt_strategy, sharding_strategy, args_strategy = easydist_shard(
-            traced_graph, state_tensor_num, params, buffers, named_states, args, kwargs)
+            traced_graph, state_tensor_num, input_signature, params, buffers, named_states, args, kwargs)
         sharding_solution = [shape_info, opt_strategy, sharding_strategy, args_strategy]
         rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
     else:
