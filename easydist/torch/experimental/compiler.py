@@ -241,8 +241,6 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
 
-    traced_graph = preprocess_traced_graph(traced_graph)
-
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     global sharding_solution
@@ -346,51 +344,51 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
-    @torch.no_grad()
-    def compiled_func_return(graph, *args, **kwargs):
-        nonlocal params, buffers, named_states
-
-        # tensor to DTensor
-        # (TODO) the redistributed of params, buffers, named_states should in graph
-        flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
-
-        device = mdconfig.easydist_device
-        materialize_fn = partial(materialize_zero, materialization_device=device)
-
-        args_strategy_idx = state_tensor_num
-        for i in range(len(flatten_args)):
-            if isinstance(flatten_args[i], torch.Tensor):
-                flatten_args[i] = sharded_tensor(flatten_args[i],
-                                                 args_strategy[args_strategy_idx],
-                                                 get_device_mesh(),
-                                                 materialize_fn=materialize_fn)
-                args_strategy_idx += 1
-
-        args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
-
-        # run the sharded_graph
-        params, buffers, named_states, grads, sharded_out = graph(params, buffers, named_states,
-                                                                  args, kwargs)
-
-        for para_name in params:
-            params[para_name].grad = grads[para_name]
-
-        # out from DTensor to Tensor
-        local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-
-        return local_out
 
     class EDCompiledFunc:
 
-        def __init__(self, func, graph) -> None:
-            self.func = func
+        def __init__(self, graph) -> None:
             self.graph = graph
 
+        @torch.no_grad()
+        def compiled_func(self, graph, *args, **kwargs):
+            nonlocal params, buffers, named_states
+
+            # tensor to DTensor
+            # (TODO) the redistributed of params, buffers, named_states should in graph
+            flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
+
+            device = mdconfig.easydist_device
+            materialize_fn = partial(materialize_zero, materialization_device=device)
+
+            args_strategy_idx = state_tensor_num
+            for i in range(len(flatten_args)):
+                if isinstance(flatten_args[i], torch.Tensor):
+                    flatten_args[i] = sharded_tensor(flatten_args[i],
+                                                     args_strategy[args_strategy_idx],
+                                                     get_device_mesh(),
+                                                     materialize_fn=materialize_fn)
+                    args_strategy_idx += 1
+
+            args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
+
+            # run the sharded_graph
+            params, buffers, named_states, grads, sharded_out = graph(params, buffers, named_states,
+                                                                      args, kwargs)
+
+            for para_name in params:
+                params[para_name].grad = grads[para_name]
+
+            # out from DTensor to Tensor
+            local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
+
+            return local_out
+
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            return self.func(self.graph, *args, **kwargs)
+            return self.compiled_func(self.graph, *args, **kwargs)
 
         def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
-            return self.func(graph, *args, **kwargs)
+            return self.compiled_func(graph, *args, **kwargs)
 
         def get_state(self):
             return params, buffers, named_states
@@ -427,4 +425,4 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     if module is not None:
         module.to("meta")
 
-    return EDCompiledFunc(compiled_func_return, sharded_graph)
+    return EDCompiledFunc(sharded_graph)
