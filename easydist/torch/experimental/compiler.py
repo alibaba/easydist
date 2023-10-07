@@ -24,6 +24,7 @@ import numpy
 import rich
 import torch
 import torch.utils._pytree as pytree
+import torch.distributed.rpc as rpc
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribute_tensor)
 from torch.fx._pytree import tree_flatten_spec
@@ -53,6 +54,7 @@ import sys
 sys.setrecursionlimit(100000)
 
 logger = logging.getLogger(__name__)
+sharding_solution = []
 
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
@@ -68,63 +70,76 @@ def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
 
 
 def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, *args, **kwargs):
+    # only called by rank 0
+    if mdconfig.enable_compile_cache:
+        os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
+        compiled_cache_file = os.path.join(mdconfig.compile_cache_dir, f"./{input_signature}.pkl")
 
-    # (1) preprocess pass
-    fx_module = preprocess_traced_graph(fx_module)
+    find_cache = mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        fx_module.print_readable()
-
-    # (2) sharding annotation
-    with _sharding_ann_env():
-        start_t = time.perf_counter()
-        sharding_interpreter = EDTorchShardingAnn(fx_module)
-        flatten_args = tree_flatten_spec(list(args) + list(kwargs.values()), fx_module._in_spec)
-        sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
-        logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+    if find_cache:
+        logger.info(f"load compiled result from {compiled_cache_file}.")
+        shape_info, opt_strategy, sharding_strategy, args_strategy = pickle.load(
+            open(compiled_cache_file, "rb"))
+    else:
         if mdconfig.log_level <= logging.DEBUG:
-            rich.print("sharding_info:\n", sharding_info)
-            rich.print("shape_info:\n", shape_info)
+            fx_module.print_readable()
 
-    # sync sharding info for all process
-    torch.distributed.broadcast_object_list(sharding_info, src=0, device="cuda")
+        # (1) sharding annotation
+        with _sharding_ann_env():
+            start_t = time.perf_counter()
+            sharding_interpreter = EDTorchShardingAnn(fx_module)
+            flatten_args = tree_flatten_spec(list(args) + list(kwargs.values()), fx_module._in_spec)
+            sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
+            logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+            if mdconfig.log_level <= logging.DEBUG:
+                rich.print("sharding_info:\n", sharding_info)
+                rich.print("shape_info:\n", shape_info)
 
-    # (3) translate fx.GraphModule into MetaGraph
-    meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)
-    meta_graph.dump()
+        # (2) translate fx.GraphModule into MetaGraph
+        meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(meta_graph)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(meta_graph)
 
-    # (4) construct AutoFlowSolver and run ILP
-    device_mesh = get_device_mesh()
-    device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
+        # (3) construct AutoFlowSolver and run ILP
+        device_mesh = get_device_mesh()
+        device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
 
-    total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-    solver = AutoFlowSolver(device_mesh_shape, total_memery=total_memery)
+        total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        solver = AutoFlowSolver(device_mesh_shape, total_memery=total_memery)
 
-    if mdconfig.enable_graph_coarsen:
-        logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
-        solver.add_coarsen_graph(meta_graph)
-    else:
-        solver.add_graph(meta_graph)
+        if mdconfig.enable_graph_coarsen:
+            logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
+            solver.add_coarsen_graph(meta_graph)
+        else:
+            solver.add_graph(meta_graph)
 
-    start_t = time.perf_counter()
-    if mdconfig.enable_graph_coarsen:
-        opt_strategy = solver.ilp_solve()
-    else:
-        opt_strategy = solver.ilp_optimize()
-    logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
+        start_t = time.perf_counter()
+        if mdconfig.enable_graph_coarsen:
+            opt_strategy = solver.ilp_solve()
+        else:
+            opt_strategy = solver.ilp_optimize()
+        logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(opt_strategy)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(opt_strategy)
 
-    sharding_strategies = get_torch_sharding_strategy(fx_module, opt_strategy)
+        sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(sharding_strategies)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(sharding_strategy)
 
-    return shape_info, meta_graph, opt_strategy, sharding_strategies
+        args_strategy = meta_graph.get_input_strategy(opt_strategy)
+        args_strategy = [[to_torch_spmd(i) for i in var_strategy]
+                         for var_strategy in args_strategy]
+
+        if mdconfig.enable_compile_cache:
+            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy],
+                        open(compiled_cache_file, "wb"))
+            logger.info(f"compiled result saved in {compiled_cache_file}.")
+
+    return shape_info, opt_strategy, sharding_strategy, args_strategy
 
 
 @torch.no_grad()
@@ -149,8 +164,12 @@ def dtensor_to_tensor(leaf):
     return leaf
 
 
-def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
+def fetch_strategy():
+    global sharding_solution
+    return sharding_solution
 
+
+def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -222,35 +241,26 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
 
-    if mdconfig.enable_compile_cache:
-        os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
-        compiled_cache_file = os.path.join(mdconfig.compile_cache_dir, f"./{input_signature}.pkl")
+    traced_graph = preprocess_traced_graph(traced_graph)
 
-    args_strategy = None
-    find_cache = mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file)
-
-    if find_cache:
-        logger.info(f"load compiled result from {compiled_cache_file}.")
-        shape_info, sharding_strategy, opt_strategy, args_strategy = pickle.load(
-            open(compiled_cache_file, "rb"))
-    else:
-        shape_info, meta_graph, opt_strategy, sharding_strategy = easydist_shard(
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    global sharding_solution
+    if rank == 0:
+        shape_info, opt_strategy, sharding_strategy, args_strategy = easydist_shard(
             traced_graph, state_tensor_num, params, buffers, named_states, args, kwargs)
+        sharding_solution = [shape_info, opt_strategy, sharding_strategy, args_strategy]
+        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+    else:
+        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+        shape_info, opt_strategy, sharding_strategy, args_strategy = rpc.rpc_sync("ed_worker0", fetch_strategy, args=())
+
+    rpc.shutdown()
 
     # mem_anaylize(traced_graph, shape_info, opt_strategy)
     sharded_graph = sharding_transform(traced_graph, sharding_strategy)
     sharded_graph = fix_embedding(sharded_graph, recover=True)
     
-    if args_strategy is None:
-        args_strategy = meta_graph.get_input_strategy(opt_strategy)
-        args_strategy = [[to_torch_spmd(i) for i in var_strategy]
-                         for var_strategy in args_strategy]
-
-        if mdconfig.enable_compile_cache and torch.distributed.get_rank() == 0:
-            pickle.dump([shape_info, sharding_strategy, opt_strategy, args_strategy],
-                        open(compiled_cache_file, "wb"))
-            logger.info(f"compiled result saved in {compiled_cache_file}.")
-
     if mdconfig.comm_optimization is True:
         sharded_graph = comm_optimize(sharded_graph, opt_strategy)
 
@@ -265,7 +275,6 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     device_mesh = get_device_mesh()
     if isinstance(device_mesh, TorchMockDeviceMesh):
         if device_mesh.debug_only:
-            world_size = torch.distributed.get_world_size()
             mesh_shape = numpy.array(range(world_size)).reshape(1, -1).tolist()
         else:
             mesh_shape = device_mesh.shape
