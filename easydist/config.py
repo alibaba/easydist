@@ -15,6 +15,13 @@
 import os
 import logging
 
+def _get_env_or_raise(env_var: str) -> str:
+    env_val = os.environ.get(env_var, None)
+    if not env_val:
+        raise ValueError("environment variable {env_var} expected, but not set")
+    else:
+        return env_val
+
 log_level_str = os.environ.get("EASYDIST_LOGLEVEL", 'INFO').upper()
 log_level = logging.getLevelName(log_level_str)
 
@@ -38,6 +45,10 @@ all_to_all_punish_factor = 3.
 
 enable_graph_coarsen = os.environ.get("ENABLE_GRAPH_COARSEN", "True").upper() in ["1", "TRUE"]
 coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
+
+# Master address and port
+master_addr = os.environ.get("MASTER_ADDR", "localhost")
+master_port = int(_get_env_or_raise("MASTER_PORT"))
 
 # PyTorch
 
