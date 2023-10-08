@@ -16,6 +16,7 @@ import logging
 import os
 import pickle
 import time
+import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
@@ -54,7 +55,9 @@ import sys
 sys.setrecursionlimit(100000)
 
 logger = logging.getLogger(__name__)
-sharding_solution = []
+
+sharding_sol = None
+sol_rdy_cond = threading.Condition()
 
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
@@ -165,8 +168,11 @@ def dtensor_to_tensor(leaf):
 
 
 def fetch_strategy():
-    global sharding_solution
-    return sharding_solution
+    with sol_rdy_cond:
+        if sharding_sol is None:
+            sol_rdy_cond.wait()
+
+    return sharding_sol
 
 
 def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
@@ -243,15 +249,21 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    global sharding_solution
+
+    # Lansong(TODO) Currently send strategy by rpc. But broadcast way is more efficient.
+    rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
     if rank == 0:
         shape_info, opt_strategy, sharding_strategy, args_strategy = easydist_shard(
-            traced_graph, state_tensor_num, input_signature, params, buffers, named_states, args, kwargs)
-        sharding_solution = [shape_info, opt_strategy, sharding_strategy, args_strategy]
-        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+                                traced_graph, state_tensor_num, input_signature,
+                                params, buffers, named_states, args, kwargs)
+
+        with sol_rdy_cond:
+            global sharding_sol
+            sharding_sol = [shape_info, opt_strategy, sharding_strategy, args_strategy]
+            sol_rdy_cond.notify_all()
     else:
-        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
-        shape_info, opt_strategy, sharding_strategy, args_strategy = rpc.rpc_sync("ed_worker0", fetch_strategy, args=())
+        shape_info, opt_strategy, sharding_strategy, args_strategy = rpc.rpc_sync(
+                              "ed_worker0", fetch_strategy, args=(), timeout=0)
 
     rpc.shutdown()
 
