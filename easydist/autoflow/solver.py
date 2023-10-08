@@ -251,7 +251,6 @@ class AutoFlowSolver:
             mip_info = ClusterMipInfo(cluster, cluster_strtg_pool, mip_vars)
             self.clusters[cluster_id] = mip_info
 
-            # Lansong 2do
             # add edges from user side
             for input_node, input_idx in cluster.args.descs:
                 if input_node.op_name == "placeholder" or input_node.op_name == "get_attr":
