@@ -24,6 +24,7 @@ from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate,
 from torch.fx.node import _get_qualified_name
 
 from easydist.torch.device_mesh import get_device_mesh
+from easydist.torch.utils import get_dtensor_spec
 
 # used to select proper output for the same function
 # [CAUTION] only support single static graph
@@ -48,7 +49,7 @@ def _transform_to_Placemnet(varstrtg):
             res.append(_Partial(eval('c10d.' + strtg.args['ops'].__str__())))
         else:
             RuntimeError('Rule_override: strtg not recognized')
-    return res
+    return tuple(res)
 
 
 def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_info):
@@ -67,7 +68,7 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
                     dtensor_specs.append(None)
                     continue
                 kwargs['mesh'] = mesh
-                dtensor_specs.append(DTensorSpec(**kwargs))
+                dtensor_specs.append(get_dtensor_spec(**kwargs))
 
             struct = graph_output_struct[op_name]
             if struct == 'elem':

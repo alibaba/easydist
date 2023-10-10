@@ -240,7 +240,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     # mem_anaylize(traced_graph, shape_info, opt_strategy)
     sharded_graph = sharding_transform(traced_graph, sharding_strategy)
     sharded_graph = fix_embedding(sharded_graph, recover=True)
-    
+
     if args_strategy is None:
         args_strategy = meta_graph.get_input_strategy(opt_strategy)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
@@ -351,7 +351,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
         args_strategy_idx = state_tensor_num
         for i in range(len(flatten_args)):
             if isinstance(flatten_args[i], torch.Tensor):
-                flatten_args[i] = sharded_tensor(flatten_args[i],
+                flatten_args[i] = sharded_tensor(flatten_args[i].detach(),
                                                  args_strategy[args_strategy_idx],
                                                  get_device_mesh(),
                                                  materialize_fn=materialize_fn)
