@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import importlib
 from functools import update_wrapper
 from typing import Any
 
@@ -111,7 +112,16 @@ class CompiledFuncWrapper:
                             "Input mismatch. If you are sure that different inputs do not change the graph, "
                             "you can try turning on the enable_mono_graph option.")
                 graph = self.graph_list[input_signature]
-                return self.compiled_func.run_with_graph(graph, *args, **kwargs)
+                output = self.compiled_func.run_with_graph(graph, *args, **kwargs)
+                if importlib.util.find_spec("torch.distributed._functional_collectives"):
+                    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+                    # wait and unwrap AsyncCollectiveTensor
+                    def wait_unwarp_fn(async_coll_tensor_):
+                        async_coll_tensor_.trigger_wait()
+                        return async_coll_tensor_.elem
+                    return pytree.tree_map_only(AsyncCollectiveTensor, wait_unwarp_fn,output)
+                else:
+                    return output
             else:
                 return self.original_func(*args, **kwargs)
 

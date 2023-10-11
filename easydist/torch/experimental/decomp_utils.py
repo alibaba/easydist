@@ -8,6 +8,7 @@ from torch._decomp.decompositions import mse_loss, mse_loss_backward
 
 aten = torch.ops.aten  # pyre-ignore
 
+
 # from torch/distributed/_spmd/api.py
 def _fused_adam_decomp(
     self,
@@ -76,6 +77,13 @@ def _foreach_binop_list_decomp(op, self, other):
 
 
 # from torch/distributed/_spmd/api.py
+def _foreach_triop_scalar_decomp(op, self, other, scalar):
+    self_updated = op(self, other, scalar)
+    for s, s_u in zip(self, self_updated):
+        s.copy_(s_u)
+
+
+# from torch/distributed/_spmd/api.py
 def _foreach_binop_scalar_decomp(op, self, scalar=1):
     self_updated = op(self, scalar)
     for s, s_u in zip(self, self_updated):
@@ -107,12 +115,21 @@ EASYDIST_DECOMP_TABLE = {
     aten._foreach_addcmul_.Scalar: partial(_foreach_addcop_scalar_decomp,
                                            aten._foreach_addcmul.Scalar),
     aten._foreach_div_.List: partial(_foreach_binop_list_decomp, aten._foreach_div.List),
-    aten._foreach_mul_.Scalar: partial(_foreach_binop_scalar_decomp, aten._foreach_mul.Scalar),
+    aten._foreach_mul_.Scalar: partial(_foreach_binop_list_decomp, aten._foreach_mul.Scalar),
+    aten._foreach_div_.Scalar: partial(_foreach_binop_scalar_decomp, aten._foreach_div.Scalar),
     aten._foreach_neg_.default: partial(_foreach_unaop_decomp, aten._foreach_neg.default),
+    aten._foreach_lerp_.Scalar: partial(_foreach_triop_scalar_decomp, aten._foreach_lerp.Scalar),
     aten._foreach_reciprocal_.default: partial(_foreach_unaop_decomp,
                                                aten._foreach_reciprocal.default),
+    aten._foreach_sqrt_.default: partial(_foreach_unaop_decomp, aten._foreach_sqrt.default),
     aten._foreach_sub_.Scalar: partial(_foreach_binop_scalar_decomp, aten._foreach_sub.Scalar),
     aten._fused_adam_.default: _fused_adam_decomp,
     aten.mse_loss.default: mse_loss,
     aten.mse_loss_backward.default: mse_loss_backward,
 }
+
+try:
+    from torch._inductor.decomposition import _foreach_lerp_scalar
+    EASYDIST_DECOMP_TABLE.update({aten._foreach_lerp.Scalar: _foreach_lerp_scalar})
+except:
+    pass
