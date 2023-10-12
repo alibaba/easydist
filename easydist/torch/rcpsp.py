@@ -2,18 +2,18 @@
 import collections
 from ortools.sat.python import cp_model
 
+MODE_COMM = 0
+MODE_COMP = 1
 
+'''
+jobs_data = [task = (machine_id, processing_time),]
+dependencies = [dependency = ((job_id, task_id), (job_id, task_id)),]
+'''
 def RCPSP(jobs_data, dependencies):
-    """Minimal jobshop problem."""
-    # Data.
-    #jobs_data = [  # task = (machine_id, processing_time).
-    #    [(0, 3), (1, 2), (2, 2)],  # Job0
-    #    [(0, 2), (2, 1), (1, 4)],  # Job1
-    #    [(1, 4), (2, 3)],  # Job2
-    #]
-
+    
     machines_count = 1 + max(task[0] for job in jobs_data for task in job)
     all_machines = range(machines_count)
+    
     # Computes horizon dynamically as the sum of all durations.
     horizon = sum(task[1] for job in jobs_data for task in job)
 
@@ -22,6 +22,7 @@ def RCPSP(jobs_data, dependencies):
 
     # Named tuple to store information about created variables.
     task_type = collections.namedtuple("task_type", "start end interval")
+    
     # Named tuple to manipulate solution information.
     assigned_task_type = collections.namedtuple(
         "assigned_task_type", "start job index duration"
@@ -81,57 +82,26 @@ def RCPSP(jobs_data, dependencies):
                     )
                 )
 
-        '''
-        # Create per machine output lines.
-        output = ""
-        for machine in all_machines:
-            # Sort by starting time.
-            assigned_jobs[machine].sort()
-            sol_line_tasks = "Machine " + str(machine) + ": "
-            sol_line = "           "
-
-            for assigned_task in assigned_jobs[machine]:
-                name = f"job_{assigned_task.job}_task_{assigned_task.index}"
-                # Add spaces to output to align columns.
-                sol_line_tasks += f"{name:15}"
-
-                start = assigned_task.start
-                duration = assigned_task.duration
-                sol_tmp = f"[{start},{start + duration}]"
-                # Add spaces to output to align columns.
-                sol_line += f"{sol_tmp:15}"
-
-            sol_line += "\n"
-            sol_line_tasks += "\n"
-            output += sol_line_tasks
-            output += sol_line
-
-        # Finally print the solution found.
-        print(f"Optimal Schedule Length: {solver.ObjectiveValue()}")
-        print(output)
-    else:
-        print("No solution found.")
-    '''
-
-    assigned_jobs[all_machines[0]].sort()
-    assigned_jobs[all_machines[1]].sort()
+    assigned_jobs[all_machines[MODE_COMM]].sort()
+    assigned_jobs[all_machines[MODE_COMP]].sort()
     idx_0 = 0
     idx_1 = 0
     schedule = []
 
-    while idx_0 < len(assigned_jobs[0]) and idx_1 < len(assigned_jobs[1]):
-        if assigned_jobs[0][idx_0].start <= assigned_jobs[1][idx_1].start:
-            schedule.append((0, assigned_jobs[0][idx_0].job))
+    while idx_0 < len(assigned_jobs[MODE_COMM]) and \
+        idx_1 < len(assigned_jobs[MODE_COMP]):
+        if assigned_jobs[MODE_COMM][idx_0].start <= assigned_jobs[MODE_COMP][idx_1].start:
+            schedule.append((MODE_COMM, assigned_jobs[MODE_COMM][idx_0].job))
             idx_0 += 1
         else:
-            schedule.append((1, assigned_jobs[1][idx_1].job))
+            schedule.append((MODE_COMP, assigned_jobs[MODE_COMP][idx_1].job))
             idx_1 += 1
 
-    if idx_0 < len(assigned_jobs[0]):
-        for j in assigned_jobs[0][idx_0:]:
-            schedule.append((0, j.job))
+    if idx_0 < len(assigned_jobs[MODE_COMM]):
+        for j in assigned_jobs[MODE_COMM][idx_0:]:
+            schedule.append((MODE_COMM, j.job))
     else:
-        for j in assigned_jobs[1][idx_1:]:
-            schedule.append((1, j.job))
+        for j in assigned_jobs[MODE_COMP][idx_1:]:
+            schedule.append((MODE_COMP, j.job))
 
     return schedule

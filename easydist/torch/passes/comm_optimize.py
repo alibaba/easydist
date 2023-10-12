@@ -15,7 +15,6 @@
 import logging
 import operator
 import time
-import random
 
 from functools import reduce
 
@@ -27,9 +26,15 @@ from torch.fx.node import _get_qualified_name
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.rcpsp import RCPSP
 from easydist.torch.graph_profile import HyperPerfMeasure
+import easydist.torch.rcpsp as rcpsp
+import easydist.config as mdconfig
 
 logger = logging.getLogger(__name__)
 
+'''
+currently get maximum bandwidth through 
+communicating a large tensor(4096 * 1024 * 16)
+'''
 def bandwidth_profile():
     iter_time = 10
     comm_v = iter_time * 2 * 4096 * 1024 * 16 * 4.0
@@ -44,8 +49,17 @@ def bandwidth_profile():
         res_t += time.perf_counter() - start_t
     return comm_v / res_t
 
+'''
+input:
+fx_module: GraphModule goint to be scheduled
+shape_info: Output shape of each node
+output:
+a tuple list where the first element denotes mode(comm/comp)
+and the second denotes which node
+'''
 def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
 
+    # profile nodes in a graph
     perf = HyperPerfMeasure(fx_module)
     device_mesh = get_device_mesh()
     placements = [Replicate()] * device_mesh.ndim
@@ -57,8 +71,10 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
     perf.run(*args)
     node_profile = perf.node_runtime()
     
+    # get the bandwidth
     bandwidth = bandwidth_profile()
     
+    # calculate communication time
     for node in fx_module.graph.nodes:
         if node.op == 'call_function' and \
             _get_qualified_name(node.target) == \
@@ -75,13 +91,14 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
                 t = reduce((lambda x, y: x * y), input_info['shape'], 0.002 * bandwidth) * 2 * 4 / bandwidth
             node_profile[node.name] = t
     
+    # round the profile result to meet or-tools need
     int_node_profile = {}
     min_t = min(node_profile.values())
     for key in node_profile:
         int_node_profile[key] = min(int(node_profile[key] / min_t) + 20, 32768)
         assert(int_node_profile[key] > 0)
 
-    if torch.distributed.get_rank() == 0:
+    if mdconfig.log_level <= logging.DEBUG:
         print(f'bandwidth:{bandwidth}')
         for node_name, _time in int_node_profile.items():
             print(f'{node_name}: {_time}')
@@ -93,29 +110,29 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
         node_to_rank[node] = rank
         rank_to_node[rank] = node
 
+    # prepare RCPSP input
     jobs_data = []
     dependencies = []
     for node in fx_module.graph.nodes:
         if node.op == 'call_function' and \
             _get_qualified_name(node.target) == \
             'easydist.torch.passes.sharding.redist_tensor_func':
-            jobs_data.append([(0, int_node_profile[node.name])])
+            jobs_data.append([(rcpsp.MODE_COMM, int_node_profile[node.name])])
         else:
             if node.name in int_node_profile:
-                jobs_data.append([(1, int_node_profile[node.name])])
+                jobs_data.append([(rcpsp.MODE_COMP, int_node_profile[node.name])])
             else:
-                jobs_data.append([(1, 20)])
+                jobs_data.append([(rcpsp.MODE_COMP, 20)])
 
         for pre in node.all_input_nodes:
             dependencies.append(((node_to_rank[pre], 0), (node_to_rank[node], 0)))
     assert(len(jobs_data) == len(fx_module.graph.nodes))
 
+    # only rank 0 process do the calculation
     if torch.distributed.get_rank() == 0:
         logger.info('enter rcpsp')
-        logger.info('job cnt:')
-        logger.info(len(jobs_data))
-        logger.info('dependency cnt:')
-        logger.info(len(dependencies))
+        logger.info(f'job cnt: {len(jobs_data)}')
+        logger.info(f'dependency cnt: {len(dependencies)}')
         start_t = time.perf_counter()
         raw_sche = RCPSP(jobs_data, dependencies)
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
@@ -126,8 +143,9 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
         raw_sche = [None] * len(fx_module.graph.nodes)
     torch.distributed.broadcast_object_list(raw_sche, src=0, device="cuda")
 
-    sche = [(1, node) for node in fx_module.graph.nodes if node.name.__contains__('arg')] \
+    sche = [(rcpsp.MODE_COMM, node) for node in fx_module.graph.nodes if node.name.__contains__('arg')] \
         + [(mode, rank_to_node[job]) for mode, job in raw_sche if not rank_to_node[job].name.__contains__('arg')]
+    
     assert(len(sche) == len(fx_module.graph.nodes))
 
     return sche
@@ -210,6 +228,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
     elif comm_strtg == 'rcpsp':
         sche = rcpsp_trial(fx_module, shape_info)
         
+        # schedule node topological order according to sche
         fx_module.graph._root._next = sche[0][1]
         sche[0][1]._prev = fx_module.graph._root
         for idx, (mode, node) in enumerate(sche):
@@ -220,10 +239,10 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
                 node._next = fx_module.graph._root
                 fx_module.graph._root._prev = node
                 break
-            if mode == 1 and sche[idx + 1][0] == 0:
+            if mode == rcpsp.MODE_COMP and sche[idx + 1][0] == rcpsp.MODE_COMM:
                 comm_map[node] = []
                 for follower in sche[idx + 1 :]:
-                    if follower[0] == 0:
+                    if follower[0] == rcpsp.MODE_COMM:
                         comm_map[node].append((follower[1].all_input_nodes[0],
                                                follower[1],
                                                comm_dest[follower[1]]))
