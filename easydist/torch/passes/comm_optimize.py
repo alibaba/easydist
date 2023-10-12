@@ -78,7 +78,7 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
     int_node_profile = {}
     min_t = min(node_profile.values())
     for key in node_profile:
-        int_node_profile[key] = min(int(node_profile[key] / min_t), 327680)
+        int_node_profile[key] = min(int(node_profile[key] / min_t) + 20, 32768)
         assert(int_node_profile[key] > 0)
 
     if torch.distributed.get_rank() == 0:
@@ -135,10 +135,6 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
 def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy=None, grouping=False):
     fx_module.graph.eliminate_dead_code()
     fx_module.recompile()
-
-    if torch.distributed.get_rank() == 0:
-        for node in fx_module.graph.nodes:
-            print(node.name)
 
     node_to_rank: dict[torch.fx.Node, int] = {}
     # processing
