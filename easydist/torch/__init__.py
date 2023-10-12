@@ -16,6 +16,7 @@ import os
 
 import torch
 from torch._functorch import config
+from torch.distributed._tensor.op_schema import OpSchema
 
 from .api import compile, enable_transform, get_input_strategy, easydist_shard
 from .bridge import shard_module, torch2meta_graph
@@ -41,3 +42,22 @@ def easydist_setup_torch(device, allow_tf32):
 
     # this environment used for cuda graph
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+
+# hotfix for PyTorch 2.1.0
+if "2.1.0" in torch.__version__:
+    def hot_fix_opschema_hash(self):
+        # NOTE: we turn kwargs_schema into a frozenset to hash as it would not be nested dict
+        frozen_set_kwargs_schema = frozenset(self.kwargs_schema.items())
+        return hash(
+            (
+                self.func_schema.name,
+                tuple(self.func_schema.arguments),
+                tuple(self.func_schema.returns),
+                self.func_schema.name,
+                tuple(tuple(e) if isinstance(e, list) else e for e in self.args_schema),
+                frozen_set_kwargs_schema,
+            )
+        )
+
+    OpSchema.__hash__ = hot_fix_opschema_hash

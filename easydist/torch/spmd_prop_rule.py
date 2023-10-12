@@ -14,6 +14,7 @@ from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
 from torch.distributed._tensor.ops.common_rules import pointwise_rule
 from torch.distributed._tensor.ops.utils import register_prop_rule
 from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate, Shard, _Partial)
+from easydist.torch.utils import get_dtensor_spec
 
 aten = torch.ops.aten
 
@@ -44,10 +45,9 @@ def _prop_native_layer_norm(op_schema: OpSchema) -> OutputSharding:
     assert all(
         isinstance(p, Replicate) or (isinstance(p, Shard) and p.dim < batch_ndim, )
         for p in input.placements)
-    stats_spec = DTensorSpec(
+    stats_spec = get_dtensor_spec(
         mesh=input.mesh,
         placements=input.placements,
-        ndim=input.ndim,
         shape=torch.Size(s for (i, s) in enumerate(input.shape)),
     )
     return OutputSharding(output_spec=(input, stats_spec, stats_spec))
@@ -77,12 +77,12 @@ def _prop_native_layer_norm_backward(op_schema: OpSchema) -> OutputSharding:
         assert all(isinstance(s, Replicate) for s in bias.placements)
 
     if all(isinstance(s, Replicate) for s in grad.placements):
-        weight_grad = (DTensorSpec(
+        weight_grad = (get_dtensor_spec(
             mesh=weight.mesh,
             placements=[Replicate()] * weight.mesh.ndim,
             shape=weight.shape,
         ) if weight else None)
-        bias_grad = (DTensorSpec(
+        bias_grad = (get_dtensor_spec(
             mesh=bias.mesh,
             placements=[Replicate()] * bias.mesh.ndim,
             shape=bias.shape,
@@ -99,12 +99,12 @@ def _prop_native_layer_norm_backward(op_schema: OpSchema) -> OutputSharding:
     batch_ndim = len(input.shape) - len(normalized_shape)
     assert any(isinstance(s, Shard) and s.dim < batch_ndim
                for s in grad.placements), f"Got {grad.placements}"
-    weight_grad = (DTensorSpec(
+    weight_grad = (get_dtensor_spec(
         mesh=weight.mesh,
         placements=[_Partial()] * weight.mesh.ndim,
         shape=weight.shape,
     ) if weight else None)
-    bias_grad = (DTensorSpec(
+    bias_grad = (get_dtensor_spec(
         mesh=bias.mesh,
         placements=[_Partial()] * bias.mesh.ndim,
         shape=bias.shape,
@@ -145,9 +145,9 @@ def _prop_convolution_default(op_schema: OpSchema) -> OutputSharding:
         if isinstance(s, Shard) and s.dim == 1 and isinstance(s_input, Shard) and s_input.dim == 1:
             output_placements[idx] = _Partial()
 
-    output_spec = DTensorSpec(mesh=input.mesh,
-                              placements=output_placements,
-                              shape=torch.Size(output_shape))
+    output_spec = get_dtensor_spec(mesh=input.mesh,
+                                   placements=output_placements,
+                                   shape=torch.Size(output_shape))
 
     return OutputSharding(output_spec=output_spec)
 
@@ -169,11 +169,13 @@ def _prop_convolution_backward_default(op_schema: OpSchema) -> OutputSharding:
             if isinstance(weight_placement[idx], Shard) and weight_placement[idx].dim == 0:
                 bias_placement[idx] = Shard(dim=0)
 
-    weight_grad = DTensorSpec(mesh=weight.mesh, placements=weight_placement, shape=weight.shape)
+    weight_grad = get_dtensor_spec(mesh=weight.mesh,
+                                   placements=weight_placement,
+                                   shape=weight.shape)
 
-    bias_grad = DTensorSpec(mesh=weight.mesh,
-                            placements=bias_placement,
-                            shape=torch.Size(bias_sizes))
+    bias_grad = get_dtensor_spec(mesh=weight.mesh,
+                                 placements=bias_placement,
+                                 shape=torch.Size(bias_sizes))
 
     return OutputSharding(output_spec=(
         input if output_mask[0] else None,
@@ -197,7 +199,9 @@ def _prop_batch_norm_default(op_schema: OpSchema) -> OutputSharding:
 
     reserve_placement = [Replicate()] * weight.mesh.ndim
 
-    reserve = DTensorSpec(mesh=weight.mesh, placements=reserve_placement, shape=torch.Size([0]))
+    reserve = get_dtensor_spec(mesh=weight.mesh,
+                               placements=reserve_placement,
+                               shape=torch.Size([0]))
 
     return OutputSharding(output_spec=(input, running_mean, running_var, reserve), )
 
@@ -240,10 +244,9 @@ def _prop_native_group_norm(op_schema: OpSchema) -> OutputSharding:
     for idx, p in enumerate(input.placements):
         if isinstance(p, Shard) and p.dim < batch_ndim:
             stats_placement[idx] = copy.deepcopy(p)
-    stats_spec = DTensorSpec(
+    stats_spec = get_dtensor_spec(
         mesh=input.mesh,
         placements=stats_placement,
-        ndim=input.mesh.ndim,
         shape=torch.Size((input.shape[0], group)),
     )
     return OutputSharding(output_spec=(input, stats_spec, stats_spec))
@@ -261,9 +264,13 @@ def _prop_native_group_norm_backward(op_schema: OpSchema) -> OutputSharding:
     spec = Replicate()
     if isinstance(input.placements[0], Shard):
         spec = _Partial()
-    d_gamma = DTensorSpec(mesh=gamma.mesh, placements=[spec] * gamma.mesh.ndim, shape=gamma.shape)
+    d_gamma = get_dtensor_spec(mesh=gamma.mesh,
+                               placements=[spec] * gamma.mesh.ndim,
+                               shape=gamma.shape)
 
-    d_bias = DTensorSpec(mesh=gamma.mesh, placements=[spec] * gamma.mesh.ndim, shape=gamma.shape)
+    d_bias = get_dtensor_spec(mesh=gamma.mesh,
+                              placements=[spec] * gamma.mesh.ndim,
+                              shape=gamma.shape)
 
     return OutputSharding(
         # NOTE: type errors below are legit. This is because DTensor currently
@@ -289,8 +296,10 @@ def _prop_batch_norm_backward_default(op_schema: OpSchema) -> OutputSharding:
         if isinstance(s, Shard):
             weight_placement[idx] = weight.placements[idx]
 
-    weight_grad = DTensorSpec(mesh=weight.mesh, placements=weight_placement, shape=weight.shape)
-    bias_grad = DTensorSpec(mesh=weight.mesh, placements=weight_placement, shape=weight.shape)
+    weight_grad = get_dtensor_spec(mesh=weight.mesh,
+                                   placements=weight_placement,
+                                   shape=weight.shape)
+    bias_grad = get_dtensor_spec(mesh=weight.mesh, placements=weight_placement, shape=weight.shape)
 
     return OutputSharding(
         # NOTE: type errors below are legit. This is because DTensor currently
@@ -317,9 +326,9 @@ def _prop_max_pool2d_with_indices(op_schema: OpSchema) -> OutputSharding:
             math.floor(input.shape[2 + inner_dim] + 2 * padding[inner_dim] -
                        (kernel[inner_dim] - 1) - 1) / stride[inner_dim] + 1)
 
-    output_spec = DTensorSpec(mesh=input.mesh,
-                              placements=input.placements,
-                              shape=torch.Size(output_shape))
+    output_spec = get_dtensor_spec(mesh=input.mesh,
+                                   placements=input.placements,
+                                   shape=torch.Size(output_shape))
 
     return OutputSharding(output_spec=(output_spec, input))
 
@@ -331,7 +340,7 @@ def _prop_max_pool2d_with_indices(op_schema: OpSchema) -> OutputSharding:
 def _prop_max_pool2d_with_indices_backward(op_schema: OpSchema) -> OutputSharding:
     grad_output, input = op_schema.args_schema[0:2]
 
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=grad_output.mesh, placements=grad_output.placements, shape=input.shape))
 
 
@@ -352,9 +361,9 @@ def _prop_constant_pad_nd(op_schema: OpSchema) -> OutputSharding:
         new_dim = input_sizes[l_diff + i] + pad[pad_idx] + pad[pad_idx + 1]
         new_shape.append(new_dim)
 
-    output_spec = DTensorSpec(mesh=input.mesh,
-                              placements=input.placements,
-                              shape=torch.Size(new_shape))
+    output_spec = get_dtensor_spec(mesh=input.mesh,
+                                   placements=input.placements,
+                                   shape=torch.Size(new_shape))
 
     return OutputSharding(output_spec=output_spec)
 
@@ -372,7 +381,7 @@ def _prop_embedding(op_schema: OpSchema) -> OutputSharding:
            for placement in weight_spec.placements) and inp_spec.placements == [Shard(0)]:
         # Embedding table is replicated, input ids are sharded along batch
         # dimension. Output lookups should match input sharding spec in this case.
-        return OutputSharding(output_spec=DTensorSpec(
+        return OutputSharding(output_spec=get_dtensor_spec(
             mesh=inp_spec.mesh, placements=inp_spec.placements, shape=out_shape))
 
     if all(placement.is_replicate() for placement in inp_spec.placements):
@@ -389,10 +398,9 @@ def _prop_embedding(op_schema: OpSchema) -> OutputSharding:
                 func_schema=op_schema.func_schema,
                 args_schema=(
                     weight_spec,
-                    DTensorSpec(mesh=inp_spec.mesh,
-                                placements=[Replicate()] * len(inp_spec.placements),
-                                shape=inp_spec.shape,
-                                ndim=inp_spec.ndim),
+                    get_dtensor_spec(mesh=inp_spec.mesh,
+                                     placements=[Replicate()] * len(inp_spec.placements),
+                                     shape=inp_spec.shape),
                 ),
                 kwargs_schema=op_schema.kwargs_schema,
             )
@@ -425,16 +433,16 @@ def _prop_select(op_schema: OpSchema) -> OutputSharding:
 
     new_shape = tensor.shape[:dim] + tensor.shape[dim + 1:]
 
-    return OutputSharding(output_spec=DTensorSpec(
-        mesh=tensor.mesh, placements=new_placements, shape=new_shape, ndim=tensor.ndim - 1))
+    return OutputSharding(
+        output_spec=get_dtensor_spec(mesh=tensor.mesh, placements=new_placements, shape=new_shape))
 
 
 @register_prop_rule(aten.slice_backward.default)
 def _prop_slice_backward(op_schema: OpSchema) -> OutputSharding:
     grad, input_sizes = op_schema.args_schema[0:2]
 
-    return OutputSharding(output_spec=DTensorSpec(
-        mesh=grad.mesh, placements=grad.placements, shape=input_sizes, ndim=grad.ndim))
+    return OutputSharding(output_spec=get_dtensor_spec(
+        mesh=grad.mesh, placements=grad.placements, shape=input_sizes))
 
 
 @register_prop_rule(  # pyre-ignore
@@ -448,6 +456,18 @@ def _prop__foreach_binop_scalar(op_schema: OpSchema) -> OutputSharding:
     self, scalar = op_schema.args_schema
     assert isinstance(self, list) and all(isinstance(s, DTensorSpec) for s in self)
     assert not isinstance(scalar, list)
+    return OutputSharding(output_spec=self)
+
+
+@register_prop_rule(  # pyre-ignore
+    [
+        aten._foreach_sub.List,
+        aten._foreach_lerp.Scalar,
+    ])
+def _prop__foreach_trinop_scalar(op_schema: OpSchema) -> OutputSharding:
+    self, other = op_schema.args_schema[:2]
+    assert isinstance(self, list) and all(isinstance(s, DTensorSpec) for s in self)
+    assert isinstance(self, list) and all(isinstance(s, DTensorSpec) for s in other)
     return OutputSharding(output_spec=self)
 
 
@@ -537,14 +557,14 @@ def _prop_upsample_nearest2d(op_schema: OpSchema) -> OutputSharding:
     input, output_size = op_schema.args_schema[0:2]
     batch, channel = input.shape[:2]
     full_ouput_size = (batch, channel, *output_size)
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=input.mesh, placements=input.placements, shape=torch.Size(full_ouput_size)))
 
 
 @register_prop_rule(aten.upsample_nearest2d_backward.default)
 def _prop_upsample_nearest2d_backward(op_schema: OpSchema) -> OutputSharding:
     grad_output, output_size, input_size = op_schema.args_schema[0:3]
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=grad_output.mesh, placements=grad_output.placements, shape=torch.Size(input_size)))
 
 
@@ -600,8 +620,8 @@ def _prop_nll_loss_forward(op_schema: OpSchema) -> OutputSharding:
             out_placement[idx] = self.placements[idx]
 
     return OutputSharding(output_spec=(
-        DTensorSpec(mesh=self.mesh, placements=out_placement, shape=torch.Size([])),
-        DTensorSpec(
+        get_dtensor_spec(mesh=self.mesh, placements=out_placement, shape=torch.Size([])),
+        get_dtensor_spec(
             mesh=self.mesh, placements=[Replicate()] * self.mesh.ndim, shape=torch.Size([])),
     ))
 
@@ -629,7 +649,7 @@ def _prop_avg_pool3d(op_schema: OpSchema) -> OutputSharding:
             math.floor(input.shape[2 + inner_dim] + 2 * padding[inner_dim] -
                        (kernel_size[inner_dim] - 1) - 1) / stride[inner_dim] + 1)
 
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=input.mesh, placements=input.placements, shape=torch.Size(output_shape)))
 
 
@@ -668,10 +688,7 @@ def reduce_dim_rule(op_schema: OpSchema) -> OutputSharding:
     else:
         del self_shape[dim]
 
-    out_spec = DTensorSpec(mesh=self.mesh,
-                           placements=self_placements,
-                           shape=self_shape,
-                           ndim=self.ndim - 1)
+    out_spec = get_dtensor_spec(mesh=self.mesh, placements=self_placements, shape=self_shape)
 
     return OutputSharding(output_spec=(out_spec, out_spec))
 
@@ -695,15 +712,13 @@ def scaled_dot_product_efficient_attention_rule(op_schema: OpSchema) -> OutputSh
         if isinstance(s, Shard) and s.dim == dim_size - 1:
             out_placements[idx] = Shard(s.dim)
 
-    out_spec = DTensorSpec(mesh=query.mesh,
-                           placements=out_placements,
-                           shape=torch.Size(list(query.shape[:-1]) + list(value.shape[-1:])),
-                           ndim=query.ndim)
+    out_spec = get_dtensor_spec(mesh=query.mesh,
+                                placements=out_placements,
+                                shape=torch.Size(list(query.shape[:-1]) + list(value.shape[-1:])))
 
-    state_spec = DTensorSpec(mesh=query.mesh,
-                             placements=[Replicate()] * query.mesh.ndim,
-                             shape=torch.Size(list(query.shape[:-2]) + [0]),
-                             ndim=query.ndim - 1)
+    state_spec = get_dtensor_spec(mesh=query.mesh,
+                                  placements=[Replicate()] * query.mesh.ndim,
+                                  shape=torch.Size(list(query.shape[:-2]) + [0]))
 
     return OutputSharding(output_spec=(out_spec, state_spec))
 
@@ -741,7 +756,7 @@ def embedding_dense_backward_rules(op_schema: OpSchema) -> OutputSharding:
                                       f"grad_output - {grad_output}\n"
                                       f"indices - {indices}")
 
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=indices.mesh, shape=output_shape, placements=output_placements))
 
 
@@ -773,5 +788,15 @@ def _prop_stack(op_schema: OpSchema) -> OutputSharding:
     output_shape = list(tensors[0].shape)
     output_shape.insert(dim, len(tensors))
 
-    return OutputSharding(output_spec=DTensorSpec(
+    return OutputSharding(output_spec=get_dtensor_spec(
         mesh=tensors[0].mesh, shape=output_shape, placements=tensors[0].placements))
+
+# aten._foreach_pow not defined in PyTorch < 2.1.0
+if "_foreach_pow" in torch.ops.aten.__dir__():
+    @register_prop_rule([aten._foreach_pow.ScalarAndTensor])  # pyre-ignore
+    def _prop__foreach_pow_scalar_and_tensor(op_schema: OpSchema):
+        scala, exponent = op_schema.args_schema
+        assert isinstance(exponent, list) and all(
+            isinstance(s, DTensorSpec) for s in exponent
+        )
+        return OutputSharding(output_spec=exponent)

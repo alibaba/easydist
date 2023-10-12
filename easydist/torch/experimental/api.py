@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import importlib
 from functools import update_wrapper
 from typing import Any
 
@@ -36,7 +37,8 @@ class CompiledFuncWrapper:
                  func,
                  tracing_mode="fake",
                  cuda_graph=True,
-                 enable_mono_graph=False) -> None:
+                 enable_mono_graph=False,
+                 compile_only=False) -> None:
         update_wrapper(self, func)
         self.original_func = func
 
@@ -44,6 +46,7 @@ class CompiledFuncWrapper:
         self.tracing_mode = tracing_mode
         self.enable_cuda_graph = cuda_graph
         self.enable_mono_graph = enable_mono_graph
+        self.compile_only = compile_only
 
         self.init_helper = SetParaInitHelper()
 
@@ -98,6 +101,8 @@ class CompiledFuncWrapper:
             self.graph_list[input_signature] = self.compiled_func.graph
             # release the cpu module when finised pre-shard in _compiler
             self.init_helper = None
+        if self.compile_only:
+            return self.compiled_func
 
         def run_func(*args, **kwargs):
             if self.compiled_func:
@@ -111,7 +116,16 @@ class CompiledFuncWrapper:
                             "Input mismatch. If you are sure that different inputs do not change the graph, "
                             "you can try turning on the enable_mono_graph option.")
                 graph = self.graph_list[input_signature]
-                return self.compiled_func.run_with_graph(graph, *args, **kwargs)
+                output = self.compiled_func.run_with_graph(graph, *args, **kwargs)
+                if importlib.util.find_spec("torch.distributed._functional_collectives"):
+                    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+                    # wait and unwrap AsyncCollectiveTensor
+                    def wait_unwarp_fn(async_coll_tensor_):
+                        async_coll_tensor_.trigger_wait()
+                        return async_coll_tensor_.elem
+                    return pytree.tree_map_only(AsyncCollectiveTensor, wait_unwarp_fn,output)
+                else:
+                    return output
             else:
                 return self.original_func(*args, **kwargs)
 
@@ -165,17 +179,18 @@ def easydist_compile(func=None,
                      enable_mono_graph=False,
                      use_hint=False,
                      liveness_only_input=False,
-                     max_solver_time=float("inf")):
+                     max_solver_time=float("inf"),
+                     compile_only=False):
 
     mdconfig.use_hint = use_hint
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
     if func:
-        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph)
+        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph)
+            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
 
         return wrapper

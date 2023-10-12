@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
+from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.utils._mode_utils import no_dispatch
 import torch.utils._pytree as pytree
 
@@ -102,3 +103,11 @@ def get_input_signature(*args, **kwargs):
 
     input_meta_str = pytree.tree_map(to_meta, [args, kwargs])
     return hashlib.sha256(repr(input_meta_str).encode("utf-8")).hexdigest()
+
+
+def get_dtensor_spec(mesh, placements, shape=None, ndim=None):
+    # In PyTorch < 2.1.0: DTensorSpec(mesh, placements, shape=None, ndim=None)
+    # In PyTorch >= 2.1.0: DTensorSpec(mesh, placements)
+    if "shape" in list(DTensorSpec.__dataclass_fields__.keys()):
+        return DTensorSpec(mesh=mesh, placements=placements, shape=shape, ndim=ndim)
+    return DTensorSpec(mesh=mesh, placements=tuple(placements))

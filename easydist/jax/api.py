@@ -196,9 +196,19 @@ def get_opt_strategy(func, *args, **kwargs):
 
     device_mesh = get_device_mesh()
     solver = AutoFlowSolver(device_mesh.device_ids.shape)
-    solver.add_graph(meta_graph)
+
+    if mdconfig.enable_graph_coarsen:
+        logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
+        solver.add_coarsen_graph(meta_graph)
+    else:
+        solver.add_graph(meta_graph)
+
     start_t = time.perf_counter()
-    opt_strategy = solver.ilp_optimize()
+    if mdconfig.enable_graph_coarsen:
+        opt_strategy = solver.ilp_solve()
+    else:
+        opt_strategy = solver.ilp_optimize()
+
     logger.info(f"[AutoFlowSolver.ilp_optimize]: {time.perf_counter() - start_t} s.")
     # start_t = time.perf_counter()
     # beam_search_strategy = solver.beam_search()
@@ -277,29 +287,37 @@ def _compile(func, args, kwargs):
 
 class CompiledFuncWrapper:
 
-    def __init__(self, func) -> None:
+    def __init__(self,
+                 func,
+                 compile_only=False) -> None:
         self.original_func = func
         self.compiled_func = None
+        self.compile_only = compile_only
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.compiled_func is None:
-
             self.compiled_func = _compile(self.original_func, args, kwargs)
+
+        if self.compile_only:
+            return self.compiled_func
 
         return self.compiled_func(*args, **kwargs)
 
 
-def easydist_compile(func=None, max_solver_time=float("inf"), liveness_only_input=False):
+def easydist_compile(func=None,
+                     max_solver_time=float("inf"),
+                     liveness_only_input=False,
+                     compile_only=False):
 
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
     if func:
-        return CompiledFuncWrapper(func)
+        return CompiledFuncWrapper(func, compile_only)
 
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func)
+            return CompiledFuncWrapper(func, compile_only)
 
         return wrapper

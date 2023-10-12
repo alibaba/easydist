@@ -84,6 +84,9 @@ class VarSPMDStrategy:
     def __str__(self) -> str:
         return f"VarSPMDStrategy({self.var_spmd_strategy.__str__()})"
 
+    def __len__(self) -> str:
+        return self.var_spmd_strategy.__len__()
+
     def __repr__(self) -> str:
         return self.__str__()
 
@@ -110,6 +113,9 @@ class VarSPMDStrategyGroup:
 
     def __getitem__(self, idx) -> VarSPMDStrategy:
         return self.var_spmd_strategy_group[idx]
+
+    def __len__(self) -> str:
+        return self.var_spmd_strategy_group.__len__()
 
     def __str__(self) -> str:
         return f"VarSPMDStrategyGroup({self.var_spmd_strategy_group.__str__()})"
@@ -910,3 +916,4 @@ class MetaGraph:
                      SPMD(SPMD.REPLICATE)])
 
         return partial_strategy_list
+

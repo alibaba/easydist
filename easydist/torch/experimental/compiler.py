@@ -16,6 +16,7 @@ import logging
 import os
 import pickle
 import time
+import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
@@ -24,6 +25,7 @@ import numpy
 import rich
 import torch
 import torch.utils._pytree as pytree
+import torch.distributed.rpc as rpc
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribute_tensor)
 from torch.fx._pytree import tree_flatten_spec
@@ -54,6 +56,9 @@ sys.setrecursionlimit(100000)
 
 logger = logging.getLogger(__name__)
 
+sharding_sol = None
+sol_rdy_cond = threading.Condition()
+
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     fx_module = fix_meta_device(fx_module)
@@ -67,68 +72,77 @@ def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     return fx_module
 
 
-def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, *args, **kwargs):
+def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_signature, *args, **kwargs):
+    # only called by rank 0
+    if mdconfig.enable_compile_cache:
+        os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
+        compiled_cache_file = os.path.join(mdconfig.compile_cache_dir, f"./{input_signature}.pkl")
 
-    # (1) preprocess pass
-    fx_module = preprocess_traced_graph(fx_module)
+    find_cache = mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        fx_module.print_readable()
-
-    # (2) sharding annotation
-    with _sharding_ann_env():
-        start_t = time.perf_counter()
-        sharding_interpreter = EDTorchShardingAnn(fx_module)
-        flatten_args = tree_flatten_spec(list(args) + list(kwargs.values()), fx_module._in_spec)
-        sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
-        logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+    if find_cache:
+        logger.info(f"load compiled result from {compiled_cache_file}.")
+        shape_info, opt_strategy, sharding_strategy, args_strategy = pickle.load(
+            open(compiled_cache_file, "rb"))
+    else:
         if mdconfig.log_level <= logging.DEBUG:
-            rich.print("sharding_info:\n", sharding_info)
-            rich.print("shape_info:\n", shape_info)
+            fx_module.print_readable()
 
-    # sync sharding info for all process
-    torch.distributed.broadcast_object_list(sharding_info, src=0, device="cuda")
+        # (1) sharding annotation
+        with _sharding_ann_env():
+            start_t = time.perf_counter()
+            sharding_interpreter = EDTorchShardingAnn(fx_module)
+            flatten_args = tree_flatten_spec(list(args) + list(kwargs.values()), fx_module._in_spec)
+            sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
+            logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+            if mdconfig.log_level <= logging.DEBUG:
+                rich.print("sharding_info:\n", sharding_info)
+                rich.print("shape_info:\n", shape_info)
 
-    # (3) translate fx.GraphModule into MetaGraph
-    meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)
-    meta_graph.dump()
+        # (2) translate fx.GraphModule into MetaGraph
+        meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(meta_graph)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(meta_graph)
 
-    # (4) construct AutoFlowSolver and run ILP
-    device_mesh = get_device_mesh()
-    device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
+        # (3) construct AutoFlowSolver and run ILP
+        device_mesh = get_device_mesh()
+        device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
 
-    total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-    solver = AutoFlowSolver(device_mesh_shape, total_memery=total_memery)
+        total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        solver = AutoFlowSolver(device_mesh_shape, total_memery=total_memery)
 
-    if mdconfig.enable_graph_coarsen:
-        logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
-        solver.add_coarsen_graph(meta_graph)
-    else:
-        solver.add_graph(meta_graph)
+        if mdconfig.enable_graph_coarsen:
+            logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
+            solver.add_coarsen_graph(meta_graph)
+        else:
+            solver.add_graph(meta_graph)
 
-    start_t = time.perf_counter()
-    if mdconfig.enable_graph_coarsen:
-        opt_strategy = solver.ilp_solve()
-    else:
-        opt_strategy = solver.ilp_optimize()
-    logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
+        start_t = time.perf_counter()
+        if mdconfig.enable_graph_coarsen:
+            opt_strategy = solver.ilp_solve()
+        else:
+            opt_strategy = solver.ilp_optimize()
+        logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(opt_strategy)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(opt_strategy)
 
-    #g = passes.graph_drawer.FxGraphDrawer(sharded_fx_module, 'lol')
-    #with open("trial.svg", "wb") as f:
-    #    f.write(g.get_dot_graph().create_svg())
+        sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
 
-    sharding_strategies = get_torch_sharding_strategy(fx_module, opt_strategy)
+        if mdconfig.log_level <= logging.DEBUG:
+            rich.print(sharding_strategy)
 
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(sharding_strategies)
+        args_strategy = meta_graph.get_input_strategy(opt_strategy)
+        args_strategy = [[to_torch_spmd(i) for i in var_strategy]
+                         for var_strategy in args_strategy]
 
-    return shape_info, meta_graph, opt_strategy, sharding_strategies
+        if mdconfig.enable_compile_cache:
+            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy],
+                        open(compiled_cache_file, "wb"))
+            logger.info(f"compiled result saved in {compiled_cache_file}.")
+
+    return shape_info, opt_strategy, sharding_strategy, args_strategy
 
 
 @torch.no_grad()
@@ -153,8 +167,15 @@ def dtensor_to_tensor(leaf):
     return leaf
 
 
-def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
+def fetch_strategy():
+    with sol_rdy_cond:
+        if sharding_sol is None:
+            sol_rdy_cond.wait()
 
+    return sharding_sol
+
+
+def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -226,34 +247,29 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
 
-    if mdconfig.enable_compile_cache:
-        os.makedirs(mdconfig.compile_cache_dir, exist_ok=True)
-        compiled_cache_file = os.path.join(mdconfig.compile_cache_dir, f"./{input_signature}.pkl")
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
 
-    args_strategy = None
-    find_cache = mdconfig.enable_compile_cache and os.path.exists(compiled_cache_file)
+    # Lansong(TODO) Currently send strategy by rpc. But broadcast way is more efficient.
+    rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+    if rank == 0:
+        shape_info, opt_strategy, sharding_strategy, args_strategy = easydist_shard(
+                                traced_graph, state_tensor_num, input_signature,
+                                params, buffers, named_states, args, kwargs)
 
-    if find_cache:
-        logger.info(f"load compiled result from {compiled_cache_file}.")
-        shape_info, sharding_strategy, opt_strategy, args_strategy = pickle.load(
-            open(compiled_cache_file, "rb"))
+        with sol_rdy_cond:
+            global sharding_sol
+            sharding_sol = [shape_info, opt_strategy, sharding_strategy, args_strategy]
+            sol_rdy_cond.notify_all()
     else:
-        shape_info, meta_graph, opt_strategy, sharding_strategy = easydist_shard(
-            traced_graph, state_tensor_num, params, buffers, named_states, args, kwargs)
+        shape_info, opt_strategy, sharding_strategy, args_strategy = rpc.rpc_sync(
+                              "ed_worker0", fetch_strategy, args=(), timeout=0)
+
+    rpc.shutdown()
 
     # mem_anaylize(traced_graph, shape_info, opt_strategy)
     sharded_graph = sharding_transform(traced_graph, sharding_strategy)
     sharded_graph = fix_embedding(sharded_graph, recover=True)
-    
-    if args_strategy is None:
-        args_strategy = meta_graph.get_input_strategy(opt_strategy)
-        args_strategy = [[to_torch_spmd(i) for i in var_strategy]
-                         for var_strategy in args_strategy]
-
-        if mdconfig.enable_compile_cache and torch.distributed.get_rank() == 0:
-            pickle.dump([shape_info, sharding_strategy, opt_strategy, args_strategy],
-                        open(compiled_cache_file, "wb"))
-            logger.info(f"compiled result saved in {compiled_cache_file}.")
 
     if mdconfig.comm_optimization is True:
         sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
@@ -269,7 +285,6 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     device_mesh = get_device_mesh()
     if isinstance(device_mesh, TorchMockDeviceMesh):
         if device_mesh.debug_only:
-            world_size = torch.distributed.get_world_size()
             mesh_shape = numpy.array(range(world_size)).reshape(1, -1).tolist()
         else:
             mesh_shape = device_mesh.shape
@@ -341,51 +356,51 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
-    @torch.no_grad()
-    def compiled_func_return(graph, *args, **kwargs):
-        nonlocal params, buffers, named_states
-
-        # tensor to DTensor
-        # (TODO) the redistributed of params, buffers, named_states should in graph
-        flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
-
-        device = mdconfig.easydist_device
-        materialize_fn = partial(materialize_zero, materialization_device=device)
-
-        args_strategy_idx = state_tensor_num
-        for i in range(len(flatten_args)):
-            if isinstance(flatten_args[i], torch.Tensor):
-                flatten_args[i] = sharded_tensor(flatten_args[i],
-                                                 args_strategy[args_strategy_idx],
-                                                 get_device_mesh(),
-                                                 materialize_fn=materialize_fn)
-                args_strategy_idx += 1
-
-        args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
-
-        # run the sharded_graph
-        params, buffers, named_states, grads, sharded_out = graph(params, buffers, named_states,
-                                                                  args, kwargs)
-
-        for para_name in params:
-            params[para_name].grad = grads[para_name]
-
-        # out from DTensor to Tensor
-        local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-
-        return local_out
 
     class EDCompiledFunc:
 
-        def __init__(self, func, graph) -> None:
-            self.func = func
+        def __init__(self, graph) -> None:
             self.graph = graph
 
+        @torch.no_grad()
+        def compiled_func(self, graph, *args, **kwargs):
+            nonlocal params, buffers, named_states
+
+            # tensor to DTensor
+            # (TODO) the redistributed of params, buffers, named_states should in graph
+            flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
+
+            device = mdconfig.easydist_device
+            materialize_fn = partial(materialize_zero, materialization_device=device)
+
+            args_strategy_idx = state_tensor_num
+            for i in range(len(flatten_args)):
+                if isinstance(flatten_args[i], torch.Tensor):
+                    flatten_args[i] = sharded_tensor(flatten_args[i].detach(),
+                                                     args_strategy[args_strategy_idx],
+                                                     get_device_mesh(),
+                                                     materialize_fn=materialize_fn)
+                    args_strategy_idx += 1
+
+            args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
+
+            # run the sharded_graph
+            params, buffers, named_states, grads, sharded_out = graph(params, buffers, named_states,
+                                                                      args, kwargs)
+
+            for para_name in params:
+                params[para_name].grad = grads[para_name]
+
+            # out from DTensor to Tensor
+            local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
+
+            return local_out
+
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            return self.func(self.graph, *args, **kwargs)
+            return self.compiled_func(self.graph, *args, **kwargs)
 
         def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
-            return self.func(graph, *args, **kwargs)
+            return self.compiled_func(graph, *args, **kwargs)
 
         def get_state(self):
             return params, buffers, named_states
@@ -422,4 +437,4 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     if module is not None:
         module.to("meta")
 
-    return EDCompiledFunc(compiled_func_return, sharded_graph)
+    return EDCompiledFunc(sharded_graph)
