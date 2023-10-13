@@ -15,7 +15,6 @@ pytree._register_pytree_node(
     diffusers.models.unet_2d_condition.UNet2DConditionOutput, lambda x: ([x.sample], None),
     lambda values, _: diffusers.models.unet_2d_condition.UNet2DConditionOutput(values[0]))
 
-
 def main():
     # setting up easydist and torch.distributed
     mdconfig.log_level = logging.INFO
@@ -29,7 +28,7 @@ def main():
     model_id = "stabilityai/stable-diffusion-2"
 
     # Use the Euler scheduler here instead
-    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler", cache_dir='/scratch/08694/hpccsg/.cache_lsj')
+    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
     pipe = StableDiffusionPipeline.from_pretrained(model_id,
                                                    scheduler=scheduler,
                                                    torch_dtype=torch.float16,

@@ -88,39 +88,18 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
 
     graph_rules: dict[str, list] = {}
 
-    if torch.distributed.get_rank() == 0:
-        print('!')
-        print(opt_strategy)
-        print('!!')
-        print(shape_info)
-        for node in fx_module.graph.nodes:
-            print(node.name)
-    
     excluded_node =[
         'redist_tensor_func',
         'getitem',
         'arange',
         'to_dtensor',
         'clone',
-    #    'scalar_tensor',
-    #    'where',
-    #    'ones',
-    #    'triu',
-    #    'unsqueeze',
-    #    'expand',
-    #    'mul',
-    #    'div',
-    #    'exp',
-    #    'group_norm',
-    #    'permute'
     ]
     for node in fx_module.graph.nodes:
         if node.op == 'call_function':
             op_name = _get_qualified_name(node.target)
 
             excluded = False
-            #if opt_strategy.get(node.name) is None:
-            #    continue
 
             for name in excluded_node:
                 if node.name.__contains__(name):
