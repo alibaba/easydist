@@ -54,6 +54,9 @@ def _transform_to_Placemnet(varstrtg):
 
 def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_info):
 
+    fx_module.graph.eliminate_dead_code()
+    fx_module.recompile()
+
     def operator_rule_factory(op_name, graph_rules):
 
         def operator_rule(op_schema: OpSchema) -> OutputSharding:
@@ -85,12 +88,24 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
 
     graph_rules: dict[str, list] = {}
 
+    excluded_node =[
+        'redist_tensor_func',
+        'getitem',
+        'arange',
+        'to_dtensor',
+        'clone',
+    ]
     for node in fx_module.graph.nodes:
         if node.op == 'call_function':
             op_name = _get_qualified_name(node.target)
 
-            if node.name.__contains__('redist_tensor_func') \
-                    or node.name.__contains__('getitem'):
+            excluded = False
+
+            for name in excluded_node:
+                if node.name.__contains__(name):
+                    excluded = True
+                    break
+            if excluded:
                 continue
             strategy = opt_strategy[node.name]['strategy']
             output_spec_list = []
@@ -107,8 +122,8 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
                 graph_output_struct[op_name] = 'tuple'
                 tot_info = output_shapes
 
-            tensor_args_idx = 0
-            assert len(strategy.out_strtg_group) == len(tot_info)
+            assert len(strategy.out_strtg_group.var_spmd_strategy_group) \
+                == len(tot_info)
             for var_strtg, tensor_info in zip(strategy.out_strtg_group,
                                               tot_info):
                 if tensor_info == {} or var_strtg is None:
@@ -137,4 +152,5 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
             operator_rule_factory(op_name, graph_rules)
         )
 
+    logger.info("Rule Override: Done!")
     return fx_module

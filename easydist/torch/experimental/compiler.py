@@ -272,7 +272,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     sharded_graph = fix_embedding(sharded_graph, recover=True)
 
     if mdconfig.comm_optimization is True:
-        sharded_graph = comm_optimize(sharded_graph, opt_strategy)
+        sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
 
     # override pytorch dtensor propagate rules to optimize dispater behavior
     if mdconfig.override_dtensor_rule is True:
