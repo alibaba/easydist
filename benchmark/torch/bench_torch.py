@@ -129,8 +129,11 @@ def to_meta(node_output):
 
 
 def bench_easydist(model, data_in):
-    mock_mesh = TorchMockDeviceMesh(1, 2, debug_only=True)
-    set_device_mesh(mock_mesh)
+    world_size = torch.distributed.get_world_size()
+
+    mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
+    mesh = DeviceMesh("cuda", mesh_shape.tolist())
+    set_device_mesh(mesh)
 
     if not isinstance(data_in, list):
         data_in = [data_in]
@@ -236,7 +239,7 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    model, data_in = get_gpt_case(device="meta")
+    model, data_in = get_gat_case(device="meta")
 
     bench_easydist(model, data_in)
 

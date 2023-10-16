@@ -22,8 +22,9 @@ import torch
 from sortedcontainers import SortedList
 from torch.distributed._tensor.api import DTensor, Replicate
 from torch.fx.node import _get_qualified_name
+from torch.distributed._tensor import DeviceMesh
 
-from easydist.torch.device_mesh import get_device_mesh
+from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.graph_profile import HyperPerfMeasure
 import easydist.torch.rcpsp as rcpsp
 import easydist.config as mdconfig
@@ -53,6 +54,8 @@ def graph_profile(fx_module: torch.fx.GraphModule, shape_info):
     # profile nodes in a graph
     perf = HyperPerfMeasure(fx_module)
     device_mesh = get_device_mesh()
+    if not isinstance(device_mesh, DeviceMesh):
+        RuntimeError("MockDeviceMesh in comm_optimize. Please set device to torch DeviceMesh")
     placements = [Replicate()] * device_mesh.ndim
     args = [DTensor.from_local(torch.randn(arg['shape'], dtype=arg['dtype']),
                                device_mesh, placements) \
@@ -63,7 +66,7 @@ def graph_profile(fx_module: torch.fx.GraphModule, shape_info):
     node_profile = perf.node_runtime()
     
     # get the bandwidth
-    bandwidth = bandwidth_profile()
+    bandwidth = bandwidth_profile() * 0.5
     
     # calculate communication time
     for node in fx_module.graph.nodes:
@@ -117,7 +120,13 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
     available_resources = {'comm': 1, 'comp': 1}
     precedence_relations = []
 
+    arg_num = 0
+    arg_list = []
     for node in fx_module.graph.nodes:
+        if node.name.__contains__('arg'):
+            arg_list.append(node)
+            arg_num += 1
+            continue
         resource = []
         if _is_comm_node(node):
             duration = processing_time[node.name]
@@ -130,11 +139,12 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
             resource.append(('comp', 1))
         precedence = []
         for pre in node.all_input_nodes:
-            precedence.append(pre)
+            if not pre.name.__contains__('arg'):
+                precedence.append(pre)
         precedence_relations.append(precedence)
         task_data.append((node, duration, precedence, resource))
 
-    assert(len(task_data) == len(fx_module.graph.nodes))
+    assert(len(task_data) == len(fx_module.graph.nodes) - arg_num)
 
     # only rank 0 process do the calculation
     if torch.distributed.get_rank() == 0:
@@ -145,15 +155,14 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
 
-        assert(len(raw_sche) == len(fx_module.graph.nodes))
+        assert(len(raw_sche) == len(fx_module.graph.nodes) - arg_num)
     else:
-        raw_sche = [None] * len(fx_module.graph.nodes)
+        raw_sche = [None] * (len(fx_module.graph.nodes) - arg_num)
     torch.distributed.broadcast_object_list(raw_sche, src=0, device="cuda")
 
     node_sche = [task_data[i][0] for i in raw_sche]
 
-    sche = [node for node in fx_module.graph.nodes if node.name.__contains__('arg')] \
-        + [node for node in node_sche if not node.name.__contains__('arg')]
+    sche = arg_list + node_sche
     
     assert(len(sche) == len(fx_module.graph.nodes))
 
