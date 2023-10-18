@@ -129,8 +129,11 @@ def to_meta(node_output):
 
 
 def bench_easydist(model, data_in):
-    mock_mesh = TorchMockDeviceMesh(1, 2, debug_only=True)
-    set_device_mesh(mock_mesh)
+    world_size = torch.distributed.get_world_size()
+
+    mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
+    mesh = DeviceMesh("cuda", mesh_shape.tolist())
+    set_device_mesh(mesh)
 
     if not isinstance(data_in, list):
         data_in = [data_in]

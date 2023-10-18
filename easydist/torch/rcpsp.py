@@ -1,6 +1,152 @@
-"""Minimal jobshop example."""
 import collections
+import numpy as np
 from ortools.sat.python import cp_model
+
+from itertools import product
+from mip import Model, xsum, BINARY
+
+def rcpsp_genetic(num_tasks, processing_time, resource_consumption, available_resources, precedence_relations):
+    """
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using the python-mip library.
+
+    Args:
+    num_tasks (int): The number of tasks plus the two 'dummy' ones.
+    processing_time (list): The processing time of each task.
+    resource_consumption (list): The resource consumption of each task.
+    available_resources (list): The resources available.
+    precedence_relations (list): The precedence relations.
+
+    Returns:
+    None
+    """
+
+    # Create ranges for resources, tasks, and time periods
+    resources_range = range(len(available_resources))
+    tasks_range = range(len(processing_time))
+    time_period_range = range(sum(processing_time))
+
+    # Create the model
+    model = Model()
+
+    # Create the decision variables
+    decision_variables = [[model.add_var(name=f"x({task},{time_period})", var_type=BINARY) for time_period in time_period_range] for task in tasks_range]
+
+    # Set the objective function
+    model.objective = xsum(time_period * decision_variables[num_tasks + 1][time_period] for time_period in time_period_range)
+
+    # Set the constraints
+    for task in tasks_range:
+        model += xsum(decision_variables[task][time_period] for time_period in time_period_range) == 1
+
+    for (resource, time_period) in product(resources_range, time_period_range):
+        model += (xsum(resource_consumption[task][resource] * decision_variables[task][time_period_2] for task in tasks_range for time_period_2 in range(max(0, time_period - processing_time[task] + 1), time_period + 1)) <= available_resources[resource])
+
+    for (task, successor) in precedence_relations:
+        model += xsum(time_period * decision_variables[successor][time_period] - time_period * decision_variables[task][time_period] for time_period in time_period_range) >= processing_time[task]
+
+    # Optimize the model
+    model.optimize()
+
+    # Print the optimal schedule
+    for (task, time_period) in product(tasks_range, time_period_range):
+        if decision_variables[task][time_period].x >= 0.99:
+            print(f"task {task}: begins at t={time_period} and finishes at t={time_period+processing_time[task]}")
+
+def rcpsp_general(task_data, resource_capacities):
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
+
+    model = cp_model.CpModel()
+    num_tasks = len(task_data)
+    horizon = sum(task[1] for task in task_data)
+    makespan = model.NewIntVar(0, horizon, 'makespan')
+
+    task_starts = [model.NewIntVar(0, horizon, f'task{i}start') for i in range(num_tasks)]
+    task_ends = [model.NewIntVar(0, horizon, f'task{i}end') for i in range(num_tasks)]
+    task_intervals = [model.NewIntervalVar(task_starts[i], task_data[i][1], task_ends[i], f'interval{i}')
+        for i in range(num_tasks)]
+
+    for task, _, predecessors, _ in task_data:
+        for predecessor in predecessors:
+            model.Add(task_ends[predecessor] <= task_starts[task])
+
+    # Resource constraints
+    num_resources = len(resource_capacities)
+    for i, capacity in enumerate(resource_capacities):
+        model.AddCumulative(task_intervals, [task[3][i] for task in task_data], capacity)
+
+    model.Minimize(task_ends[-1])
+
+    solver = cp_model.CpSolver()
+    printer = cp_model.VarArraySolutionPrinter(task_starts)
+    status = solver.Solve(model)
+
+    res = []
+    for i in range(len(task_data)):
+        res.append(solver.Value(task_starts[i]))
+    return np.argsort(res)
+
+def rcpsp(task_data, available_resources, method):
+    '''
+    Main entry of the solver.
+
+    Args:
+    task_data: [(task_key, duration, predecessor, resource_usage)]
+    available_resources (dict): a mapping from resources to its available amount
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
+
+    #TODO check if input is legal
+
+    resource_capacities = []
+    resource_to_id = {}
+    resource_num = len(available_resources)
+    for i, resource in enumerate(available_resources):
+        resource_to_id[resource] = i
+        resource_capacities.append(available_resources[resource])
+
+
+    transformed_task_data = []
+    key_to_id = {}
+    id_to_key = {}
+    for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
+        key_to_id[task_key] = i
+        id_to_key[i] = task_key
+        resource_in_use = [0] * resource_num
+        for r, amount in resource_uses:
+            resource_in_use[resource_to_id[r]] = amount
+        transformed_task_data.append((i, duration, 
+                                      [key_to_id[dp] for dp in dependencies], 
+                                      resource_in_use))
+
+    if method == 'general':
+
+        schedule = rcpsp_general(transformed_task_data, resource_capacities)
+
+    elif method == 'genetic':
+        num_tasks = len(task_data)
+        processing_time = [0] * len(num_tasks)
+        resource_consumption = [[]] * len(num_tasks)
+        precedence_relations = [[]] * len(num_tasks)
+        for (task_id, duration, dependencies, resource_in_use) in transformed_task_data:
+            processing_time[task_id] = duration
+            resource_consumption[task_id] = resource_in_use
+            precedence_relations[task_id] = dependencies
+            
+        schedule = rcpsp_genetic(num_tasks, processing_time, resource_consumption,
+                                resource_capacities, precedence_relations)
+
+    return schedule
 
 MODE_COMM = 0
 MODE_COMP = 1
@@ -9,7 +155,7 @@ MODE_COMP = 1
 jobs_data = [task = (machine_id, processing_time),]
 dependencies = [dependency = ((job_id, task_id), (job_id, task_id)),]
 '''
-def RCPSP(jobs_data, dependencies):
+def rcpsp_jobshop(jobs_data, dependencies):
     
     machines_count = 1 + max(task[0] for job in jobs_data for task in job)
     all_machines = range(machines_count)
