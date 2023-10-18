@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import collections
 import numpy as np
 from ortools.sat.python import cp_model
@@ -149,12 +148,6 @@ def rcpsp(task_data, available_resources, method):
 
     return schedule
 
-=======
-"""Minimal jobshop example."""
-import collections
-from ortools.sat.python import cp_model
-
->>>>>>> 33aa9bc61baf0ac12ebc85aa4bc42b61db7272a6
 MODE_COMM = 0
 MODE_COMP = 1
 
@@ -162,11 +155,7 @@ MODE_COMP = 1
 jobs_data = [task = (machine_id, processing_time),]
 dependencies = [dependency = ((job_id, task_id), (job_id, task_id)),]
 '''
-<<<<<<< HEAD
 def rcpsp_jobshop(jobs_data, dependencies):
-=======
-def RCPSP(jobs_data, dependencies):
->>>>>>> 33aa9bc61baf0ac12ebc85aa4bc42b61db7272a6
     
     machines_count = 1 + max(task[0] for job in jobs_data for task in job)
     all_machines = range(machines_count)
