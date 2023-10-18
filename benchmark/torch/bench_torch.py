@@ -239,7 +239,7 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    model, data_in = get_gat_case(device="meta")
+    model, data_in = get_gpt_case(device="meta")
 
     bench_easydist(model, data_in)
 
