@@ -43,14 +43,14 @@ class Foo(torch.nn.Module):
         return x.relu()
 
 
-@easydist_compile(tracing_mode="fake")
-@torch.inference_mode()
-def inference_step(model, input):
-    out = model(input)
-    return out
-
-
 def inference_example(fake_init=True, cpu_init_helper=False):
+
+    @easydist_compile(tracing_mode="fake")
+    @torch.inference_mode()
+    def inference_step(model, input):
+        out = model(input)
+        return out
+
     fake_mode = FakeTensorMode()
 
     # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627
@@ -90,19 +90,19 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     print("simple model inference example pass.")
 
 
-# when using cuda_graph, because of the warm-up and cuda graph capture,
-# the result of the first step is equivalent to the original result of the third step
-@easydist_compile(tracing_mode="fake", cuda_graph=False)
-def train_step(input, model, opt):
-    out = model(input).mean()
-    out.backward()
-    opt.step()
-    opt.zero_grad(True)
-
-    return out
-
-
 def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False):
+
+    # when using cuda_graph, because of the warm-up and cuda graph capture,
+    # the result of the first step is equivalent to the original result of the third step
+    @easydist_compile(tracing_mode="fake", cuda_graph=False)
+    def train_step(input, model, opt):
+        out = model(input).mean()
+        out.backward()
+        opt.step()
+        opt.zero_grad(True)
+
+        return out
+
     fake_mode = FakeTensorMode()
 
     # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627

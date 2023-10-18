@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import time
 import logging
 import importlib
 from functools import update_wrapper
@@ -118,12 +119,13 @@ class CompiledFuncWrapper:
                 graph = self.graph_list[input_signature]
                 output = self.compiled_func.run_with_graph(graph, *args, **kwargs)
                 if importlib.util.find_spec("torch.distributed._functional_collectives"):
+                    # wait all AsyncCollectiveTensor and unwrap AsyncCollectiveTensor
                     from torch.distributed._functional_collectives import AsyncCollectiveTensor
-                    # wait and unwrap AsyncCollectiveTensor
+                    from torch.distributed._functional_collectives_impl import _wait_all
+                    _wait_all()
                     def wait_unwarp_fn(async_coll_tensor_):
-                        async_coll_tensor_.trigger_wait()
                         return async_coll_tensor_.elem
-                    return pytree.tree_map_only(AsyncCollectiveTensor, wait_unwarp_fn,output)
+                    return pytree.tree_map_only(AsyncCollectiveTensor, wait_unwarp_fn, output)
                 else:
                     return output
             else:
@@ -151,6 +153,9 @@ class CompiledFuncWrapper:
                     current_space["cuda_graph_output"] = run_func(*args, **kwargs)
                 torch.cuda.current_stream().wait_stream(s)
                 torch.cuda.synchronize()
+
+                # sleep to prevent cuda error when cuda graph capture.
+                time.sleep(2)
 
                 current_space["cuda_graph"] = torch.cuda.CUDAGraph()
 
