@@ -46,6 +46,7 @@ def easydist_setup_torch(device, allow_tf32):
 
 # hotfix for PyTorch 2.1.0
 if "2.1.0" in torch.__version__:
+    # ========================================================================
     def hot_fix_opschema_hash(self):
         # NOTE: we turn kwargs_schema into a frozenset to hash as it would not be nested dict
         frozen_set_kwargs_schema = frozenset(self.kwargs_schema.items())
@@ -61,3 +62,53 @@ if "2.1.0" in torch.__version__:
         )
 
     OpSchema.__hash__ = hot_fix_opschema_hash
+
+    # ========================================================================
+    # Fix: AttributeError: 'DTensorSpec' object has no attribute 'local_shape'
+    # In spmd_prop_rule.py::_prop_native_group_norm
+
+    from torch.distributed._tensor.placement_types import DTensorSpec
+    from typing import Tuple
+
+    # Borrow from https://github.com/pytorch/pytorch/blob/e9ebda29d87ce0916ab08c06ab26fd3766a870e5/torch/distributed/_tensor/placement_types.py#L367
+    # which was removed in 2.1.0
+    def local_shape(self) -> Tuple[int, ...]:
+        """
+        Compute the shape of a local shard of the given DTensor on its current
+        coordinate of the mesh.
+        """
+        assert self.shape is not None, "DTensorSpec does not contain global shape."
+        local_shape = list(self.shape)  # start with global shape
+        for idx, placement in enumerate(self.placements):
+            mesh_dim_size = self.mesh.size(idx)
+            my_coordinate = self.mesh.get_coordinate_on_dim(idx)
+            assert my_coordinate is not None, "Rank not part of mesh!"
+            if isinstance(placement, Shard):
+                shard_dim = placement.dim
+                assert (
+                    shard_dim < self.ndim
+                ), f"Sharding dim {shard_dim} greater than tensor ndim {self.ndim}"
+                local_shard_size, _ = placement._local_shard_size_on_dim(
+                    local_shape[shard_dim], mesh_dim_size, my_coordinate
+                )
+                assert isinstance(local_shard_size, int)
+                local_shape[shard_dim] = local_shard_size
+        return tuple(local_shape)
+    
+    assert not hasattr(DTensorSpec, "local_shape")
+    setattr(DTensorSpec, "local_shape", property(local_shape))
+    
+    # Continue：fix: AttributeError: 'DeviceMesh' object has no attribute 'get_coordinate_on_dim'
+    from torch.distributed._tensor.device_mesh import DeviceMesh
+    from typing import Optional
+    # Borrow from https://github.com/pytorch/pytorch/blob/e9ebda29d87ce0916ab08c06ab26fd3766a870e5/torch/distributed/_tensor/device_mesh.py#L294C1-L299C81
+    # which was removed in 2.1.0
+    def get_coordinate_on_dim(self, dim: int) -> Optional[int]:
+        """
+        Return the relative index of this rank relative to a given
+        dimension of the mesh. If this rank is not part of the mesh, return None.
+        """
+        return self._coordinate_on_dim[dim] if self._coordinate_on_dim else None
+    
+    assert not hasattr(DeviceMesh, "get_coordinate_on_dim")
+    setattr(DeviceMesh, "get_coordinate_on_dim", get_coordinate_on_dim)

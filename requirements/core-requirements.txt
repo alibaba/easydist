@@ -2,3 +2,5 @@ pyyaml
 rich
 mip>=1.13
 sortedcontainers
+ortools
+pandas # for ortools
