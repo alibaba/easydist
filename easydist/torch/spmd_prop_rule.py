@@ -12,6 +12,7 @@ import torch
 from torch._meta_registrations import calc_conv_nd_return_shape
 from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
 from torch.distributed._tensor.ops.common_rules import pointwise_rule
+from torch.distributed._tensor.ops.tensor_ops import prop_index
 from torch.distributed._tensor.ops.utils import register_prop_rule
 from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate, Shard, _Partial)
 from easydist.torch.utils import get_dtensor_spec
@@ -25,7 +26,6 @@ extra_pointwise_op = [
 
 for op in extra_pointwise_op:
     register_prop_rule(op)(pointwise_rule)
-
 
 # from torch/distributed/_spmd/experimental_ops.py on pytorch main branch
 # copy it because it is not ready in released pytorch
@@ -249,7 +249,15 @@ def _prop_native_group_norm(op_schema: OpSchema) -> OutputSharding:
         placements=stats_placement,
         shape=torch.Size((input.shape[0], group)),
     )
-    return OutputSharding(output_spec=(input, stats_spec, stats_spec))
+
+    suggested_schema = OpSchema(
+        func_schema=op_schema.func_schema,
+        args_schema=op_schema.args_schema,
+        kwargs_schema=op_schema.kwargs_schema,
+    )
+
+    return OutputSharding(output_spec=(input, stats_spec, stats_spec), 
+                          schema_suggestions=[suggested_schema])
 
 
 @register_prop_rule(aten.native_group_norm_backward.default)
@@ -720,7 +728,11 @@ def scaled_dot_product_efficient_attention_rule(op_schema: OpSchema) -> OutputSh
                                   placements=[Replicate()] * query.mesh.ndim,
                                   shape=torch.Size(list(query.shape[:-2]) + [0]))
 
-    return OutputSharding(output_spec=(out_spec, state_spec))
+    # _scaled_dot_product_efficient_attention return 2 tensors for PyTorch < 2.1.0
+    if len(op_schema.func_schema.returns) == 2:
+        return OutputSharding(output_spec=(out_spec, state_spec))
+
+    return OutputSharding(output_spec=(out_spec, state_spec, None, None))
 
 
 @register_prop_rule(aten.masked_fill_.Scalar)
@@ -800,3 +812,6 @@ if "_foreach_pow" in torch.ops.aten.__dir__():
             isinstance(s, DTensorSpec) for s in exponent
         )
         return OutputSharding(output_spec=exponent)
+
+if "_unsafe_index" in torch.ops.aten.__dir__():
+    register_prop_rule(aten._unsafe_index.Tensor)(prop_index)

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Copyright (c) 2023, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +15,9 @@
 
 import collections
 import logging
+=======
+import collections
+>>>>>>> 79e7e801a2a0b0a2a8de8a93b330094f3b732239
 import numpy as np
 from ortools.sat.python import cp_model
 
@@ -74,8 +78,12 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_r
     This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
 
     Args:
+<<<<<<< HEAD
     task_data: [(task_id(unique), duration, predecessor, 
                  independent_resource_usage, dependent_resource_usage)]
+=======
+    task_data: [(task_id(unique), duration, predecessor, resource_usage)]
+>>>>>>> 79e7e801a2a0b0a2a8de8a93b330094f3b732239
     available_resources (list): The resources available.
 
     Returns:
