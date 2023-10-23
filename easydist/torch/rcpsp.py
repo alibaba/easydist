@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Copyright (c) 2023, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +14,6 @@
 
 import collections
 import logging
-=======
-import collections
->>>>>>> 79e7e801a2a0b0a2a8de8a93b330094f3b732239
 import numpy as np
 from ortools.sat.python import cp_model
 
