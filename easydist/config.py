@@ -31,6 +31,8 @@ compile_cache_dir = os.environ.get("EASYDIST_COMPILE_CACHE_PATH", './md_compiled
 
 easydist_device = os.environ.get("EASYDIST_DEVICE", "cuda")
 
+available_mem = 40 * 1024 * 1024 # (KB)
+
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"
@@ -44,7 +46,7 @@ max_seconds_same_incumbent = float('inf')
 all_to_all_punish_factor = 3.
 
 enable_graph_coarsen = os.environ.get("ENABLE_GRAPH_COARSEN", "True").upper() in ["1", "TRUE"]
-coarsen_level = int(os.environ.get("COARSEN_LEVEL", "1"))
+coarsen_level = int(os.environ.get("COARSEN_LEVEL", "0"))
 
 # Master address and port
 master_addr = os.environ.get("MASTER_ADDR", "localhost")

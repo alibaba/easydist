@@ -1,3 +1,16 @@
+# Copyright (c) 2023, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 from typing import Any, Dict, Iterator, Tuple
 
 import torch
@@ -5,9 +18,9 @@ import torch.utils._pytree as pytree
 from torch.fx.graph_module import GraphModule
 from torch.fx.interpreter import Interpreter
 from torch.fx.node import Target, Argument, _get_qualified_name
+from torch.distributed._tensor.api import DTensor
 
 from easydist.torch.graph_profile_db import PerfDB
-#from hyper import hyper_perf_db
 
 
 def to_meta(_node_output):
@@ -15,6 +28,9 @@ def to_meta(_node_output):
         return _node_output.to(device="meta").contiguous()
     elif type(_node_output) is torch.nn.parameter.Parameter:
         return _node_output.data.to(device="meta").contiguous()
+    elif type(_node_output) is DTensor:
+        _node_output._local_tensor = _node_output._local_tensor.to("meta")
+        return _node_output
     else:
         return _node_output
 
@@ -57,8 +73,6 @@ class HyperPerfMeasure(Interpreter):
                 if called_time.get(ops_name) is None:
                     called_time[ops_name] = 0
                 op_perf_key = {"ops_name": ops_name, "called_time": called_time[ops_name]}
-                #if self.perf_db.get_op_perf(op_perf_key) is None:
-                #    print(op_perf_key)
                 node_to_time[node.name] = self.perf_db.get_op_perf(op_perf_key)['time']
         return node_to_time
             

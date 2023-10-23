@@ -1,9 +1,26 @@
+# Copyright (c) 2023, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import collections
+import logging
 import numpy as np
 from ortools.sat.python import cp_model
 
 from itertools import product
 from mip import Model, xsum, BINARY
+
+logger = logging.getLogger(__name__)
 
 def rcpsp_genetic(num_tasks, processing_time, resource_consumption, available_resources, precedence_relations):
     """
@@ -52,12 +69,13 @@ def rcpsp_genetic(num_tasks, processing_time, resource_consumption, available_re
         if decision_variables[task][time_period].x >= 0.99:
             print(f"task {task}: begins at t={time_period} and finishes at t={time_period+processing_time[task]}")
 
-def rcpsp_general(task_data, resource_capacities):
+def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_rec=False):
     '''
     This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
 
     Args:
-    task_data: [(task_id(unique), duration, predecessor, resource_usage)]
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
     available_resources (list): The resources available.
 
     Returns:
@@ -78,10 +96,28 @@ def rcpsp_general(task_data, resource_capacities):
         for predecessor in predecessors:
             model.Add(task_ends[predecessor] <= task_starts[task])
 
+    if dependent_rec:
+        task_dep_ends = [model.NewIntVar(0, horizon, f'task_dep{i}end') for i in range(num_tasks)]
+        task_dep_durations = [model.NewIntVar(0, horizon, f'task_dep{i}end') for i in range(num_tasks)]
+
+        successors = [[i] for i in range(num_tasks)]
+        for i, (_, _, predecessors, _) in enumerate(task_data):
+            for predecessor in predecessors:
+                successors[predecessor].append(i)
+
+        for i, task_dep_end in enumerate(task_dep_ends):
+            model.AddMaxEquality(task_dep_end, [task_ends[j] for j in successors[i]])
+            model.Add(task_dep_durations[i] == task_dep_end - task_starts[i])
+
+        task_dep_intervals = [model.NewIntervalVar(task_starts[i], task_dep_durations[i],
+            task_dep_ends[i], f'dep_interval{i}') for i in range(num_tasks)]
+
     # Resource constraints
-    num_resources = len(resource_capacities)
     for i, capacity in enumerate(resource_capacities):
-        model.AddCumulative(task_intervals, [task[3][i] for task in task_data], capacity)
+        if dep_rec_mask[i] == 1:
+            model.AddCumulative(task_dep_intervals, [task[3][i] for task in task_data], capacity)
+        else:
+            model.AddCumulative(task_intervals, [task[3][i] for task in task_data], capacity)
 
     model.Minimize(task_ends[-1])
 
@@ -89,12 +125,17 @@ def rcpsp_general(task_data, resource_capacities):
     printer = cp_model.VarArraySolutionPrinter(task_starts)
     status = solver.Solve(model)
 
-    res = []
-    for i in range(len(task_data)):
-        res.append(solver.Value(task_starts[i]))
-    return np.argsort(res)
+    if status == cp_model.OPTIMAL:
+        logger.info("RCPSP: Optimal found")
+        res = []
+        for i in range(len(task_data)):
+            res.append(solver.Value(task_starts[i]))
+        return np.argsort(res)
+    else:
+        raise RuntimeError("RCPSP: No solution found!")
+        return None
 
-def rcpsp(task_data, available_resources, method):
+def rcpsp(task_data, available_resources, rec_dep_mask, method):
     '''
     Main entry of the solver.
 
@@ -115,10 +156,14 @@ def rcpsp(task_data, available_resources, method):
         resource_to_id[resource] = i
         resource_capacities.append(available_resources[resource])
 
-
     transformed_task_data = []
     key_to_id = {}
     id_to_key = {}
+    dependent_rec = False
+    for i in rec_dep_mask:
+        if i == 1:
+            dependent_rec = True
+            break
     for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
         key_to_id[task_key] = i
         id_to_key[i] = task_key
@@ -131,7 +176,8 @@ def rcpsp(task_data, available_resources, method):
 
     if method == 'general':
 
-        schedule = rcpsp_general(transformed_task_data, resource_capacities)
+        schedule = rcpsp_general(transformed_task_data, resource_capacities, 
+                                 rec_dep_mask, dependent_rec)
 
     elif method == 'genetic':
         num_tasks = len(task_data)
