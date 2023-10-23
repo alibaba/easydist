@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 aten = torch.ops.aten
 
 
-def _transform_to_Placemnet(varstrtg):
+def _transform_to_Placement(varstrtg):
     res = []
     for strtg in varstrtg:
         if strtg.is_replicate():
@@ -129,7 +129,7 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
                 if tensor_info == {} or var_strtg is None:
                     output_spec_list.append(None)
                     continue
-                spec = _transform_to_Placemnet(var_strtg.var_spmd_strategy)
+                spec = _transform_to_Placement(var_strtg.var_spmd_strategy)
                 shape = tensor_info['shape']
                 cur_kwargs = {
                     'placements': spec,

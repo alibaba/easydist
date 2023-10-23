@@ -152,18 +152,20 @@ def bench_easydist(model, data_in):
         optimizer.zero_grad()
         return output_
 
+    train_step_partial = partial(train_step, model, optimizer, data_in)
+    train_step_partial()
+
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-
-    train_step_partial = partial(train_step, model, optimizer, data_in)
 
     timer = EDTimer(train_step_partial, in_ms=False)
 
     elaps_time = timer.time()
     peak_memory = torch.cuda.max_memory_allocated()
 
-    print(f"Memory: {peak_memory / 1024 / 1024 / 1024} GB")
-    print(f"Time: {elaps_time}")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    print(f"[{local_rank}] Memory: {peak_memory / 1024 / 1024 / 1024} GB")
+    print(f"[{local_rank}] Time: {elaps_time}")
 
 
 def bench_easydist_old(model, data_in):
@@ -242,6 +244,7 @@ def main():
     model, data_in = get_gpt_case(device="meta")
 
     bench_easydist(model, data_in)
+
 
 
 if __name__ == '__main__':
