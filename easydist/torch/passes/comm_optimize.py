@@ -15,6 +15,7 @@
 import logging
 import operator
 import time
+import torch.utils._pytree as pytree
 
 from functools import reduce
 
@@ -25,7 +26,8 @@ from torch.fx.node import _get_qualified_name
 from torch.distributed._tensor import DeviceMesh
 
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
-from easydist.torch.graph_profile import HyperPerfMeasure
+from easydist.torch.graph_profile import HyperPerfMeasure, to_meta
+from easydist.torch.passes.rule_override import _transform_to_Placement
 import easydist.torch.rcpsp as rcpsp
 import easydist.config as mdconfig
 
@@ -55,7 +57,8 @@ def graph_profile(fx_module: torch.fx.GraphModule, shape_info):
     perf = HyperPerfMeasure(fx_module)
     device_mesh = get_device_mesh()
     if not isinstance(device_mesh, DeviceMesh):
-        RuntimeError("MockDeviceMesh in comm_optimize. Please set device to torch DeviceMesh")
+        raise RuntimeError("MockDeviceMesh in comm_optimize. Please set device to torch DeviceMesh")
+    # TODO can be modified to reduce args memory in total
     placements = [Replicate()] * device_mesh.ndim
     args = [DTensor.from_local(torch.randn(arg['shape'], dtype=arg['dtype']),
                                device_mesh, placements) \
@@ -103,6 +106,23 @@ def _is_comm_node(node):
             _get_qualified_name(node.target) == \
             'easydist.torch.passes.sharding.redist_tensor_func'
 
+def _output_strategy(node_list, opt_strategy):
+    specs = []
+    for node in node_list:
+        if opt_strategy.get(node.name) is not None:
+            strtgy = opt_strategy[node.name]['strategy']
+            out_strtgies = strtgy.out_strtg_group.var_spmd_strategy_group
+            spec = []
+            for out_strtgy in out_strtgies:
+                spec.append(list(_transform_to_Placement(out_strtgy)))
+            if len(spec) == 1:
+                spec = spec[0]
+        else:
+            spec = None
+        specs.append(spec)
+    return specs
+
+
 '''
 input:
 fx_module: GraphModule goint to be scheduled
@@ -117,7 +137,10 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
 
     # prepare RCPSP input
     task_data = []
-    available_resources = {'comm': 1, 'comp': 1}
+    available_resources = {'comm': 1, 'comp': 1, 'mem': int(0.9 * mdconfig.available_mem)}
+    
+    # whether resource release only until all nodes depended on it have finished
+    resource_dep_mask = [0, 0, 1]
     precedence_relations = []
 
     arg_num = 0
@@ -131,12 +154,33 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
         if _is_comm_node(node):
             duration = processing_time[node.name]
             resource.append(('comm', 1))
+
+            pre_node = node.all_input_nodes[0]
+            while shape_info.get(pre_node.name) is None:
+                pre_node = pre_node.all_input_nodes[0]
+
+            shape_node = pre_node
         else:
             if node.name in processing_time:
                 duration = processing_time[node.name]
             else:
                 duration = 20
             resource.append(('comp', 1))
+
+            shape_node = node
+
+        if shape_info.get(shape_node.name) is not None:
+            mem_req = 0
+            outputs = shape_info[shape_node.name]
+            if isinstance(outputs, tuple):
+                outputs = list(outputs)
+            elif not isinstance(outputs, list):
+                outputs = [outputs]
+            for output in outputs:
+                if output.get('shape') is not None:
+                    mem_req += int(reduce(lambda x, y: x * y, output['shape'], 1) / 1024)
+            #resource.append(('mem', mem_req))
+        
         precedence = []
         for pre in node.all_input_nodes:
             if not pre.name.__contains__('arg'):
@@ -151,7 +195,8 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
         logger.info('enter rcpsp')
         logger.info(f'task cnt: {len(task_data)}')
         start_t = time.perf_counter()
-        raw_sche = rcpsp.rcpsp(task_data, available_resources, 'general')
+        raw_sche = rcpsp.rcpsp(task_data, available_resources, 
+                               resource_dep_mask, 'general')
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
 
@@ -166,6 +211,50 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
     
     assert(len(sche) == len(fx_module.graph.nodes))
 
+    return sche
+
+def comm_group(sche, shape_info, cap_limit, rg_limit):
+    idx = len(sche) - 1
+    cur_cap = 0
+    cur_range = 0
+    cur_comm_list = []
+    comm_list_dep = []
+    while idx >= 0:
+        cur_range += 1
+        if not _is_comm_node(sche[idx]):
+            # check dependency
+            if sche[idx] in comm_list_dep:
+                cur_comm_list.reverse()
+                sche = sche[:idx + 1] + cur_comm_list + sche[idx + 1:]
+                cur_cap = 0
+                cur_range = 0
+                cur_comm_list = []
+                comm_list_dep = []
+            idx -= 1
+            continue
+        
+        if cur_range > rg_limit or cur_cap > cap_limit:
+            cur_comm_list.reverse()
+            sche = sche[:idx + 1] + cur_comm_list + sche[idx + 1:]
+            cur_cap = 0
+            cur_range = 0
+            cur_comm_list = []
+            comm_list_dep = []
+
+        node = sche[idx]
+        pre_node = node.all_input_nodes[0]
+        while shape_info.get(pre_node.name) is None:
+            pre_node = pre_node.all_input_nodes[0]
+        comm_vol = reduce(lambda x, y: x * y, 
+                          shape_info[pre_node.name]['shape'], 1)
+
+        if comm_vol < cap_limit:
+            cur_cap += comm_vol
+            cur_comm_list.append(node)
+            comm_list_dep.append(pre_node)
+
+        idx -= 1
+    assert(len(cur_comm_list) == 0)
     return sche
 
 def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy=None, grouping=False):
@@ -242,6 +331,8 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
     elif comm_strtg == 'rcpsp':
         sche = rcpsp_trial(fx_module, shape_info)
         
+        #sche = comm_group(sche, shape_info, 1024 * 1024, 40)
+        
         # schedule node topological order according to sche
         fx_module.graph._root._next = sche[0]
         sche[0]._prev = fx_module.graph._root
@@ -298,6 +389,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
         comm_list = comm_map[node]
         # redundancy remained
         input_nodes = [n for (n, _, _) in comm_list]
+        input_ori_specs = _output_strategy(input_nodes, opt_strategy)
         input_specs = [n.args[1] for (_, n, _) in comm_list]
         with fx_module.graph.inserting_after(node):
             new_node = fx_module.graph.call_function(
