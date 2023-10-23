@@ -193,12 +193,11 @@ class HyperPerfMeasure(Interpreter):
             ops_elapsed_time_ = ops_elapsed_time_ / self.trials
 
             db_record = {
-                #"output_meta": pytree.tree_map(to_meta, real_out),
+                "output_meta": pytree.tree_map(to_meta, real_out),
                 "time": ops_elapsed_time_
             }
 
             self.perf_db.record_op_perf(op_perf_key, db_record)
 
         self.sum_time += db_record["time"]
-        #return db_record["output_meta"]
-        return pytree.tree_map(to_meta, real_out)
+        return db_record["output_meta"]
