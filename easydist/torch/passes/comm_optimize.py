@@ -214,6 +214,7 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
     return sche
 
 def comm_group(sche, shape_info, cap_limit, rg_limit):
+    ori_sche_l = len(sche)
     idx = len(sche) - 1
     cur_cap = 0
     cur_range = 0
@@ -250,11 +251,14 @@ def comm_group(sche, shape_info, cap_limit, rg_limit):
 
         if comm_vol < cap_limit:
             cur_cap += comm_vol
+            sche.remove(node)
             cur_comm_list.append(node)
-            comm_list_dep.append(pre_node)
+            comm_list_dep.append(node.all_input_nodes[0])
 
         idx -= 1
     assert(len(cur_comm_list) == 0)
+    assert(len(sche) == ori_sche_l)
+    print(sche)
     return sche
 
 def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy=None, grouping=False):
@@ -334,7 +338,10 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
     elif comm_strtg == 'rcpsp':
         sche = rcpsp_trial(fx_module, shape_info)
         
+        sche = comm_group(sche, shape_info, 1024 * 1024, 10)
+        sche = comm_group(sche, shape_info, 1024 * 1024, 20)
         #sche = comm_group(sche, shape_info, 1024 * 1024, 40)
+        #sche = comm_group(sche, shape_info, 1024 * 1024, 100)
         
         # schedule node topological order according to sche
         fx_module.graph._root._next = sche[0]
