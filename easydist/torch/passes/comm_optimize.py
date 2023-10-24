@@ -259,7 +259,6 @@ def comm_group(sche, shape_info, cap_limit, rg_limit):
     assert(len(cur_comm_list) == 0)
     assert(len(sche) == ori_sche_l)
     print(sche)
-    return sche
 
 def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy=None, grouping=False):
     fx_module.graph.eliminate_dead_code()
