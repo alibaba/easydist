@@ -34,15 +34,13 @@ from torch.nn.utils import stateless
 
 import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
-from easydist.metashard import metair
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.experimental.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.init_helper import (SetParaInitHelper, init_contiguous_buf,
                                                      materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
-                                   fix_embedding, fix_meta_device, sharding_transform)
+                                   fix_embedding, fix_meta_device, sharding_transform, sharding_transform_dtensor)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
-from easydist.torch.mem_anaylize import mem_anaylize
 from easydist.torch.passes import comm_optimize, rule_override_by_graph
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
@@ -82,7 +80,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
 
     if find_cache:
         logger.info(f"load compiled result from {compiled_cache_file}.")
-        shape_info, opt_strategy, sharding_strategy, args_strategy = pickle.load(
+        shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map = pickle.load(
             open(compiled_cache_file, "rb"))
     else:
         if mdconfig.log_level <= logging.DEBUG:
@@ -134,15 +132,16 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             rich.print(sharding_strategy)
 
         args_strategy = meta_graph.get_input_strategy(opt_strategy)
-        args_strategy = [[to_torch_spmd(i) for i in var_strategy]
-                         for var_strategy in args_strategy]
+        args_strategy = [[to_torch_spmd(i) for i in var_strategy] for var_strategy in args_strategy]
+
+        state_io_map = meta_graph.state_io_map
 
         if mdconfig.enable_compile_cache:
-            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy],
+            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
 
-    return shape_info, opt_strategy, sharding_strategy, args_strategy
+    return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
 
 
 @torch.no_grad()
@@ -253,30 +252,35 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     # Lansong(TODO) Currently send strategy by rpc. But broadcast way is more efficient.
     rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
     if rank == 0:
-        shape_info, opt_strategy, sharding_strategy, args_strategy = easydist_shard(
+        shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map = easydist_shard(
                                 traced_graph, state_tensor_num, input_signature,
                                 params, buffers, named_states, args, kwargs)
 
         with sol_rdy_cond:
             global sharding_sol
-            sharding_sol = [shape_info, opt_strategy, sharding_strategy, args_strategy]
+            sharding_sol = [shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map]
             sol_rdy_cond.notify_all()
     else:
-        shape_info, opt_strategy, sharding_strategy, args_strategy = rpc.rpc_sync(
+        shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map = rpc.rpc_sync(
                               "ed_worker0", fetch_strategy, args=(), timeout=0)
 
     rpc.shutdown()
 
-    # mem_anaylize(traced_graph, shape_info, opt_strategy)
-    sharded_graph = sharding_transform(traced_graph, sharding_strategy)
+    if mdconfig.use_dtensor:
+        sharded_graph = sharding_transform_dtensor(traced_graph, sharding_strategy)
+    else:
+        sharded_graph = sharding_transform(traced_graph, opt_strategy, state_io_map)
+
     sharded_graph = fix_embedding(sharded_graph, recover=True)
 
-    if mdconfig.comm_optimization is True:
-        sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
+    if mdconfig.use_dtensor:
+        # (TODO) comm_optimize need to support non-dtensor graph
+        if mdconfig.comm_optimization is True:
+            sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
 
-    # override pytorch dtensor propagate rules to optimize dispater behavior
-    if mdconfig.override_dtensor_rule is True:
-        sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
+        # override pytorch dtensor propagate rules to optimize dispater behavior
+        if mdconfig.override_dtensor_rule is True:
+            sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
@@ -330,6 +334,9 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             params[param_name]._local_tensor = contiguous_buf[index:index + size].view(
                 params[param_name]._local_tensor.shape)
 
+        if not mdconfig.use_dtensor:
+            params[param_name] = params[param_name]._local_tensor
+
         index += size
 
     for idx, buffer_name in enumerate(buffers):
@@ -341,6 +348,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
                                               buffers_strategy[idx],
                                               get_device_mesh(),
                                               materialize_fn=materialize_fn)
+        if not mdconfig.use_dtensor:
+            buffers[buffer_name] = buffers[buffer_name]._local_tensor
 
     # use zero init for optimizer states
     flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
@@ -352,6 +361,9 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
                                                   args_strategy[state_tensor_num],
                                                   get_device_mesh(),
                                                   materialize_fn=materialize_fn)
+            if not mdconfig.use_dtensor:
+                flat_named_states[i] = flat_named_states[i]._local_tensor
+            
             state_tensor_num += 1
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
@@ -380,6 +392,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
                                                      args_strategy[args_strategy_idx],
                                                      get_device_mesh(),
                                                      materialize_fn=materialize_fn)
+                    if not mdconfig.use_dtensor:
+                        flatten_args[i] = flatten_args[i]._local_tensor
                     args_strategy_idx += 1
 
             args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)

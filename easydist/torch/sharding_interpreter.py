@@ -305,9 +305,10 @@ class EDTorchShardingAnn(Interpreter):
             return pytree.tree_unflatten(flat_args, args_specs)
 
         args, kwargs = materialize_args_kwargs(args_meta, kwargs_meta)
+        shard_size = max(2, device_mesh_world_size())
         meta_op = MetaOp(func=target,
                          input_args=(args, kwargs),
-                         shard_size=device_mesh_world_size(),
+                         shard_size=shard_size,
                          name=ops_name)
         # user fake tensor here, maybe use shape/dtype info from `make_fx`
         meta_out = meta_op.meta_exec(flat_meta_input=pytree.tree_flatten((args_meta,

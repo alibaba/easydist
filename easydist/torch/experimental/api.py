@@ -90,6 +90,11 @@ class CompiledFuncWrapper:
         need_compile = world_size >= 2
         if get_device_mesh() is not None:
             need_compile = device_mesh_world_size() >= 2
+        
+        # override need_compile with forced_compile env var
+        if mdconfig.forced_compile:
+            need_compile = True
+
         if need_compile and self.compiled_func is None:
             mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
             mesh = DeviceMesh("cuda", mesh_shape.tolist())

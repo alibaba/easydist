@@ -17,12 +17,39 @@ import logging
 import torch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed._tensor import mesh_resources
 from torch.fx.node import Node, _get_qualified_name, map_arg
+from torch.distributed._functional_collectives import all_gather_tensor, all_reduce, reduce_scatter_tensor
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
 from easydist.utils.testing import MockDeviceMesh
+from easydist.metashard.metair import VarSPMDStrategy, SPMD
+from easydist.metashard.combination import ReduceOp
 
 logger = logging.getLogger(__name__)
+
+reduce_map = {
+    ReduceOp.SUM: "sum",
+    ReduceOp.MAX: "max",
+    ReduceOp.MIN: "min",
+    ReduceOp.AVG: "avg",
+}
+
+
+def all_gather_tensor_wrapper(tensor, dim, ranks):
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    return all_gather_tensor(tensor, dim, ranks)
+
+
+def scatter_wrapper(tensor, num_chunks, dim, indice):
+    return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice]
+
+
+def all_to_all_wrapper(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks):
+    # (TODO) call all_gather for all_to_all, need to use all_to_all for less comm size
+    gathered_tensor = all_gather_tensor_wrapper(tensor, gather_dim, ranks)
+    return scatter_wrapper(gathered_tensor, num_chunks, scatter_dim, indice)
 
 
 def materialize(x, device):
@@ -137,7 +164,7 @@ def replace_subsequence_use(node, arg_, redist_node):
         node_next = node_next.next
 
 
-def sharding_transform(fx_module: torch.fx.GraphModule, sharding_strategy):
+def sharding_transform_dtensor(fx_module: torch.fx.GraphModule, sharding_strategy):
     for node in fx_module.graph.nodes:
         if node.op == 'call_function':
             if node.name in sharding_strategy:
@@ -169,5 +196,152 @@ def sharding_transform(fx_module: torch.fx.GraphModule, sharding_strategy):
 
     # (fix) %_tensor_constant0 : [#users=1] = get_attr[target=_tensor_constant0]
     fx_module = fix_in_gragh_tensor(fx_module, sharding_strategy)
+
+    return fx_module
+
+
+def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_map):
+
+    shard_env = {}
+
+    # the last element in fx_module output is the return tensor for user function
+    # we need to make it replicate before
+    num_return_value = fx_module._out_spec.children_specs[-1].num_leaves
+
+    for node in fx_module.graph.nodes:
+        if node.op == 'placeholder':
+            if node.name in opt_strategy:
+                shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group[0]
+            else:
+                # TODO: only support 2d device mesh here
+                shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
+        elif node.op == 'call_function':
+
+            # skip for create ops
+            ops_name = _get_qualified_name(node.target)
+            if ops_name in ["torch.ops.aten.empty.memory_format", "torch.ops.aten.zeros.default"]:
+                # TODO: only support 2d device mesh here
+                shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
+                continue
+
+            if ops_name == "_operator.getitem":
+                shard_env[node.name] = shard_env[node.args[0].name][node.args[1]]
+                continue
+
+            node_args_flatten = pytree.tree_flatten(node.args)[0]
+            invars = [arg for arg in node_args_flatten if isinstance(arg, Node)]
+
+            invars_strategy = opt_strategy[node.name]['strategy'].in_strtg_group
+
+            assert len(invars) == len(invars_strategy)
+
+            for var_, tgt_specs in zip(invars, invars_strategy):
+                src_specs = shard_env[var_.name]
+                if tgt_specs != src_specs:
+                    # mismatch need to insert communication node
+                    device_mesh = get_device_mesh()
+                    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+
+                    for i, (current, target) in sorted_placements:
+                        my_coordinate = device_mesh.get_coordinate()
+                        num_chunks = device_mesh.size(dim=i)
+
+                        if current == target:
+                            continue
+
+                        if target.is_shard():
+                            if current.is_replicate():
+                                # insert split_tensor here
+                                with fx_module.graph.inserting_before(node):
+                                    scatter_node = fx_module.graph.call_function(
+                                        scatter_wrapper,
+                                        args=(var_, num_chunks, target.args["dim"],
+                                              my_coordinate[i]))
+
+                                    node.replace_input_with(var_, scatter_node)
+                            elif current.is_shard():
+                                # all_to_all
+                                with fx_module.graph.inserting_before(node):
+                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                                    ranks = submesh.mesh.flatten().tolist()
+                                    all_to_all_node = fx_module.graph.call_function(
+                                        all_to_all_wrapper,
+                                        args=(var_, current.args["dim"], target.args["dim"],
+                                              num_chunks, my_coordinate[i], ranks))
+
+                                    node.replace_input_with(var_, all_to_all_node)
+
+                            elif current.is_partial():
+                                # reduce_scatter
+                                with fx_module.graph.inserting_before(node):
+                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                                    ranks = submesh.mesh.flatten().tolist()
+                                    reduceOp = reduce_map[current.args["ops"]]
+                                    # make sure contiguous
+                                    reduce_scatter_node = fx_module.graph.call_function(
+                                        reduce_scatter_tensor,
+                                        args=(var_, reduceOp, target.args["dim"], ranks))
+
+                                    node.replace_input_with(var_, reduce_scatter_node)
+                        elif target.is_replicate():
+                            if current.is_shard():
+                                # insert all_gather here
+                                with fx_module.graph.inserting_before(node):
+                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                                    ranks = submesh.mesh.flatten().tolist()
+                                    # make sure contiguous
+                                    all_gather_node = fx_module.graph.call_function(
+                                        all_gather_tensor_wrapper,
+                                        args=(var_, current.args["dim"], ranks))
+
+                                    node.replace_input_with(var_, all_gather_node)
+                            elif current.is_partial():
+                                # insert all_reduce here
+                                with fx_module.graph.inserting_before(node):
+                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                                    ranks = submesh.mesh.flatten().tolist()
+                                    reduceOp = reduce_map[current.args["ops"]]
+                                    all_reduce_node = fx_module.graph.call_function(all_reduce,
+                                                                                    args=(var_,
+                                                                                          reduceOp,
+                                                                                          ranks))
+
+                                    node.replace_input_with(var_, all_reduce_node)
+
+            shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
+            if len(shard_env[node.name]) == 1:
+                shard_env[node.name] = shard_env[node.name][0]
+
+        if node.op == 'output':
+            need_replicate_node = node.args[0][-1 * num_return_value:]
+            device_mesh = get_device_mesh()
+            sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+            for o_node in need_replicate_node:
+                src_specs = shard_env[o_node.name]
+                for i, current in enumerate(src_specs):
+                    if current.is_shard():
+                        # insert all_gather here
+                        with fx_module.graph.inserting_before(node):
+                            submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                            ranks = submesh.mesh.flatten().tolist()
+                            # make sure contiguous
+                            all_gather_node = fx_module.graph.call_function(
+                                all_gather_tensor_wrapper,
+                                args=(o_node, current.args["dim"], ranks))
+
+                            node.replace_input_with(o_node, all_gather_node)
+                    elif current.is_partial():
+                        # insert all_reduce here
+                        with fx_module.graph.inserting_before(node):
+                            submesh = mesh_resources.create_child_mesh(device_mesh, 1)
+                            ranks = submesh.mesh.flatten().tolist()
+                            reduceOp = reduce_map[current.args["ops"]]
+                            all_reduce_node = fx_module.graph.call_function(all_reduce,
+                                                                            args=(o_node, reduceOp,
+                                                                                  ranks))
+
+                            node.replace_input_with(o_node, all_reduce_node)
+
+    fx_module.recompile()
 
     return fx_module

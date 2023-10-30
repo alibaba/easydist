@@ -41,17 +41,18 @@ ABSTRACT_DTYPE = {
 }
 
 
-def to_torch_spmd(meta_spmd):
-    if meta_spmd.state == metair.SPMD.SHARD:
+def to_torch_spmd(meta_spmd: metair.SPMD):
+    if meta_spmd.is_shard():
         return spmd.Shard(dim=meta_spmd.args["dim"])
-    elif meta_spmd.state == metair.SPMD.PARTIAL:
+    elif meta_spmd.is_partial():
         mapping_ops = {
             ReduceOp.SUM: c10d.ReduceOp.RedOpType.SUM,
             ReduceOp.MAX: c10d.ReduceOp.RedOpType.MAX,
             ReduceOp.MIN: c10d.ReduceOp.RedOpType.MIN,
+            ReduceOp.AVG: c10d.ReduceOp.RedOpType.AVG,
         }
         return spmd.placement_types._Partial(reduce_op=mapping_ops[meta_spmd.args["ops"]])
-    elif meta_spmd.state == metair.SPMD.REPLICATE:
+    elif meta_spmd.is_replicate():
         return spmd.Replicate()
 
 

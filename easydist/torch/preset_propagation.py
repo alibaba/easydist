@@ -314,3 +314,21 @@ def meta_group_norm(args, kwargs):
         ]
 
     return sharding_ann, combine_ann
+
+
+@register_meta_spmd(aten.mean.default)
+def meta_mean(args, kwargs):
+    tensor_shape = args[0].shape
+    world_size = device_mesh_world_size()
+    sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(tensor_shape)])
+
+    shard_idx = 1
+    combine_ann = {}
+
+    for idx, shape in enumerate(tensor_shape):
+        if world_size <= shape:
+            sharding_ann[0][idx] = ShardDim(shard_idx)
+            combine_ann[shard_idx] = functools.partial(CombinationFunc.reduce, ops=ReduceOp.AVG)
+            shard_idx += 1
+
+    return sharding_ann, combine_ann
