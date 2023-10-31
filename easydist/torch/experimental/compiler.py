@@ -285,6 +285,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
 
+    sharded_graph.print_readable()
+
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
     if isinstance(device_mesh, TorchMockDeviceMesh):

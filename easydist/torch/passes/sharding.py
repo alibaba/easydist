@@ -20,8 +20,12 @@ from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed._tensor import mesh_resources
 from torch.fx.node import Node, _get_qualified_name, map_arg
 from torch.distributed._functional_collectives import all_gather_tensor, all_reduce, reduce_scatter_tensor
+from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
+                                                    propagate_shape_and_sharding,
+                                                    compute_local_shape)
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
+from easydist.torch.utils import to_torch_spmd
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD
 from easydist.metashard.combination import ReduceOp
@@ -200,6 +204,113 @@ def sharding_transform_dtensor(fx_module: torch.fx.GraphModule, sharding_strateg
     return fx_module
 
 
+def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placements):
+
+    device_mesh = get_device_mesh()
+
+    for i, (current, target) in sorted_placements:
+        my_coordinate = device_mesh.get_coordinate()
+        num_chunks = device_mesh.size(dim=i)
+
+        if current == target:
+            continue
+
+        if target.is_shard():
+            if current.is_replicate():
+                # insert split_tensor here
+                with fx_module.graph.inserting_before(node):
+                    scatter_node = fx_module.graph.call_function(scatter_wrapper,
+                                                                 args=(var_, num_chunks,
+                                                                       target.args["dim"],
+                                                                       my_coordinate[i]))
+
+                    node.replace_input_with(var_, scatter_node)
+            elif current.is_shard():
+                # all_to_all
+                with fx_module.graph.inserting_before(node):
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    all_to_all_node = fx_module.graph.call_function(
+                        all_to_all_wrapper,
+                        args=(var_, current.args["dim"], target.args["dim"], num_chunks,
+                              my_coordinate[i], ranks))
+
+                    node.replace_input_with(var_, all_to_all_node)
+            elif current.is_partial():
+                # reduce_scatter
+                with fx_module.graph.inserting_before(node):
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    reduceOp = reduce_map[current.args["ops"]]
+                    # make sure contiguous
+                    reduce_scatter_node = fx_module.graph.call_function(reduce_scatter_tensor,
+                                                                        args=(var_, reduceOp,
+                                                                              target.args["dim"],
+                                                                              ranks))
+
+                    node.replace_input_with(var_, reduce_scatter_node)
+        elif target.is_replicate():
+            if current.is_shard():
+                # insert all_gather here
+                with fx_module.graph.inserting_before(node):
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    # make sure contiguous
+                    all_gather_node = fx_module.graph.call_function(all_gather_tensor_wrapper,
+                                                                    args=(var_,
+                                                                          current.args["dim"],
+                                                                          ranks))
+
+                    node.replace_input_with(var_, all_gather_node)
+            elif current.is_partial():
+                # insert all_reduce here
+                with fx_module.graph.inserting_before(node):
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    reduceOp = reduce_map[current.args["ops"]]
+                    all_reduce_node = fx_module.graph.call_function(all_reduce,
+                                                                    args=(var_, reduceOp, ranks))
+
+                    node.replace_input_with(var_, all_reduce_node)
+
+    return fx_module
+
+
+# some of this part from torch/distributed/_tensor/ops/view_ops.py
+def override_args(node, invars_strategy):
+    device_mesh = get_device_mesh()
+
+    view_op_map = {
+        torch.ops.aten.view.default: lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten._unsafe_view.default: lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten.reshape.default: lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten.expand.default:
+            lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
+    }
+
+    if node.target in view_op_map:
+        global_in_shape = node.args[0].meta['val'].shape
+        shape_argnum = 1
+
+        input_dtensor_spec = [to_torch_spmd(i) for i in invars_strategy[0]]
+        rules = view_op_map[node.target](global_in_shape, node.args[shape_argnum])
+
+        (
+            global_out_shape,
+            shard_out,
+            shardable_dims,
+        ) = propagate_shape_and_sharding(
+            input_dtensor_spec,
+            tuple(global_in_shape),
+            rules,
+            tuple(device_mesh.mesh.shape),
+        )
+
+        local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
+
+        node.update_arg(shape_argnum, local_out_shape)
+
+
 def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_map):
 
     shard_env = {}
@@ -233,80 +344,16 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
             invars_strategy = opt_strategy[node.name]['strategy'].in_strtg_group
 
+            override_args(node, invars_strategy)
+
             assert len(invars) == len(invars_strategy)
 
             for var_, tgt_specs in zip(invars, invars_strategy):
                 src_specs = shard_env[var_.name]
                 if tgt_specs != src_specs:
                     # mismatch need to insert communication node
-                    device_mesh = get_device_mesh()
                     sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
-
-                    for i, (current, target) in sorted_placements:
-                        my_coordinate = device_mesh.get_coordinate()
-                        num_chunks = device_mesh.size(dim=i)
-
-                        if current == target:
-                            continue
-
-                        if target.is_shard():
-                            if current.is_replicate():
-                                # insert split_tensor here
-                                with fx_module.graph.inserting_before(node):
-                                    scatter_node = fx_module.graph.call_function(
-                                        scatter_wrapper,
-                                        args=(var_, num_chunks, target.args["dim"],
-                                              my_coordinate[i]))
-
-                                    node.replace_input_with(var_, scatter_node)
-                            elif current.is_shard():
-                                # all_to_all
-                                with fx_module.graph.inserting_before(node):
-                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                                    ranks = submesh.mesh.flatten().tolist()
-                                    all_to_all_node = fx_module.graph.call_function(
-                                        all_to_all_wrapper,
-                                        args=(var_, current.args["dim"], target.args["dim"],
-                                              num_chunks, my_coordinate[i], ranks))
-
-                                    node.replace_input_with(var_, all_to_all_node)
-
-                            elif current.is_partial():
-                                # reduce_scatter
-                                with fx_module.graph.inserting_before(node):
-                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                                    ranks = submesh.mesh.flatten().tolist()
-                                    reduceOp = reduce_map[current.args["ops"]]
-                                    # make sure contiguous
-                                    reduce_scatter_node = fx_module.graph.call_function(
-                                        reduce_scatter_tensor,
-                                        args=(var_, reduceOp, target.args["dim"], ranks))
-
-                                    node.replace_input_with(var_, reduce_scatter_node)
-                        elif target.is_replicate():
-                            if current.is_shard():
-                                # insert all_gather here
-                                with fx_module.graph.inserting_before(node):
-                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                                    ranks = submesh.mesh.flatten().tolist()
-                                    # make sure contiguous
-                                    all_gather_node = fx_module.graph.call_function(
-                                        all_gather_tensor_wrapper,
-                                        args=(var_, current.args["dim"], ranks))
-
-                                    node.replace_input_with(var_, all_gather_node)
-                            elif current.is_partial():
-                                # insert all_reduce here
-                                with fx_module.graph.inserting_before(node):
-                                    submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                                    ranks = submesh.mesh.flatten().tolist()
-                                    reduceOp = reduce_map[current.args["ops"]]
-                                    all_reduce_node = fx_module.graph.call_function(all_reduce,
-                                                                                    args=(var_,
-                                                                                          reduceOp,
-                                                                                          ranks))
-
-                                    node.replace_input_with(var_, all_reduce_node)
+                    fx_module = insert_comm_node(fx_module, node, var_, sorted_placements)
 
             shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
             if len(shard_env[node.name]) == 1:
@@ -314,33 +361,29 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
         if node.op == 'output':
             need_replicate_node = node.args[0][-1 * num_return_value:]
-            device_mesh = get_device_mesh()
-            sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
             for o_node in need_replicate_node:
                 src_specs = shard_env[o_node.name]
-                for i, current in enumerate(src_specs):
-                    if current.is_shard():
-                        # insert all_gather here
-                        with fx_module.graph.inserting_before(node):
-                            submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                            ranks = submesh.mesh.flatten().tolist()
-                            # make sure contiguous
-                            all_gather_node = fx_module.graph.call_function(
-                                all_gather_tensor_wrapper,
-                                args=(o_node, current.args["dim"], ranks))
+                tgt_specs = [SPMD(SPMD.REPLICATE)] * len(src_specs)
+                tgt_specs = VarSPMDStrategy(*tgt_specs)
+                if tgt_specs != src_specs:
+                    # mismatch need to insert communication node
+                    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+                    fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements)
 
-                            node.replace_input_with(o_node, all_gather_node)
-                    elif current.is_partial():
-                        # insert all_reduce here
-                        with fx_module.graph.inserting_before(node):
-                            submesh = mesh_resources.create_child_mesh(device_mesh, 1)
-                            ranks = submesh.mesh.flatten().tolist()
-                            reduceOp = reduce_map[current.args["ops"]]
-                            all_reduce_node = fx_module.graph.call_function(all_reduce,
-                                                                            args=(o_node, reduceOp,
-                                                                                  ranks))
-
-                            node.replace_input_with(o_node, all_reduce_node)
+            for in_node, out_node in state_io_map.items():
+                if in_node.name in shard_env:
+                    src_specs = shard_env[out_node.name]
+                    tgt_specs = shard_env[in_node.name]
+                    o_node = None
+                    for node_ in node.args[0]:
+                        if node_ is not None and node_.name == out_node.name:
+                            o_node = node_
+                            break
+                    assert o_node is not None
+                    if tgt_specs != src_specs:
+                        # mismatch need to insert communication node
+                        sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+                        fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements)
 
     fx_module.recompile()
 
