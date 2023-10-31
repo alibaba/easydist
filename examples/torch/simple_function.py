@@ -4,15 +4,7 @@ import logging
 import torch
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch import set_device_mesh
 from easydist.torch.experimental.api import easydist_compile
-from easydist.utils.testing import TorchMockDeviceMesh
-
-
-@easydist_compile()
-def foo_func(x, y):
-    tanh = torch.tanh(x)
-    return torch.mm(torch.exp(tanh), y) + tanh
 
 
 def main():
@@ -23,13 +15,15 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    mesh = TorchMockDeviceMesh(1, 4, debug_only=True)
-    set_device_mesh(mesh)
-
     randn_x = torch.randn(10, 10, requires_grad=True).cuda()
     randn_y = torch.randn(10, 10, requires_grad=True).cuda()
     torch.distributed.broadcast(randn_x, src=0)
     torch.distributed.broadcast(randn_y, src=0)
+
+    @easydist_compile()
+    def foo_func(x, y):
+        tanh = torch.tanh(x)
+        return torch.mm(torch.exp(tanh), y) + tanh
 
     torch_out = foo_func.original_func(randn_x, randn_y)
     md_out = foo_func(randn_x, randn_y)

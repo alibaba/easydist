@@ -40,8 +40,11 @@ def easydist_setup_torch(device, allow_tf32):
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     torch.backends.cudnn.allow_tf32 = allow_tf32
 
-    # this environment used for cuda graph
+    # this env var used for cuda graph
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+    # this env var enforces the order of kernel execution on GPU as the kernel queuing order from host.
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
 
 # hotfix for PyTorch 2.1.0
