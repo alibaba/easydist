@@ -12,8 +12,6 @@ from torch.utils.checkpoint import checkpoint
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.experimental.api import easydist_compile
-from easydist.torch import set_device_mesh
-from easydist.utils.testing import TorchMockDeviceMesh
 
 
 def broadcast_module(model):
@@ -57,7 +55,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo()
-        randn_input = torch.randn(3, 5)
+        randn_input = torch.randn(1024, 1024)
 
     # broadcast the parameter and input
     model = broadcast_module(model)
@@ -65,11 +63,8 @@ def inference_example(fake_init=True, cpu_init_helper=False):
 
     torch_out = inference_step.original_func(model, randn_input)
 
-    mock_mesh = TorchMockDeviceMesh(1, 2, debug_only=True)
-    set_device_mesh(mock_mesh)
-
     if fake_init:
-        randn_input = torch.randn(3, 5).cuda()
+        randn_input = torch.randn(1024, 1024).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
@@ -122,10 +117,6 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)
-
-    # trace train step func
-    mock_mesh = TorchMockDeviceMesh(1, 2, debug_only=True)
-    set_device_mesh(mock_mesh)
 
     # need real input for compiled func
     if fake_init:

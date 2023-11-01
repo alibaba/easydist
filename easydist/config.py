@@ -33,6 +33,8 @@ easydist_device = os.environ.get("EASYDIST_DEVICE", "cuda")
 
 available_mem = 40 * 1024 * 1024 # (KB)
 
+forced_compile = os.environ.get("EASYDIST_FORCED_COMPILE", "False").upper() in ["1", "TRUE"]
+use_dtensor = True
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"

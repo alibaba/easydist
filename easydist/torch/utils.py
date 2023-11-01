@@ -19,10 +19,14 @@ from typing import Any, Dict
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
+import torch.distributed.distributed_c10d as c10d
+import torch.distributed._tensor as spmd
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.utils._mode_utils import no_dispatch
 import torch.utils._pytree as pytree
 
+from easydist.metashard.combination import ReduceOp
+from easydist.metashard import metair
 
 def to_meta(node_output):
     if isinstance(node_output, FakeTensor):
@@ -34,6 +38,21 @@ def to_meta(node_output):
         return node_output.data.detach().to(device="meta").contiguous()
     else:
         return node_output
+
+
+def to_torch_spmd(meta_spmd: metair.SPMD):
+    if meta_spmd.is_shard():
+        return spmd.Shard(dim=meta_spmd.args["dim"])
+    elif meta_spmd.is_partial():
+        mapping_ops = {
+            ReduceOp.SUM: c10d.ReduceOp.RedOpType.SUM,
+            ReduceOp.MAX: c10d.ReduceOp.RedOpType.MAX,
+            ReduceOp.MIN: c10d.ReduceOp.RedOpType.MIN,
+            ReduceOp.AVG: c10d.ReduceOp.RedOpType.AVG,
+        }
+        return spmd.placement_types._Partial(reduce_op=mapping_ops[meta_spmd.args["ops"]])
+    elif meta_spmd.is_replicate():
+        return spmd.Replicate()
 
 
 @contextmanager
