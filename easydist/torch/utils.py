@@ -16,6 +16,8 @@ import hashlib
 from contextlib import contextmanager
 from copy import copy
 from typing import Any, Dict
+from enum import Enum
+from dataclasses import dataclass
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -27,6 +29,8 @@ import torch.utils._pytree as pytree
 
 from easydist.metashard.combination import ReduceOp
 from easydist.metashard import metair
+from easydist.metashard.metair import NodeSPMDStrategy
+
 
 def to_meta(node_output):
     if isinstance(node_output, FakeTensor):
@@ -38,6 +42,23 @@ def to_meta(node_output):
         return node_output.data.detach().to(device="meta").contiguous()
     else:
         return node_output
+
+
+class EDNodeType(Enum):
+    COMMUNITAION = 1
+    COMPUTATION = 2
+    AUXILIARY = 3
+
+
+@dataclass
+class EDInfo:
+    node_type: EDNodeType = None
+    sharding_info: Any = None
+    strategy: NodeSPMDStrategy = None
+    runtime_ms: float = 0.0
+
+    def is_communication(self):
+        return self.node_type == EDNodeType.COMMUNITAION
 
 
 def to_torch_spmd(meta_spmd: metair.SPMD):

@@ -12,20 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 
+import operator
 import logging
+from typing import List
 
 import torch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed._tensor import mesh_resources
+from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
-from torch.distributed._functional_collectives import all_gather_tensor, all_reduce, reduce_scatter_tensor
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
-from easydist.torch.utils import to_torch_spmd
+from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD
 from easydist.metashard.combination import ReduceOp
@@ -40,20 +42,75 @@ reduce_map = {
 }
 
 
-def all_gather_tensor_wrapper(tensor, dim, ranks):
-    if not tensor.is_contiguous():
-        tensor = tensor.contiguous()
-    return all_gather_tensor(tensor, dim, ranks)
+def all_reduce_start(self: torch.Tensor, reduceOp: str, group: List[int], tag: str = ""):
+    tag, rankset, group_size = _expand_group(group, tag)
+    tensor = torch.ops.c10d_functional.all_reduce(self, reduceOp, tag, rankset,
+                                                  group_size)  # type: ignore[attr-defined]
+    return tensor
+
+
+def all_reduce_end(self: torch.Tensor, reduceOp: str, group: List[int], tag: str = ""):
+    return torch.ops.c10d_functional.wait_tensor(self)
+
+
+def all_gather_tensor_start(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
+    if not self.is_contiguous():
+        self = self.contiguous()
+    tag, rankset, group_size = _expand_group(group, tag)
+    tensor = torch.ops.c10d_functional.all_gather_into_tensor(
+        self, tag, rankset, group_size)  # type: ignore[attr-defined]
+    return tensor
+
+
+def all_gather_tensor_end(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
+    self = torch.ops.c10d_functional.wait_tensor(self)
+    tag, rankset, group_size = _expand_group(group, tag)
+    if gather_dim != 0:
+        self = torch.cat(torch.chunk(self, group_size, dim=0), dim=gather_dim)
+    return self
 
 
 def scatter_wrapper(tensor, num_chunks, dim, indice):
     return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice]
 
 
-def all_to_all_wrapper(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks):
+def reduce_scatter_start(self: torch.Tensor,
+                         reduceOp: str,
+                         scatter_dim: int,
+                         group: List[int],
+                         tag: str = ""):
+    tag, rankset, group_size = _expand_group(group, tag)
+    assert (self.size(scatter_dim) % group_size == 0
+            ), f"input dimension 0 ({self.size(0)} must be a multiple of group_size {group_size}"
+    if scatter_dim != 0:
+        tensor_list = torch.chunk(self, group_size, dim=scatter_dim)
+        self = torch.cat(tensor_list)
+
+    tensor = torch.ops.c10d_functional.reduce_scatter_tensor(
+        self, reduceOp, tag, rankset, group_size)  # type: ignore[attr-defined]
+    return tensor
+
+
+def reduce_scatter_end(self: torch.Tensor,
+                       reduceOp: str,
+                       scatter_dim: int,
+                       group: List[int],
+                       tag: str = ""):
+    return torch.ops.c10d_functional.wait_tensor(self)
+
+
+def all_to_all_start(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks, tag: str = ""):
     # (TODO) call all_gather for all_to_all, need to use all_to_all for less comm size
-    gathered_tensor = all_gather_tensor_wrapper(tensor, gather_dim, ranks)
-    return scatter_wrapper(gathered_tensor, num_chunks, scatter_dim, indice)
+    gathered_tensor = all_gather_tensor_start(tensor, gather_dim, ranks, tag)
+    return gathered_tensor
+
+
+def all_to_all_end(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks, tag: str = ""):
+    tensor = all_gather_tensor_end(tensor, gather_dim, ranks, tag)
+    return scatter_wrapper(tensor, num_chunks, scatter_dim, indice)
+
+
+COMM_FUNCS = [all_reduce_start, all_gather_tensor_start, reduce_scatter_start, all_to_all_start]
 
 
 def materialize(x, device):
@@ -230,12 +287,16 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                 with fx_module.graph.inserting_before(node):
                     submesh = mesh_resources.create_child_mesh(device_mesh, i)
                     ranks = submesh.mesh.flatten().tolist()
-                    all_to_all_node = fx_module.graph.call_function(
-                        all_to_all_wrapper,
+                    all_to_all_start_node = fx_module.graph.call_function(
+                        all_to_all_start,
                         args=(var_, current.args["dim"], target.args["dim"], num_chunks,
                               my_coordinate[i], ranks))
+                    all_to_all_end_node = fx_module.graph.call_function(
+                        all_to_all_end,
+                        args=(all_to_all_start_node, current.args["dim"], target.args["dim"],
+                              num_chunks, my_coordinate[i], ranks))
 
-                    node.replace_input_with(var_, all_to_all_node)
+                    node.replace_input_with(var_, all_to_all_end_node)
             elif current.is_partial():
                 # reduce_scatter
                 with fx_module.graph.inserting_before(node):
@@ -243,12 +304,14 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                     ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
-                    reduce_scatter_node = fx_module.graph.call_function(reduce_scatter_tensor,
-                                                                        args=(var_, reduceOp,
-                                                                              target.args["dim"],
-                                                                              ranks))
+                    reduce_scatter_start_node = fx_module.graph.call_function(
+                        reduce_scatter_start, args=(var_, reduceOp, target.args["dim"], ranks))
 
-                    node.replace_input_with(var_, reduce_scatter_node)
+                    reduce_scatter_end_node = fx_module.graph.call_function(
+                        reduce_scatter_end,
+                        args=(reduce_scatter_start_node, reduceOp, target.args["dim"], ranks))
+
+                    node.replace_input_with(var_, reduce_scatter_end_node)
         elif target.is_replicate():
             if current.is_shard():
                 # insert all_gather here
@@ -256,22 +319,27 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                     submesh = mesh_resources.create_child_mesh(device_mesh, i)
                     ranks = submesh.mesh.flatten().tolist()
                     # make sure contiguous
-                    all_gather_node = fx_module.graph.call_function(all_gather_tensor_wrapper,
-                                                                    args=(var_,
-                                                                          current.args["dim"],
-                                                                          ranks))
+                    all_gather_start_node = fx_module.graph.call_function(
+                        all_gather_tensor_start, args=(var_, current.args["dim"], ranks))
+                    all_gather_end_node = fx_module.graph.call_function(
+                        all_gather_tensor_end,
+                        args=(all_gather_start_node, current.args["dim"], ranks))
 
-                    node.replace_input_with(var_, all_gather_node)
+                    node.replace_input_with(var_, all_gather_end_node)
             elif current.is_partial():
                 # insert all_reduce here
                 with fx_module.graph.inserting_before(node):
                     submesh = mesh_resources.create_child_mesh(device_mesh, i)
                     ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
-                    all_reduce_node = fx_module.graph.call_function(all_reduce,
-                                                                    args=(var_, reduceOp, ranks))
+                    all_reduce_start_node = fx_module.graph.call_function(all_reduce_start,
+                                                                          args=(var_, reduceOp,
+                                                                                ranks))
 
-                    node.replace_input_with(var_, all_reduce_node)
+                    all_reduce_end_node = fx_module.graph.call_function(
+                        all_reduce_end, args=(all_reduce_start_node, reduceOp, ranks))
+
+                    node.replace_input_with(var_, all_reduce_end_node)
 
     return fx_module
 
@@ -281,11 +349,14 @@ def override_args(node, invars_strategy):
     device_mesh = get_device_mesh()
 
     view_op_map = {
-        torch.ops.aten.view.default: lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten._unsafe_view.default: lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten.reshape.default: lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten.view.default:
+        lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten._unsafe_view.default:
+        lambda input_shape, shape: view_groups(input_shape, shape),
+        torch.ops.aten.reshape.default:
+        lambda input_shape, shape: view_groups(input_shape, shape),
         torch.ops.aten.expand.default:
-            lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
+        lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
     }
 
     if node.target in view_op_map:
@@ -386,5 +457,25 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                         fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements)
 
     fx_module.recompile()
+
+    # (TODO) move this part out of this pass
+    for node in fx_module.graph.nodes:
+        if not hasattr(node, "ed_info"):
+            node.ed_info = EDInfo()
+
+        if node.op == 'placeholder':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
+        elif node.op == 'call_function':
+            if node.target in COMM_FUNCS:
+                node.ed_info.node_type = EDNodeType.COMMUNITAION
+            elif node.target == operator.getitem:
+                node.ed_info.node_type = EDNodeType.AUXILIARY
+            else:
+                node.ed_info.node_type = EDNodeType.COMPUTATION
+        elif node.op == 'output':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
+
+        if node.name in opt_strategy:
+            node.ed_info.strategy = opt_strategy[node.name]['strategy']
 
     return fx_module

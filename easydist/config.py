@@ -35,6 +35,7 @@ available_mem = 40 * 1024 * 1024 # (KB)
 
 forced_compile = os.environ.get("EASYDIST_FORCED_COMPILE", "False").upper() in ["1", "TRUE"]
 use_dtensor = True
+enable_tile_comm = False
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"
