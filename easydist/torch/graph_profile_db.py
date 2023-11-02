@@ -15,10 +15,9 @@
 import os
 import pickle
 import logging
-from pathlib import Path
 
-DEFAULT_HYPER_DIR = os.path.join(Path.home(), ".hyper")
-DEFAULT_DB_PATH = os.path.join(DEFAULT_HYPER_DIR, "perf.db")
+import easydist.config as mdconfig
+
 
 _logger = logging.getLogger(__name__)
 
@@ -27,24 +26,24 @@ class PerfDB:
 
     def __init__(self) -> None:
         self.db = dict()
-        if os.path.exists(DEFAULT_DB_PATH):
-            self.db = pickle.load(open(DEFAULT_DB_PATH, 'rb'))
-            _logger.info(f"Load Perf DB from {DEFAULT_DB_PATH}")
+        if os.path.exists(mdconfig.prof_db_path):
+            self.db = pickle.load(open(mdconfig.prof_db_path, 'rb'))
+            _logger.info(f"Load Perf DB from {mdconfig.prof_db_path}")
 
-    def get_op_perf(self, key):
-        if key["ops_name"] in self.db:
-            return self.db[key["ops_name"]].get(key["called_time"], None)
+    def get_op_perf(self, key_l1, key_l2):
+        if key_l1 in self.db:
+            return self.db[key_l1].get(key_l2, None)
         return None
 
-    def record_op_perf(self, key, value):
-        if key["ops_name"] not in self.db:
-            self.db[key["ops_name"]] = dict()    
-        self.db[key["ops_name"]][key["called_time"]] = value
+    def record_op_perf(self, key_l1, key_l2, value):
+        if key_l1 not in self.db:
+            self.db[key_l1] = dict()    
+        self.db[key_l1][key_l2] = value
 
     def persistent(self):
-        _logger.info(f"Persistent Perf DB to {DEFAULT_DB_PATH}")
+        _logger.info(f"Persistent Perf DB to {mdconfig.prof_db_path}")
 
-        if not os.path.exists(DEFAULT_HYPER_DIR):
-            os.makedirs(DEFAULT_HYPER_DIR, exist_ok=True)
+        if not os.path.exists(mdconfig.easydist_dir):
+            os.makedirs(mdconfig.easydist_dir, exist_ok=True)
 
-        pickle.dump(self.db, open(DEFAULT_DB_PATH, 'wb'))
+        pickle.dump(self.db, open(mdconfig.prof_db_path, 'wb'))
