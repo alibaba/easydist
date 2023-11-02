@@ -168,8 +168,7 @@ def dtensor_to_tensor(leaf):
 
 def fetch_strategy():
     with sol_rdy_cond:
-        if sharding_sol is None:
-            sol_rdy_cond.wait()
+        sol_rdy_cond.wait()
 
     return sharding_sol
 
@@ -284,8 +283,6 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
-
-    sharded_graph.print_readable()
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
