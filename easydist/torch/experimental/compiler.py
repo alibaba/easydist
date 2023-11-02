@@ -38,7 +38,7 @@ from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, t
 from easydist.torch.experimental.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.init_helper import (SetParaInitHelper, init_contiguous_buf,
                                                      materialize_zero)
-from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
+from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias, tile_comm, runtime_prof,
                                    fix_embedding, fix_meta_device, sharding_transform, sharding_transform_dtensor)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph
@@ -168,8 +168,7 @@ def dtensor_to_tensor(leaf):
 
 def fetch_strategy():
     with sol_rdy_cond:
-        if sharding_sol is None:
-            sol_rdy_cond.wait()
+        sol_rdy_cond.wait()
 
     return sharding_sol
 
@@ -270,6 +269,9 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
         sharded_graph = sharding_transform_dtensor(traced_graph, sharding_strategy)
     else:
         sharded_graph = sharding_transform(traced_graph, opt_strategy, state_io_map)
+        if mdconfig.enable_tile_comm:
+            sharded_graph = runtime_prof(sharded_graph)
+            sharded_graph = tile_comm(sharded_graph)
 
     sharded_graph = fix_embedding(sharded_graph, recover=True)
 
@@ -284,8 +286,6 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
-
-    sharded_graph.print_readable()
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
