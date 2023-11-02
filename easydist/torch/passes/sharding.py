@@ -42,6 +42,12 @@ reduce_map = {
     ReduceOp.AVG: "avg",
 }
 
+CREATE_ATEN_OP = [
+    torch.ops.aten.empty.memory_format, torch.ops.aten.zeros.default, torch.ops.aten.ones.default,
+    torch.ops.aten.scalar_tensor.default, torch.ops.aten.arange.default,
+    torch.ops.aten.zeros.default
+]
+
 
 def all_reduce_start(self: torch.Tensor, reduceOp: str, group: List[int], tag: str = ""):
     tag, rankset, group_size = _expand_group(group, tag)
@@ -169,38 +175,37 @@ def fix_in_gragh_tensor(fx_module: torch.fx.GraphModule, sharding_strategy):
         ]
 
         if node.op == 'call_function':
-            for op in create_ops:
-                if op in _get_qualified_name(node.target):
-                    strategy, global_shape = None, None
-                    if node.name in sharding_strategy and len(sharding_strategy[node.name]) > 0:
-                        strategy = sharding_strategy[node.name][0]
-                        # modify the arg of creat ops
-                        # (CAUTION!!) device_mesh maybe mock now,
-                        # but the local shape need to be consistent of runtime
-                        global_shape = node.args[0]
-                        local_shape = list(global_shape)
-                        device_mesh = get_device_mesh()
-                        if isinstance(device_mesh, MockDeviceMesh):
-                            logger.warning("maybe wrong shape in MockDeviceMesh for create ops.")
-                        for idx, placement in enumerate(strategy):
-                            if placement.is_shard():
-                                shard_dim = placement.dim
-                                split_size, pad_idx = divmod(global_shape[shard_dim],
-                                                             device_mesh.size(idx))
-                                local_shape[shard_dim] = split_size
-                                if device_mesh_rank(device_mesh, idx) < pad_idx:
-                                    local_shape[shard_dim] = split_size + 1
+            if node.target in CREATE_ATEN_OP:
+                strategy, global_shape = None, None
+                if node.name in sharding_strategy and len(sharding_strategy[node.name]) > 0:
+                    strategy = sharding_strategy[node.name][0]
+                    # modify the arg of creat ops
+                    # (CAUTION!!) device_mesh maybe mock now,
+                    # but the local shape need to be consistent of runtime
+                    global_shape = node.args[0]
+                    local_shape = list(global_shape)
+                    device_mesh = get_device_mesh()
+                    if isinstance(device_mesh, MockDeviceMesh):
+                        logger.warning("maybe wrong shape in MockDeviceMesh for create ops.")
+                    for idx, placement in enumerate(strategy):
+                        if placement.is_shard():
+                            shard_dim = placement.dim
+                            split_size, pad_idx = divmod(global_shape[shard_dim],
+                                                         device_mesh.size(idx))
+                            local_shape[shard_dim] = split_size
+                            if device_mesh_rank(device_mesh, idx) < pad_idx:
+                                local_shape[shard_dim] = split_size + 1
 
-                        node.update_arg(0, local_shape)
+                    node.update_arg(0, local_shape)
 
-                    with fx_module.graph.inserting_after(node):
-                        to_dtensor_node = fx_module.graph.call_function(to_dtensor,
-                                                                        args=(node, strategy,
-                                                                              global_shape))
+                with fx_module.graph.inserting_after(node):
+                    to_dtensor_node = fx_module.graph.call_function(to_dtensor,
+                                                                    args=(node, strategy,
+                                                                          global_shape))
 
-                        node.replace_all_uses_with(to_dtensor_node)
+                    node.replace_all_uses_with(to_dtensor_node)
 
-                        to_dtensor_node.update_arg(0, node)
+                    to_dtensor_node.update_arg(0, node)
 
     fx_module.recompile()
 
@@ -235,10 +240,7 @@ def sharding_transform_dtensor(fx_module: torch.fx.GraphModule, sharding_strateg
                 node_strategy = sharding_strategy[node.name]
 
                 # skip for create ops
-                ops_name = _get_qualified_name(node.target)
-                if ops_name in [
-                        "torch.ops.aten.empty.memory_format", "torch.ops.aten.zeros.default"
-                ]:
+                if node.target in CREATE_ATEN_OP:
                     continue
 
                 node_args_flatten = pytree.tree_flatten(node.args)[0]
@@ -419,7 +421,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
             # skip for create ops
             ops_name = _get_qualified_name(node.target)
-            if ops_name in ["torch.ops.aten.empty.memory_format", "torch.ops.aten.zeros.default"]:
+            if node.target in CREATE_ATEN_OP:
                 # TODO: only support 2d device mesh here
                 shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
                 continue
