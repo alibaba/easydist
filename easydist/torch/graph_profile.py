@@ -150,7 +150,6 @@ class HyperPerfMeasure(Interpreter):
 
         if self.node_cnt.get(ops_name) is None:
             self.node_cnt[ops_name] = 0
-        #op_perf_key = {"ops_name": ops_name, "called_time": self.node_cnt[ops_name], "args_meta": str(args_meta) + ' | ' + str(kwargs_meta)}
         op_perf_key = {"ops_name": ops_name, "called_time": self.node_cnt[ops_name]}
         self.node_cnt[ops_name] += 1
 
@@ -193,12 +192,14 @@ class HyperPerfMeasure(Interpreter):
             ops_elapsed_time_ = ops_elapsed_time_ / self.trials
 
             db_record = {
-                #"output_meta": pytree.tree_map(to_meta, real_out),
+                "output_meta": pytree.tree_map(to_meta, real_out),
                 "time": ops_elapsed_time_
             }
+            if torch.distributed.get_rank() == 0:
+                print(ops_name)
+                print(db_record["time"])
 
             self.perf_db.record_op_perf(op_perf_key, db_record)
 
         self.sum_time += db_record["time"]
-        #return db_record["output_meta"]
-        return pytree.tree_map(to_meta, real_out)
+        return db_record["output_meta"]

@@ -69,7 +69,7 @@ def rcpsp_genetic(num_tasks, processing_time, resource_consumption, available_re
         if decision_variables[task][time_period].x >= 0.99:
             print(f"task {task}: begins at t={time_period} and finishes at t={time_period+processing_time[task]}")
 
-def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_rec=False):
+def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
     '''
     This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
 
@@ -96,6 +96,11 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_r
         for predecessor in predecessors:
             model.Add(task_ends[predecessor] <= task_starts[task])
 
+    dependent_rec = False
+    for i in dep_rec_mask:
+        if i == 1:
+            dependent_rec = True
+            break
     if dependent_rec:
         task_dep_ends = [model.NewIntVar(0, horizon, f'task_dep{i}end') for i in range(num_tasks)]
         task_dep_durations = [model.NewIntVar(0, horizon, f'task_dep{i}end') for i in range(num_tasks)]
@@ -114,7 +119,7 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_r
 
     # Resource constraints
     for i, capacity in enumerate(resource_capacities):
-        if dep_rec_mask[i] == 1:
+        if dep_rec_mask is not None and dep_rec_mask[i] == 1:
             model.AddCumulative(task_dep_intervals, [task[3][i] for task in task_data], capacity)
         else:
             model.AddCumulative(task_intervals, [task[3][i] for task in task_data], capacity)
@@ -133,7 +138,6 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None, dependent_r
         return np.argsort(res)
     else:
         raise RuntimeError("RCPSP: No solution found!")
-        return None
 
 def rcpsp(task_data, available_resources, rec_dep_mask, method):
     '''
@@ -159,11 +163,6 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
     transformed_task_data = []
     key_to_id = {}
     id_to_key = {}
-    dependent_rec = False
-    for i in rec_dep_mask:
-        if i == 1:
-            dependent_rec = True
-            break
     for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
         key_to_id[task_key] = i
         id_to_key[i] = task_key
@@ -177,7 +176,7 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
     if method == 'general':
 
         schedule = rcpsp_general(transformed_task_data, resource_capacities, 
-                                 rec_dep_mask, dependent_rec)
+                                 rec_dep_mask)
 
     elif method == 'genetic':
         num_tasks = len(task_data)

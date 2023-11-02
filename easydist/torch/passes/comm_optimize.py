@@ -24,12 +24,22 @@ from sortedcontainers import SortedList
 from torch.distributed._tensor.api import DTensor, Replicate
 from torch.fx.node import _get_qualified_name
 from torch.distributed._tensor import DeviceMesh
+from torch.distributed._tensor.placement_types import DTensorSpec
 
+import easydist
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.graph_profile import HyperPerfMeasure, to_meta
 from easydist.torch.passes.rule_override import _transform_to_Placement
 import easydist.torch.rcpsp as rcpsp
+import easydist.torch.comm_rules as comm_rules
+from easydist.torch.comm_rules import comm_redirect as comm_redirect
 import easydist.config as mdconfig
+from easydist.metashard.metair import (
+    SPMD,
+    NodeSPMDStrategy,
+    VarSPMDStrategyGroup,
+    VarSPMDStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +48,17 @@ currently get maximum bandwidth through
 communicating a large tensor(4096 * 1024 * 16)
 '''
 def bandwidth_profile():
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
     iter_time = 10
     comm_v = iter_time * 2 * 4096 * 1024 * 16 * 4.0
     res_t = 0.0
@@ -52,6 +73,17 @@ def bandwidth_profile():
     return comm_v / res_t
 
 def graph_profile(fx_module: torch.fx.GraphModule, shape_info):
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
 
     # profile nodes in a graph
     perf = HyperPerfMeasure(fx_module)
@@ -131,9 +163,21 @@ output:
 a tuple list where the first element denotes mode(comm/comp)
 and the second denotes which node
 '''
-def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
+def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info):
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
 
     processing_time = graph_profile(fx_module, shape_info)
+    negligible_duration = 20
 
     # prepare RCPSP input
     task_data = []
@@ -150,36 +194,33 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
             arg_list.append(node)
             arg_num += 1
             continue
+
         resource = []
+
         if _is_comm_node(node):
             duration = processing_time[node.name]
             resource.append(('comm', 1))
-
-            pre_node = node.all_input_nodes[0]
-            while shape_info.get(pre_node.name) is None:
-                pre_node = pre_node.all_input_nodes[0]
 
             shape_node = pre_node
         else:
             if node.name in processing_time:
                 duration = processing_time[node.name]
             else:
-                duration = 20
+                duration = negligible_duration
             resource.append(('comp', 1))
 
             shape_node = node
 
-        if shape_info.get(shape_node.name) is not None:
-            mem_req = 0
-            outputs = shape_info[shape_node.name]
-            if isinstance(outputs, tuple):
-                outputs = list(outputs)
-            elif not isinstance(outputs, list):
-                outputs = [outputs]
-            for output in outputs:
-                if output.get('shape') is not None:
-                    mem_req += int(reduce(lambda x, y: x * y, output['shape'], 1) / 1024)
-            #resource.append(('mem', mem_req))
+        mem_req = 0
+        outputs = shape_info[shape_node.name]
+        if isinstance(outputs, tuple):
+            outputs = list(outputs)
+        elif not isinstance(outputs, list):
+            outputs = [outputs]
+        for output in outputs:
+            if output.get('shape') is not None:
+                mem_req += int(reduce(lambda x, y: x * y, output['shape'], 1) * 4 / 1024)
+        resource.append(('mem', mem_req))
         
         precedence = []
         for pre in node.all_input_nodes:
@@ -213,167 +254,272 @@ def rcpsp_trial(fx_module: torch.fx.GraphModule, shape_info):
 
     return sche
 
-def comm_group(sche, shape_info, cap_limit, rg_limit):
-    ori_sche_l = len(sche)
+def comm_nodes_group(fx_module, node_list, comm_info):
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+
+'''
+    if len(node_list) <= 1:
+        return
+    # group the node and add proper decouple node to both the graph and the schedule
+    print(node_list)
+    sche = [node for node in fx_module.graph.nodes]
+    from_nodes = [comm_info[node]['from_node'] for node in node_list]
+    to_nodes = [comm_info[node]['to_node'] for node in node_list]
+    total_size = 0
+    retrive_points = []
+    retrive_shapes = []
+    for node in node_list:
+        comm_vol = comm_info[node]['comm_meta'].comm_vol
+        comm_shape = comm_info[node]['comm_meta'].shape
+        retrive_points.append(comm_vol)
+        retrive_shapes.append(comm_shape)
+        total_size += comm_vol
+
+    def comm_couple(tensor_list):
+        flattened_tensor_list = [t.flatten() for t in tensor_list]
+        return torch.cat(tuple(flattened_tensor_list))
+
+    def comm_decouple(tensor, retrive_points, retrive_shapes):
+        tensor_list = torch.split(tensor, retrive_points)
+        return [tensor.reshape(shape) for tensor, shape in zip(tensor_list, retrive_shapes)]
+
+    to_node = sche[min([sche.index(to_node) for to_node in to_nodes])]
+
+    with fx_module.graph.inserting_before(node_list[0]):
+        comm_args = list(comm_info[node_list[0]]['comm_meta'].comm_args)
+        new_from_node = fx_module.graph.call_function(
+            comm_couple, args=tuple([from_nodes])
+        )
+        new_comm_node = fx_module.graph.call_function(
+            eval(comm_info[node_list[0]]['comm_meta'].op_meta[0]), 
+            args=tuple([new_from_node] + comm_args)
+        )
+
+    with fx_module.graph.inserting_before(to_node):
+        new_to_node = fx_module.graph.call_function(
+            comm_decouple, args=(new_comm_node, tuple(retrive_points), tuple(retrive_shapes))
+        )
+        
+    comm_info[new_comm_node] = {'from_node': new_from_node,
+                                'to_node':   new_to_node,
+                                'comm_meta':  comm_meta(new_comm_node.name,
+                                                       torch.Size([total_size]),
+                                                       comm_info[node_list[0]]['comm_meta'].op_meta,
+                                                       *comm_info[node_list[0]]['comm_meta'].comm_args)}
+    
+    for idx, (comm_node, to_node) in enumerate(zip(node_list, to_nodes)):
+        with fx_module.graph.inserting_before(to_node):
+            retrive_node = fx_module.graph.call_function(
+                operator.getitem, args=(new_to_node, idx)
+            )
+        to_node.replace_input_with(comm_node, retrive_node)
+
+    fx_module.graph.eliminate_dead_code()
+    fx_module.recompile()
+
+    for node in node_list:
+        del comm_info[node]
+
+def comm_group(fx_module, comm_info, cap_limit, rg_limit):
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
+    sche = [node for node in fx_module.graph.nodes]
     idx = len(sche) - 1
     cur_cap = 0
     cur_range = 0
     cur_comm_list = []
     comm_list_dep = []
+    retrive_node = None
+    # TODO return a map that map a start node to an end node (add if)
     while idx >= 0:
         cur_range += 1
         if not _is_comm_node(sche[idx]):
             # check dependency
-            if sche[idx] in comm_list_dep:
+            if sche[idx] in comm_list_dep or \
+                cur_range > rg_limit or \
+                cur_cap > cap_limit:
+                
                 cur_comm_list.reverse()
-                sche = sche[:idx + 1] + cur_comm_list + sche[idx + 1:]
+                comm_nodes_group(fx_module, cur_comm_list, comm_info)
+                sche = [node for node in fx_module.graph.nodes]
+
                 cur_cap = 0
                 cur_range = 0
                 cur_comm_list = []
                 comm_list_dep = []
-            idx -= 1
+
+            if retrive_node:
+                idx = sche.index(retrive_node)
+                retrive_node = None
+            else:
+                idx -= 1
             continue
         
         if cur_range > rg_limit or cur_cap > cap_limit:
+
             cur_comm_list.reverse()
-            sche = sche[:idx + 1] + cur_comm_list + sche[idx + 1:]
+            comm_nodes_group(fx_module, cur_comm_list, comm_info)
+            sche = [node for node in fx_module.graph.nodes]
+
             cur_cap = 0
             cur_range = 0
             cur_comm_list = []
             comm_list_dep = []
+            if retrive_node:
+                idx = sche.index(retrive_node)
+                retrive_node = None
+                continue
 
         node = sche[idx]
-        pre_node = node.all_input_nodes[0]
-        while shape_info.get(pre_node.name) is None:
-            pre_node = pre_node.all_input_nodes[0]
-        comm_vol = reduce(lambda x, y: x * y, 
-                          shape_info[pre_node.name]['shape'], 1)
+        comm_vol = comm_info[node]['comm_meta'].comm_vol
 
         if comm_vol < cap_limit:
-            cur_cap += comm_vol
-            sche.remove(node)
-            cur_comm_list.append(node)
-            comm_list_dep.append(node.all_input_nodes[0])
+            if len(cur_comm_list) == 0 or \
+                comm_info[node]['comm_meta'] == comm_info[cur_comm_list[0]]['comm_meta']:
+                cur_cap += comm_vol
+                del sche[idx]
+                cur_comm_list.append(node)
+                comm_list_dep.append(comm_info[node]['from_node'])
+            elif retrive_node is None:
+                retrive_node = node
 
         idx -= 1
-    assert(len(cur_comm_list) == 0)
-    assert(len(sche) == ori_sche_l)
-    print(sche)
 
-def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy=None, grouping=False):
-    fx_module.graph.eliminate_dead_code()
-    fx_module.recompile()
-
-    node_to_rank: dict[torch.fx.Node, int] = {}
-    # processing
-    rank = 0
-    for node in fx_module.graph.nodes:
-        if _is_comm_node(node):
-            continue
-        node_to_rank[node] = rank
-        rank += 1
-
+def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, opt_strategy, grouping=False, mem_restrain=False):
     '''
-        ppredecesor -> predecesor1 -> node1
-            |    ...                    ^
-            v                           |
-    predecesorN -> nodeN           predecesor1'
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
     '''
-
-    # comm_op expressed as (from_node, comm_node, to_node)
-    comm_queue = SortedList(key=lambda op_tup: node_to_rank[op_tup[0]])
-
-    comm_dest = {}
-    for node in fx_module.graph.nodes:
-        if node.op == 'call_function':
-            op_name = _get_qualified_name(node.target)
-
-            if op_name != 'easydist.torch.passes.sharding.redist_tensor_func':
-                input_nodes = node.all_input_nodes
-                for predecesor in input_nodes:
-                    if _is_comm_node(predecesor):
-                        ppredecesor = predecesor.all_input_nodes
-                        assert (len(ppredecesor) == 1)
-                        from_node = ppredecesor[0]
-                        comm_node = predecesor
-                        to_node = node
-                        
-                        comm_dest[comm_node] = to_node
-
-                        # code needed to eliminate redundant comm node
-                        if opt_strategy is not None and from_node.op == 'call_function':
-                            target_node = from_node
-                            idx = 0
-                            if from_node.name.__contains__('getitem'):
-                                pppredecesor = from_node.all_input_nodes
-                                assert(len(pppredecesor) == 1)
-                                target_node = pppredecesor[0]
-                                idx = from_node.args[1]
-                            if opt_strategy.get(to_node.name) is not None and \
-                                opt_strategy.get(target_node.name) is not None:
-                                to_node_strategy = opt_strategy[to_node.name]['strategy']
-                                from_node_strategy = opt_strategy[target_node.name]['strategy']
-                                if from_node_strategy is not None and \
-                                    from_node_strategy.get_outvar_strtg(idx) == \
-                                    to_node_strategy.get_invar_strtg(input_nodes.index(comm_node)):
-                                    to_node.replace_input_with(comm_node, from_node)
-                                    continue
-                        comm_queue.add((from_node, comm_node, to_node))
-
     fx_module.graph.eliminate_dead_code()
     fx_module.recompile()
+    #if torch.distributed.get_rank() == 0:
+    #    fx_module.print_readable()
 
-    fx_module.graph.eliminate_dead_code()
-    fx_module.recompile()
+    if mdconfig.log_level <= logging.DEBUG:
+        fx_module.print_readable()
+
+    _shapeinfo_fill_up(shape_info, fx_module)
+    _strategy_fill_up(opt_strategy, shape_info, fx_module)
+
+    # comm_node -> {from_node, to_node, comm_meta}
+    comm_info = {}
+
+    # assume single input, single consumer communication node
+    if mdconfig.use_dtensor:
+        # remove redundancy
+        for node in fx_module.graph.nodes:
+            if node.op == 'call_function':
+                op_name = _get_qualified_name(node.target)
+                if op_name != 'easydist.torch.passes.sharding.redist_tensor_func':
+
+                    input_nodes = node.all_input_nodes
+                    for predecesor in input_nodes:
+                        if _is_comm_node(predecesor):
+                            ppredecesor = predecesor.all_input_nodes
+                            assert (len(ppredecesor) == 1)
+
+                            from_node = ppredecesor[0]
+                            comm_node = predecesor
+                            to_node = node
+                            
+                            output_plac = comm_node.args[1]
+                            # TODO check
+                            from_node_placements = opt_strategy[from_node.name]['strategy'].get_outvar_strtg(0)
+                            input_plac = comm_rules.to_DTensorPlacements(from_node_placements)
+
+                            if input_plac == output_plac:
+                                to_node.replace_input_with(comm_node, from_node)
+                            else:
+                                comm_op_name = _get_qualified_name(comm_node.target)
+                                comm_info[comm_node] = {
+                                    'from_node': from_node,
+                                    'to_node':   to_node,
+                                    'comm_meta': comm_meta(
+                                        comm_node.name, 
+                                        shape_info[from_node.name]['shape'], 
+                                        (comm_op_name, input_plac, output_plac),
+                                        *list(comm_node.args)[1:]
+                                    )
+                                }
+
+        fx_module.graph.eliminate_dead_code()
+        fx_module.recompile()
+
+    #if torch.distributed.get_rank() == 0:
+    #    fx_module.print_readable()
+
+    grouping = True
+    if grouping:
+        comm_group(fx_module, comm_info, 1024 * 1024, 10000)
+        fx_module.graph.eliminate_dead_code()
+        fx_module.recompile()
+
+    #if torch.distributed.get_rank() == 0:
+        #sche = [node for node in fx_module.graph.nodes]
+        #print(sche)
+        #fx_module.print_readable()
+        #exit(1)
+    return fx_module
 
     # node just computed -> commnications followed
     comm_map = {}
     comm_strtg = 'rcpsp'
     if comm_strtg == 'eager':
-        for (from_node, comm_node, to_node) in comm_queue:
+        for comm_node in comm_info:
             if comm_map.get(from_node) is None:
                 comm_map[from_node] = []
-            comm_map[from_node].append((from_node, comm_node, to_node))
+            comm_map[from_node].append((comm_info[comm_node]['from_node'],
+                                        comm_node, 
+                                        comm_info[comm_node]['to_node']))
     elif comm_strtg == 'rcpsp':
-        sche = rcpsp_trial(fx_module, shape_info)
+        sche = rcpsp_schdule(fx_module, comm_info)
         
-        sche = comm_group(sche, shape_info, 1024 * 1024, 10)
-        sche = comm_group(sche, shape_info, 1024 * 1024, 20)
-        #sche = comm_group(sche, shape_info, 1024 * 1024, 40)
-        #sche = comm_group(sche, shape_info, 1024 * 1024, 100)
-        
-        # schedule node topological order according to sche
-        fx_module.graph._root._next = sche[0]
-        sche[0]._prev = fx_module.graph._root
+        _link_nodes(fx_module, sche)
+
         for idx, node in enumerate(sche):
-            if idx + 1 < len(sche):
-                node._next = sche[idx + 1]
-                sche[idx + 1]._prev = node
-            else:
-                node._next = fx_module.graph._root
-                fx_module.graph._root._prev = node
-                break
             if not _is_comm_node(node) and _is_comm_node(sche[idx + 1]):
                 comm_map[node] = []
                 for follower in sche[idx + 1:]:
                     if _is_comm_node(follower):
-                        comm_map[node].append((follower.all_input_nodes[0],
+                        comm_map[node].append((comm_info[follower]['from_node'],
                                                follower,
-                                               comm_dest[follower]))
+                                               comm_info[follower]['to_node']))
                     else:
                         break
                 assert(len(comm_map[node]) > 0)
 
-        fx_module.graph.eliminate_dead_code()
-        fx_module.recompile()
-
+    
     def redist_tensor_func_transformed(input_tensors: list, input_specs: list):
         res = []
         device_mesh = get_device_mesh()
-        res_cache: dict[DTensor, list] = {}
+        #res_cache: dict[DTensor, list] = {}
         for input_tensor, spec in zip(input_tensors, input_specs):
             if isinstance(input_tensor, DTensor) and input_tensor.size() != torch.Size([0]):
                 if spec != input_tensor._spec.placements:
+                    '''
                     hist = res_cache.get(input_tensor)
                     current_res = None
                     if hist != None:
@@ -385,21 +531,48 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
                     else:
                         res_cache[input_tensor] = []
                     if current_res is None:
-                        current_res = input_tensor.redistribute(
-                            device_mesh, spec).contiguous()
                         res_cache[input_tensor].append((spec, len(res)))
+                    '''
+                    local_tensor = input_tensor._local_tensor
+                    current_spec = input_tensor._spec
+                    target_spec = DTensorSpec(
+                        device_mesh, tuple(spec), tensor_meta=input_tensor._spec.tensor_meta
+                    )
+                    comm_steps = comm_rules.redist_steps(device_mesh, current_spec.shape, 
+                                                         current_spec.placements, target_spec.placements)
+                    res_tensor = local_tensor
+                    for (comm_step, args) in comm_steps:
+                        res_tensor = comm_redirect[comm_step](*args, res_tensor, device_mesh)
+                    current_res = DTensor(
+                        res_tensor,
+                        device_mesh,
+                        target_spec.placements,
+                        shape=input_tensor.shape,
+                        dtype=input_tensor.dtype,
+                        requires_grad=input_tensor.requires_grad,
+                        stride=input_tensor.stride(),
+                    )
                     res.append(current_res)
                     continue
-            res.append(input_tensor.contiguous())
+            res.append(input_tensor)
         return res
 
     # add new comm node after nodes that need comms after computation
     for node in comm_map:
         comm_list = comm_map[node]
+
         # redundancy remained
         input_nodes = [n for (n, _, _) in comm_list]
         input_ori_specs = _output_strategy(input_nodes, opt_strategy)
         input_specs = [n.args[1] for (_, n, _) in comm_list]
+
+        # TODO do the grouping, grouped as a tuple
+        # 1 make the rules
+        # 2 select nodes from the tuple according to rules
+        # 3 add a node for each group as a decoupling state before the fisrt node need
+        # 4 change input of such nodes
+        #input_nodes = []
+
         with fx_module.graph.inserting_after(node):
             new_node = fx_module.graph.call_function(
                 redist_tensor_func_transformed, args=(input_nodes, input_specs))
@@ -414,3 +587,106 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info=None, opt_strategy
 
     logger.info("Communication Optimization: Done!")
     return fx_module
+
+def _strategy_fill_up(opt_strategy, shape_info, fx_module):
+    for node in fx_module.graph.nodes:
+        if not _is_comm_node(node):
+            if opt_strategy.get(node.name) is None:
+                if node.name.__contains__("getitem"):
+                    idx = node.args[1]
+                    pre_node = node.all_input_nodes[0]
+                    opt_strategy[node.name] = {
+                        'node': node.name,
+                        'strategy': NodeSPMDStrategy(
+                            VarSPMDStrategyGroup(
+                                opt_strategy[pre_node.name]['strategy'].get_invar_strtg(idx)
+                            ),
+                            VarSPMDStrategyGroup(
+                                opt_strategy[pre_node.name]['strategy'].get_outvar_strtg(idx)
+                            )
+                        )
+                    }
+                elif not (node.name.__contains__("arg") or node.name.__contains__("output")):
+                    # Assumption: nodes without strategy and not being args or output are constant tensor
+                    opt_strategy[node.name] = {
+                        'node': node, 
+                        'strategy': NodeSPMDStrategy(
+                            VarSPMDStrategyGroup(
+                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] * len(shape_info[node.name]['shape'])))
+                            ),
+                            VarSPMDStrategyGroup(
+                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] * len(shape_info[node.name]['shape'])))
+                            )
+                        )    
+                    }
+                    #print(node.name)
+                    #print(opt_strategy[node.name])
+
+    if mdconfig.log_level <= logging.DEBUG:
+        print(f"opt_strategy: {opt_strategy}")
+
+def _shapeinfo_fill_up(shape_info, fx_module):
+    for node in fx_module.graph.nodes:
+        if not _is_comm_node(node):
+            if shape_info.get(node.name) is None:
+                if node.name.__contains__("to_dtensor"):
+                    pre_node = node.all_input_nodes[0]
+                    shape_info[node.name] = shape_info[pre_node.name]
+                elif torch.distributed.get_rank() == 0:
+                    print(node.name)
+                    raise RuntimeError("_shapeinfo_fill_up: unmet node!")
+
+    if mdconfig.log_level <= logging.DEBUG:
+        print(f"shape_info: {shape_info}")
+
+
+def _link_nodes(fx_module, node_list):
+    '''
+    Change the topological order of fx_module according to node_list
+    '''
+    fx_module.graph._root._next = node_list[0]
+    node_list[0]._prev = fx_module.graph._root
+    for idx, node in enumerate(node_list[:-1]):
+        node._next = node_list[idx + 1]
+        node_list[idx + 1]._prev = node
+    node_list[-1]._next = fx_module.graph._root
+    fx_module.graph._root._prev = node_list[-1]
+    fx_module.graph.eliminate_dead_code()
+    fx_module.recompile()
+
+class comm_meta:
+    '''
+    This function solves the Resource-Constrained Project Scheduling Problem (RCPSP) using or-tools from Google.
+
+    Args:
+    task_data: [(task_id(unique), duration, predecessor, 
+                 independent_resource_usage, dependent_resource_usage)]
+    available_resources (list): The resources available.
+
+    Returns:
+    An ordering of index representing the scheduled order
+    '''
+
+    def __init__(self, name, shape, op_meta, *args):
+        self.name = name
+        self.shape = shape
+        self.comm_vol = reduce(lambda x, y: x * y, shape, 1)
+        self.op_meta = op_meta
+        self.comm_args = args
+    
+    def __eq__(self, other):
+        if len(self.comm_args) != len(other.comm_args):
+            return False
+        if self.op_meta != other.op_meta:
+            return False
+        for i, j in zip(self.comm_args, other.comm_args):
+            if i != j:
+                return False
+        return True
+
+    def __str__(self):
+        return f"Communication_{self.name}: (shape: {self.shape}, op_meta: {self.op_meta}, comm_args: {self.comm_args})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+    
