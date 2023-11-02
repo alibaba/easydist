@@ -14,6 +14,8 @@
 
 import os
 import logging
+from pathlib import Path
+
 
 def _get_env_or_raise(env_var: str) -> str:
     env_val = os.environ.get(env_var, None)
@@ -21,6 +23,7 @@ def _get_env_or_raise(env_var: str) -> str:
         raise ValueError("environment variable {env_var} expected, but not set")
     else:
         return env_val
+
 
 log_level_str = os.environ.get("EASYDIST_LOGLEVEL", 'INFO').upper()
 log_level = logging.getLevelName(log_level_str)
@@ -36,6 +39,16 @@ available_mem = 40 * 1024 * 1024 # (KB)
 forced_compile = os.environ.get("EASYDIST_FORCED_COMPILE", "False").upper() in ["1", "TRUE"]
 use_dtensor = True
 enable_tile_comm = False
+
+# Profiling
+
+profile_trials = 5
+profile_warmup_trials = 2
+
+easydist_dir = os.path.join(Path.home(), ".easydist")
+prof_db_path = os.path.join(easydist_dir, "perf.db")
+dump_prof_db = False
+
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"

@@ -22,6 +22,7 @@ from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed._tensor import mesh_resources
 from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
+from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
@@ -53,7 +54,7 @@ def all_reduce_end(self: torch.Tensor, reduceOp: str, group: List[int], tag: str
     return torch.ops.c10d_functional.wait_tensor(self)
 
 
-def all_gather_tensor_start(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
+def all_gather_start(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
     if not self.is_contiguous():
         self = self.contiguous()
     tag, rankset, group_size = _expand_group(group, tag)
@@ -62,7 +63,7 @@ def all_gather_tensor_start(self: torch.Tensor, gather_dim: int, group: List[int
     return tensor
 
 
-def all_gather_tensor_end(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
+def all_gather_end(self: torch.Tensor, gather_dim: int, group: List[int], tag: str = ""):
     self = torch.ops.c10d_functional.wait_tensor(self)
     tag, rankset, group_size = _expand_group(group, tag)
     if gather_dim != 0:
@@ -101,16 +102,18 @@ def reduce_scatter_end(self: torch.Tensor,
 
 def all_to_all_start(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks, tag: str = ""):
     # (TODO) call all_gather for all_to_all, need to use all_to_all for less comm size
-    gathered_tensor = all_gather_tensor_start(tensor, gather_dim, ranks, tag)
+    gathered_tensor = all_gather_start(tensor, gather_dim, ranks, tag)
     return gathered_tensor
 
 
 def all_to_all_end(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks, tag: str = ""):
-    tensor = all_gather_tensor_end(tensor, gather_dim, ranks, tag)
+    tensor = all_gather_end(tensor, gather_dim, ranks, tag)
     return scatter_wrapper(tensor, num_chunks, scatter_dim, indice)
 
 
-COMM_FUNCS = [all_reduce_start, all_gather_tensor_start, reduce_scatter_start, all_to_all_start]
+COMM_FUNCS = [all_reduce_start, all_gather_start, reduce_scatter_start, all_to_all_start]
+COMM_SYNC_FUNCS = [all_reduce_end, all_gather_end, reduce_scatter_end, all_to_all_end]
+CUSTOM_FUNCS = COMM_FUNCS + COMM_SYNC_FUNCS + [scatter_wrapper]
 
 
 def materialize(x, device):
@@ -320,10 +323,9 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                     ranks = submesh.mesh.flatten().tolist()
                     # make sure contiguous
                     all_gather_start_node = fx_module.graph.call_function(
-                        all_gather_tensor_start, args=(var_, current.args["dim"], ranks))
+                        all_gather_start, args=(var_, current.args["dim"], ranks))
                     all_gather_end_node = fx_module.graph.call_function(
-                        all_gather_tensor_end,
-                        args=(all_gather_start_node, current.args["dim"], ranks))
+                        all_gather_end, args=(all_gather_start_node, current.args["dim"], ranks))
 
                     node.replace_input_with(var_, all_gather_end_node)
             elif current.is_partial():
@@ -382,9 +384,25 @@ def override_args(node, invars_strategy):
         node.update_arg(shape_argnum, local_out_shape)
 
 
+def create_meta_from_node(node):
+    fake_args = []
+    for arg in node.args:
+        if isinstance(arg, Node):
+            fake_args.append(arg.meta['val'])
+        else:
+            fake_args.append(arg)
+    fake_val = node.target(*fake_args, **node.kwargs)
+    return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
+
+
 def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_map):
 
     shard_env = {}
+
+    # (TODO) move this part out of this pass
+    for node in fx_module.graph.nodes:
+        if node.op == 'call_function' and 'val' not in node.meta:
+            node.meta = create_meta_from_node(node)
 
     # the last element in fx_module output is the return tensor for user function
     # we need to make it replicate before
@@ -461,11 +479,20 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
     # (TODO) move this part out of this pass
     for node in fx_module.graph.nodes:
         if not hasattr(node, "ed_info"):
-            node.ed_info = EDInfo()
+            node.ed_info = EDInfo(ori_meta=node.meta)
+
+        if node.name in opt_strategy:
+            node.ed_info.strategy = opt_strategy[node.name]['strategy']
+
+        node.meta = node.ed_info.get_sharded_meta()
 
         if node.op == 'placeholder':
             node.ed_info.node_type = EDNodeType.AUXILIARY
         elif node.op == 'call_function':
+            # create meta for custom function
+            if node.target in CUSTOM_FUNCS:
+                node.meta = create_meta_from_node(node)
+            # annotate node type
             if node.target in COMM_FUNCS:
                 node.ed_info.node_type = EDNodeType.COMMUNITAION
             elif node.target == operator.getitem:
@@ -474,8 +501,5 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                 node.ed_info.node_type = EDNodeType.COMPUTATION
         elif node.op == 'output':
             node.ed_info.node_type = EDNodeType.AUXILIARY
-
-        if node.name in opt_strategy:
-            node.ed_info.strategy = opt_strategy[node.name]['strategy']
 
     return fx_module

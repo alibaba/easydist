@@ -72,10 +72,8 @@ class HyperPerfMeasure(Interpreter):
                     continue
                 if called_time.get(ops_name) is None:
                     called_time[ops_name] = 0
-                op_perf_key = {"ops_name": ops_name, "called_time": called_time[ops_name]}
-                node_to_time[node.name] = self.perf_db.get_op_perf(op_perf_key)['time']
+                node_to_time[node.name] = self.perf_db.get_op_perf(ops_name, called_time[ops_name])['time']
         return node_to_time
-            
 
     def run(self, *args) -> Any:
         """
@@ -154,7 +152,7 @@ class HyperPerfMeasure(Interpreter):
         op_perf_key = {"ops_name": ops_name, "called_time": self.node_cnt[ops_name]}
         self.node_cnt[ops_name] += 1
 
-        db_record = self.perf_db.get_op_perf(op_perf_key)
+        db_record = self.perf_db.get_op_perf(op_perf_key["ops_name"], op_perf_key["called_time"])
 
         if db_record is None:
 
@@ -197,7 +195,7 @@ class HyperPerfMeasure(Interpreter):
                 "time": ops_elapsed_time_
             }
 
-            self.perf_db.record_op_perf(op_perf_key, db_record)
+            self.perf_db.record_op_perf(op_perf_key["ops_name"], op_perf_key["called_time"], db_record)
 
         self.sum_time += db_record["time"]
         return db_record["output_meta"]
