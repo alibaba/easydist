@@ -16,6 +16,7 @@ import logging
 
 import torch
 from torch.fx.node import _get_qualified_name
+from torch.distributed._functional_collectives_impl import _wait_all
 
 import easydist.config as mdconfig
 from easydist.torch.utils import EDNodeType
@@ -72,6 +73,8 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                         start_evt_[evt_idx].record()
 
                     _ = node.target(*materialized_inputs, **node.kwargs)
+                    if node.ed_info.node_type == EDNodeType.COMMUNITAION:
+                        _wait_all()
 
                     if evt_idx >= 0:
                         end_evt_[evt_idx].record()
