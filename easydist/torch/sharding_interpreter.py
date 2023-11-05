@@ -200,7 +200,8 @@ class EDTorchShardingAnn(Interpreter):
             Any: The value of the attribute that was retrieved
         """
         assert isinstance(target, str)
-        output = self.fetch_attr(target)
+        # TODO @botbw: got normal tensor here using real mode, need to find out why
+        output = to_meta(self.fetch_attr(target))
 
         if "get_attr" not in self.sharding_info:
             self.sharding_info["get_attr"] = {}
