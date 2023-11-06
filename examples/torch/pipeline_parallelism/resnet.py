@@ -16,7 +16,7 @@ from easydist.torch.pp.split import from_tracing, LossWrapper, split_into_equal_
 @easydist_compile
 def train_step(model, opt, *input):
     out = model(*input)
-    out.backward()
+    out[0]['loss'].backward()
     opt.step()
     opt.zero_grad(True)
     return out
@@ -24,7 +24,8 @@ def train_step(model, opt, *input):
 
 def setup():
     # setting up easydist and torch.distributed
-    mdconfig.log_level = logging.INFO
+    mdconfig.log_level = logging.DEBUG
+    mdconfig.forced_compile = True
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
     torch.distributed.init_process_group(backend="nccl")

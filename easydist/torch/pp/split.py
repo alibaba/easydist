@@ -954,10 +954,20 @@ class StageBackward(torch.nn.Module):
             extract_tensors_with_grads(
                 stage_output_with_grads, output_grads_with_grads
             )
+            
+            # TODO @botbw
+            # https://github.com/pytorch/PiPPy/blob/15dfcd8ea1f445a30627693334ac0b9be160d01b/pippy/IR.py#L383
+            # https://github.com/pytorch/PiPPy/blob/15dfcd8ea1f445a30627693334ac0b9be160d01b/pippy/IR.py#L404
+            # find correct way to get grad when input_values are not leaves
+            for i, val in enumerate(input_values):
+                if isinstance(val, torch.Tensor) and val.requires_grad:
+                    val.retain_grad()
+                    # input_values[i] = val.detach().requires_grad_(True)
 
             torch.autograd.backward(
                 # type: ignore[arg-type]
-                stage_output_tensors, grad_tensors=output_grad_tensors
+                stage_output_tensors, grad_tensors=output_grad_tensors,
+                retain_graph=True, # TODO @botbw
             )
 
             grad_inputs = []
