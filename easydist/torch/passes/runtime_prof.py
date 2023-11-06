@@ -36,7 +36,7 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
     for node in fx_module.graph.nodes:
         if hasattr(node, "ed_info"):
-            if node.ed_info.node_type in [EDNodeType.COMMUNITAION, EDNodeType.COMPUTATION]:
+            if node.ed_info.node_type in [EDNodeType.COMMUNICATION, EDNodeType.COMPUTATION]:
                 # get the input signature of this node and checl if it is in the database
                 inputs_signature = []
                 for arg in node.args:
@@ -73,7 +73,7 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                         start_evt_[evt_idx].record()
 
                     _ = node.target(*materialized_inputs, **node.kwargs)
-                    if node.ed_info.node_type == EDNodeType.COMMUNITAION:
+                    if node.ed_info.node_type == EDNodeType.COMMUNICATION:
                         _wait_all()
 
                     if evt_idx >= 0:
@@ -94,10 +94,21 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
     runtime_prof_result = broadcast_result[0]
 
+    min_runtime_ms = float('inf')
     for node in fx_module.graph.nodes:
         if hasattr(node, "ed_info") and node.name in runtime_prof_result:
-            node.ed_info.runtime_prof = runtime_prof_result[node.name]
-
+            node.ed_info.runtime_ms = runtime_prof_result[node.name]
+            min_runtime_ms = min(node.ed_info.runtime_ms, min_runtime_ms)
+    for node in fx_module.graph.nodes:
+        if hasattr(node, "ed_info"):
+            if node.name in runtime_prof_result:
+                # Avoid overflow
+                node.ed_info.normalized_int_runtime_ms = min(
+                    int(node.ed_info.runtime_ms / min_runtime_ms) * 2, 32768
+                )
+            else:
+                node.ed_info.normalized_int_runtime_ms = 1
+    
     if mdconfig.dump_prof_db and torch.distributed.get_rank() == 0:
         perf_db.persistent()
 

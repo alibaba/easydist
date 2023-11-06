@@ -30,6 +30,7 @@ import easydist
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.graph_profile import HyperPerfMeasure, to_meta
 from easydist.torch.passes.rule_override import _transform_to_Placement
+from easydist.torch.passes.runtime_prof import runtime_prof
 import easydist.torch.rcpsp as rcpsp
 import easydist.torch.comm_rules as comm_rules
 from easydist.torch.comm_rules import comm_redirect as comm_redirect
@@ -177,12 +178,11 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info):
     An ordering of index representing the scheduled order
     '''
 
-    processing_time = graph_profile(fx_module, shape_info)
-    negligible_duration = 20
+    runtime_prof(fx_module)
 
     # prepare RCPSP input
     task_data = []
-    available_resources = {'comm': 1, 'comp': 1, 'mem': int(0.9 * mdconfig.available_mem)}
+    available_resources = {'comm': 1, 'comp': 1, 'mem': int(0.95 * mdconfig.available_mem)}
     
     # whether resource release only until all nodes depended on it have finished
     resource_dep_mask = [0, 0, 1]
@@ -191,6 +191,8 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info):
     arg_num = 0
     arg_list = []
     for node in fx_module.graph.nodes:
+        duration = node.ed_info.normalized_int_runtime_ms
+        assert(duration > 0)
         if node.name.__contains__('arg'):
             arg_list.append(node)
             arg_num += 1
@@ -199,35 +201,30 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info):
         resource = []
 
         if node.ed_info.is_communication():
-            duration = processing_time[node.name]
             resource.append(('comm', 1))
-
-            shape_node = node.all_input_nodes[0]
+            mem_req = node.ed_info.comm_meta['comm_vol']
         else:
-            if node.name in processing_time:
-                duration = processing_time[node.name]
-            else:
-                duration = negligible_duration
             resource.append(('comp', 1))
-
-            shape_node = node
-
-        mem_req = 0
-        outputs = shape_info[shape_node.name]
-        if isinstance(outputs, tuple):
-            outputs = list(outputs)
-        elif not isinstance(outputs, list):
-            outputs = [outputs]
-        for output in outputs:
-            if output.get('shape') is not None:
-                mem_req += int(reduce(lambda x, y: x * y, output['shape'], 1) * 4 / 1024)
+            if node.name.__contains__('_end'):
+                mem_req = int(node.all_input_nodes[0].ed_info.comm_meta['comm_vol'] / 1024)
+            else:
+                output_shapes = shape_info[node.name]
+                if isinstance(output_shapes, tuple):
+                    output_shapes = list(output_shapes)
+                elif not isinstance(output_shapes, list):
+                    output_shapes = [output_shapes]
+                mem_req = 0
+                for output_shape in output_shapes:
+                    if output_shape.get('shape') is not None:
+                        mem_req += int(reduce(lambda x,y:x*y, output_shape['shape'], 1) * 4 / 1024)
         resource.append(('mem', mem_req))
-        
+
         precedence = []
         for pre in node.all_input_nodes:
             if not pre.name.__contains__('arg'):
                 precedence.append(pre)
         precedence_relations.append(precedence)
+        
         task_data.append((node, duration, precedence, resource))
 
     assert(len(task_data) == len(fx_module.graph.nodes) - arg_num)
@@ -282,7 +279,7 @@ def comm_nodes_group(fx_module, node_list):
         retrive_shapes.append(comm_shape)
         total_size += comm_vol
 
-    def comm_couple(tensor_list):
+    def comm_couple(*tensor_list):
         flattened_tensor_list = [t.flatten() for t in tensor_list]
         return torch.cat(tuple(flattened_tensor_list))
 
@@ -295,7 +292,7 @@ def comm_nodes_group(fx_module, node_list):
     with fx_module.graph.inserting_before(node_list[0]):
         comm_args = list(node_list[0].args[1:])
         new_from_node = fx_module.graph.call_function(
-            comm_couple, args=tuple([from_nodes])
+            comm_couple, args=tuple(from_nodes)
         )
         new_from_node.ed_info = EDInfo()
         new_from_node.ed_info.node_type = EDNodeType.COMPUTATION
@@ -434,7 +431,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, opt_strategy, gro
             assert len(node.all_input_nodes) == 1
             from_node = node.all_input_nodes[0]
             comm_shape = shape_info[from_node.name]['shape']
-            node.ed_info.comm_meta = {'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1), 
+            node.ed_info.comm_meta = {'comm_vol': int(reduce(lambda x, y: x * y, comm_shape, 1) * 4 / 1024), 
                                       'comm_shape': comm_shape}
         elif node.ed_info.is_computation():
             for pre in node.all_input_nodes:
@@ -446,38 +443,37 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, opt_strategy, gro
         for node in fx_module.graph.nodes:
             print(node.name)
             print(node.ed_info)
-    #_shapeinfo_fill_up(shape_info, fx_module)
+    _shapeinfo_fill_up(shape_info, fx_module)
     #_strategy_fill_up(opt_strategy, shape_info, fx_module)
 
-    grouping = True
-    if grouping:
-        comm_group(fx_module, 1024 * 1024, 10000)
-        fx_module.graph.eliminate_dead_code()
-        fx_module.recompile()
+    #grouping = True
+    #if grouping:
+    #    comm_group(fx_module, 1024 * 1024, 10000)
+    #    fx_module.graph.eliminate_dead_code()
+    #    fx_module.recompile()
 
     # node just computed -> commnications followed
-    comm_strtg = 'eager'
+    comm_strtg = 'rcpsp'
+    comm_map = {}
     if comm_strtg == 'eager':
-        comm_map = {}
         for node in fx_module.graph.nodes:
             if node.ed_info.is_communication():
-                from_node = node.all_input_nodes[0]
                 if comm_map.get(from_node) is None:
                     comm_map[from_node] = []
-                comm_map[from_node].append((from_node, node))
+                comm_map[from_node].append(node)
     elif comm_strtg == 'rcpsp':
         sche = rcpsp_schedule(fx_module, shape_info)
         
         _link_nodes(fx_module, sche)
 
         for idx, node in enumerate(sche):
-            if not _is_comm_node(node) and _is_comm_node(sche[idx + 1]):
+            if not node.ed_info.is_communication() and \
+                idx + 1 < len(sche) and \
+                sche[idx + 1].ed_info.is_communication():
                 comm_map[node] = []
                 for follower in sche[idx + 1:]:
-                    if _is_comm_node(follower):
-                        comm_map[node].append((comm_info[follower]['from_node'],
-                                               follower,
-                                               comm_info[follower]['to_node']))
+                    if follower.ed_info.is_communication():
+                        comm_map[node].append(follower)
                     else:
                         break
                 assert(len(comm_map[node]) > 0)
@@ -491,18 +487,18 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, opt_strategy, gro
 
     # add new comm node after nodes that need comms after computation
     for node in comm_map:
-        #if len(comm_map[node] <= 1):
+        #if len(comm_map[node]) <= 1:
         #    continue
 
         # redundancy remained
-        input_nodes = [n for (n, _) in comm_map[node]]
-        comm_funcs = [_get_qualified_name(n.target) for (_, n) in comm_map[node]]
-        comm_args = [n.args[1:] for (_, n) in comm_map[node]]
+        input_nodes = [n.all_input_nodes[0] for n in comm_map[node]]
+        comm_funcs = [_get_qualified_name(n.target) for n in comm_map[node]]
+        comm_args = [n.args[1:] for n in comm_map[node]]
 
         with fx_module.graph.inserting_after(node):
             new_comm_node = fx_module.graph.call_function(
                 grouped_comm, args=(input_nodes, comm_funcs, comm_args))
-        for idx, (_, comm_node) in enumerate(comm_map[node]):
+        for idx, comm_node in enumerate(comm_map[node]):
             with fx_module.graph.inserting_after(new_comm_node):
                 idx_node = fx_module.graph.call_function(operator.getitem, args=(new_comm_node, idx))
             comm_node.ed_info.comm_meta['to_node'].replace_input_with(comm_node, idx_node)
@@ -554,12 +550,18 @@ def _strategy_fill_up(opt_strategy, shape_info, fx_module):
 
 def _shapeinfo_fill_up(shape_info, fx_module):
     for node in fx_module.graph.nodes:
-        if not _is_comm_node(node):
+        #if node.name.__contains__("getitem"):
+        #    pre_node = node.all_input_nodes[0]
+        #    shape_info[node.name] = shape_info[pre_node.name][node.args[1]]
+        #    print(node.name)
+        #    print(shape_info[node.name])
+        if not node.ed_info.is_communication():
             if shape_info.get(node.name) is None:
-                if node.name.__contains__("to_dtensor"):
+                if node.name.__contains__("scatter_wrapper"):
                     pre_node = node.all_input_nodes[0]
                     shape_info[node.name] = shape_info[pre_node.name]
-                elif torch.distributed.get_rank() == 0:
+                elif not node.name.__contains__("_end") and \
+                        torch.distributed.get_rank() == 0:
                     print(node.name)
                     raise RuntimeError("_shapeinfo_fill_up: unmet node!")
 

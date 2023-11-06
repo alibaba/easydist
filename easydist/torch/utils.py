@@ -75,6 +75,7 @@ class EDInfo:
     sharding_info: Any = None
     strategy: NodeSPMDStrategy = None
     runtime_ms: float = 0.0
+    normalized_int_runtime_ms = 0
     comm_meta = None # {comm_vol, comm_shape}
 
     def is_communication(self):
