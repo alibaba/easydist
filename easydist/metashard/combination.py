@@ -34,6 +34,7 @@ class ReduceOp(Enum):
     SUM = 1
     MAX = 2
     MIN = 3
+    AVG = 4
 
 
 class HaloHint:
@@ -86,14 +87,21 @@ class CombinationFunc:
     @staticmethod
     def reduce(sharded_tensor, ops=ReduceOp.SUM):
         init = platform.zeros_like(sharded_tensor[0])
-        assert ops in [ReduceOp.SUM, ReduceOp.MAX, ReduceOp.MIN]
+        num_elem = len(sharded_tensor)
+        ratio = 1.
+        assert ops in [ReduceOp.SUM, ReduceOp.MAX, ReduceOp.MIN, ReduceOp.AVG]
         if ops == ReduceOp.SUM:
             reduce_func_ = platform.add
         elif ops == ReduceOp.MAX:
+            # (TODO) fix init here
             reduce_func_ = platform.max
         elif ops == ReduceOp.MIN:
             reduce_func_ = platform.min
-        return functools.reduce(reduce_func_, sharded_tensor, init)
+        elif ops == ReduceOp.AVG:
+            reduce_func_ = platform.add
+            ratio = 1. / num_elem
+
+        return ratio * functools.reduce(reduce_func_, sharded_tensor, init)
 
     @staticmethod
     def gather(sharded_tensor, dim, halowidth=0, chunk=1):

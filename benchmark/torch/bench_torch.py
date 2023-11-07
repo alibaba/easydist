@@ -143,7 +143,7 @@ def bench_easydist(model, data_in):
 
     optimizer = optim.SGD(model.parameters(), lr=0.001)
 
-    @easydist_compile()
+    @easydist_compile(cuda_graph=False)
     def train_step(model, optimizer, data_in):
         output_ = model(*data_in)
         output_grad = torch.ones_like(output_)
@@ -241,7 +241,7 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    model, data_in = get_gpt_case(device="meta")
+    model, data_in = get_gpt_case(device="cuda")
 
     bench_easydist(model, data_in)
 

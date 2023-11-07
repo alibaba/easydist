@@ -12,19 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import torch
 from torch.fx.node import Node, _get_qualified_name
-import torch.distributed.distributed_c10d as c10d
-
-import torch.distributed._tensor as spmd
 from torch.distributed._tensor import distribute_tensor
 import torch.utils._pytree as pytree
 
-from easydist.metashard.combination import ReduceOp
-from easydist.metashard import metair
 from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar
 from easydist.utils import rsetattr, rgetattr
+from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
 
 from .passes.sharding import get_device_mesh
@@ -39,20 +34,6 @@ ABSTRACT_DTYPE = {
     torch.uint8: "uint8",
     torch.complex64: "complex64",
 }
-
-
-def to_torch_spmd(meta_spmd):
-    if meta_spmd.state == metair.SPMD.SHARD:
-        return spmd.Shard(dim=meta_spmd.args["dim"])
-    elif meta_spmd.state == metair.SPMD.PARTIAL:
-        mapping_ops = {
-            ReduceOp.SUM: c10d.ReduceOp.RedOpType.SUM,
-            ReduceOp.MAX: c10d.ReduceOp.RedOpType.MAX,
-            ReduceOp.MIN: c10d.ReduceOp.RedOpType.MIN,
-        }
-        return spmd.placement_types._Partial(reduce_op=mapping_ops[meta_spmd.args["ops"]])
-    elif meta_spmd.state == metair.SPMD.REPLICATE:
-        return spmd.Replicate()
 
 
 def materialize(x, device):
