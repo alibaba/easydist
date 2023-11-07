@@ -276,9 +276,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
     sharded_graph = fix_embedding(sharded_graph, recover=True)
 
     if not mdconfig.use_dtensor:
-        # (TODO) comm_optimize need to support non-dtensor graph
         if mdconfig.comm_optimization is True:
-            sharded_graph = comm_optimize(sharded_graph, shape_info, opt_strategy)
+            sharded_graph = comm_optimize(sharded_graph, shape_info, 'rcpsp', grouping=True, mem_restrain=True)
 
         # override pytorch dtensor propagate rules to optimize dispater behavior
         if mdconfig.override_dtensor_rule is True:

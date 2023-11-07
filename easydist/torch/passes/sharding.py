@@ -395,6 +395,8 @@ def create_meta_from_node(node):
         else:
             fake_args.append(arg)
     fake_val = node.target(*fake_args, **node.kwargs)
+    if isinstance(fake_val, list):
+        return {'val': fake_val}
     return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
 
