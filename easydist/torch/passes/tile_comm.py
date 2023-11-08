@@ -59,7 +59,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                 communication_nodes.append(node)
             else:
                 computation_nodes.append(node)
-    
+
     # Step 2: find the communication nodes that are critical
     critical_communication = {}
     for node in fx_module.graph.nodes:
@@ -67,7 +67,13 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             all_prev_nodes = set(find_all_prev_nodes(node))
             all_post_nodes = set(find_all_post_nodes(node))
             independent_nodes = set(computation_nodes) - all_prev_nodes - all_post_nodes
-            
+
+            independent_nodes_runtime = 0.0
+            for indpd_node in independent_nodes:
+                independent_nodes_runtime += indpd_node.ed_info.runtime_ms
+
+            print(f"{node.name} {node.ed_info.runtime_ms} {len(all_prev_nodes)},{len(all_post_nodes)},{len(independent_nodes)} {independent_nodes_runtime}")
+
             # TODO need to extend if independent_nodes can not cover the communication
             if len(independent_nodes) == 0:
                 critical_communication[node] = None
