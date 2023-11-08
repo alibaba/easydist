@@ -15,6 +15,7 @@
 import logging
 
 import torch
+import torch.utils._pytree as pytree
 from torch.fx.node import _get_qualified_name
 from torch.distributed._functional_collectives_impl import _wait_all
 
@@ -38,26 +39,19 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         if hasattr(node, "ed_info"):
             if node.ed_info.node_type in [EDNodeType.COMMUNICATION, EDNodeType.COMPUTATION]:
                 # get the input signature of this node and checl if it is in the database
-                inputs_signature = []
-                for arg in node.args:
-                    if isinstance(arg, torch.fx.Node):
-                        inputs_signature.append(arg.meta['val'])
-                    else:
-                        inputs_signature.append(arg)
+                inputs_signature = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta['val'],
+                                                        node.args)
 
                 qualified_name = _get_qualified_name(node.target)
-                db_record = perf_db.get_op_perf(qualified_name, inputs_signature.__str__())
+                db_record = perf_db.get_op_perf(
+                    qualified_name, inputs_signature.__str__())
                 if db_record is not None:
                     runtime_prof_result[node.name] = db_record
                     continue
 
                 # materialize the input of this node
-                materialized_inputs = []
-                for arg in inputs_signature:
-                    if isinstance(arg, torch.Tensor):
-                        materialized_inputs.append(materialize_random(arg))
-                    else:
-                        materialized_inputs.append(arg)
+                materialized_inputs = pytree.tree_map_only(torch.Tensor, materialize_random,
+                                                           inputs_signature)
 
                 # profile and get runtime in ms
                 start_evt_, end_evt_ = [], []
@@ -83,7 +77,8 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                 ops_elapsed_time_ = 0
                 for evt_idx in range(0, mdconfig.profile_trials):
                     # time elapsed in **milliseconds**
-                    ops_elapsed_time_ += start_evt_[evt_idx].elapsed_time(end_evt_[evt_idx])
+                    ops_elapsed_time_ += start_evt_[
+                        evt_idx].elapsed_time(end_evt_[evt_idx])
                 ops_elapsed_time_ = ops_elapsed_time_ / mdconfig.profile_trials
 
                 runtime_prof_result[node.name] = ops_elapsed_time_
@@ -91,7 +86,8 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                                        ops_elapsed_time_)
 
     broadcast_result = [runtime_prof_result]
-    torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
+    torch.distributed.broadcast_object_list(
+        broadcast_result, src=0, device="cuda")
     runtime_prof_result = broadcast_result[0]
 
     min_runtime_ms = float('inf')
