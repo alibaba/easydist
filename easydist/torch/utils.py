@@ -63,7 +63,7 @@ def to_torch_spmd(meta_spmd: metair.SPMD):
 
 
 class EDNodeType(Enum):
-    COMMUNITAION = 1
+    COMMUNICATION = 1
     COMPUTATION = 2
     AUXILIARY = 3
 
@@ -75,9 +75,14 @@ class EDInfo:
     sharding_info: Any = None
     strategy: NodeSPMDStrategy = None
     runtime_ms: float = 0.0
+    normalized_int_runtime_ms = 0
+    comm_meta = None # {comm_vol, comm_shape}
 
     def is_communication(self):
-        return self.node_type == EDNodeType.COMMUNITAION
+        return self.node_type == EDNodeType.COMMUNICATION
+    
+    def is_computation(self):
+        return self.node_type == EDNodeType.COMPUTATION
     
     def get_sharded_meta(self):
         shared_meta = copy.copy(self.ori_meta)

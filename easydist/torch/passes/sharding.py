@@ -15,6 +15,7 @@
 import operator
 import logging
 from typing import List
+from functools import reduce
 
 import torch
 import torch.utils._pytree as pytree
@@ -30,7 +31,7 @@ from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
 from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType
 from easydist.utils.testing import MockDeviceMesh
-from easydist.metashard.metair import VarSPMDStrategy, SPMD
+from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
 from easydist.metashard.combination import ReduceOp
 
 logger = logging.getLogger(__name__)
@@ -424,6 +425,8 @@ def create_meta_from_node(node):
         else:
             fake_args.append(arg)
     fake_val = node.target(*fake_args, **node.kwargs)
+    if isinstance(fake_val, list):
+        return {'val': fake_val}
     return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
 
@@ -462,6 +465,13 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
             if ops_name == "_operator.getitem":
                 shard_env[node.name] = shard_env[node.args[0].name][node.args[1]]
+                opt_strategy[node.name] = {
+                    'node': node.name,
+                    'strategy': NodeSPMDStrategy(
+                                    VarSPMDStrategyGroup(shard_env[node.name]),
+                                    VarSPMDStrategyGroup(shard_env[node.name])
+                                )
+                }
                 continue
 
             node_args_flatten = pytree.tree_flatten(node.args)[0]
@@ -531,7 +541,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                 node.meta = create_meta_from_node(node)
             # annotate node type
             if node.target in COMM_FUNCS:
-                node.ed_info.node_type = EDNodeType.COMMUNITAION
+                node.ed_info.node_type = EDNodeType.COMMUNICATION
             elif node.target == operator.getitem:
                 node.ed_info.node_type = EDNodeType.AUXILIARY
             else:
