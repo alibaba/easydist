@@ -82,6 +82,10 @@ def scatter_wrapper(tensor, num_chunks, dim, indice):
     return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice]
 
 
+def copy_wrapper(self, other):
+    return torch.ops.aten.copy_.default(self, other)
+
+
 def reduce_scatter_start(self: torch.Tensor,
                          reduceOp: str,
                          scatter_dim: int,
@@ -120,7 +124,7 @@ def all_to_all_end(tensor, gather_dim, scatter_dim, num_chunks, indice, ranks, t
 
 COMM_FUNCS = [all_reduce_start, all_gather_start, reduce_scatter_start, all_to_all_start]
 COMM_SYNC_FUNCS = [all_reduce_end, all_gather_end, reduce_scatter_end, all_to_all_end]
-CUSTOM_FUNCS = COMM_FUNCS + COMM_SYNC_FUNCS + [scatter_wrapper]
+CUSTOM_FUNCS = COMM_FUNCS + COMM_SYNC_FUNCS + [scatter_wrapper, copy_wrapper]
 
 
 def materialize(x, device):
@@ -267,7 +271,7 @@ def sharding_transform_dtensor(fx_module: torch.fx.GraphModule, sharding_strateg
     return fx_module
 
 
-def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placements):
+def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placements, copy_innode=None):
 
     device_mesh = get_device_mesh()
 
@@ -287,7 +291,12 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                                                                        target.args["dim"],
                                                                        my_coordinate[i]))
 
-                    node.replace_input_with(var_, scatter_node)
+                    if copy_innode is not None:
+                        copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                  args=(copy_innode, scatter_node))
+                        node.replace_input_with(var_, copy_node)
+                    else:
+                        node.replace_input_with(var_, scatter_node)
             elif current.is_shard():
                 # all_to_all
                 with fx_module.graph.inserting_before(node):
@@ -302,7 +311,12 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                         args=(all_to_all_start_node, current.args["dim"], target.args["dim"],
                               num_chunks, my_coordinate[i], ranks))
 
-                    node.replace_input_with(var_, all_to_all_end_node)
+                    if copy_innode is not None:
+                        copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                  args=(copy_innode, all_to_all_end_node))
+                        node.replace_input_with(var_, copy_node)
+                    else:
+                        node.replace_input_with(var_, all_to_all_end_node)
             elif current.is_partial():
                 # reduce_scatter
                 with fx_module.graph.inserting_before(node):
@@ -317,7 +331,13 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                         reduce_scatter_end,
                         args=(reduce_scatter_start_node, reduceOp, target.args["dim"], ranks))
 
-                    node.replace_input_with(var_, reduce_scatter_end_node)
+                    if copy_innode is not None:
+                        copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                  args=(copy_innode, reduce_scatter_end_node))
+                        node.replace_input_with(var_, copy_node)
+                    else:
+                        node.replace_input_with(var_, reduce_scatter_end_node)
+
         elif target.is_replicate():
             if current.is_shard():
                 # insert all_gather here
@@ -330,7 +350,12 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                     all_gather_end_node = fx_module.graph.call_function(
                         all_gather_end, args=(all_gather_start_node, current.args["dim"], ranks))
 
-                    node.replace_input_with(var_, all_gather_end_node)
+                    if copy_innode is not None:
+                        copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                  args=(copy_innode, all_gather_end_node))
+                        node.replace_input_with(var_, copy_node)
+                    else:
+                        node.replace_input_with(var_, all_gather_end_node)
             elif current.is_partial():
                 # insert all_reduce here
                 with fx_module.graph.inserting_before(node):
@@ -344,7 +369,12 @@ def insert_comm_node(fx_module: torch.fx.GraphModule, node, var_, sorted_placeme
                     all_reduce_end_node = fx_module.graph.call_function(
                         all_reduce_end, args=(all_reduce_start_node, reduceOp, ranks))
 
-                    node.replace_input_with(var_, all_reduce_end_node)
+                    if copy_innode is not None:
+                        copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                  args=(copy_innode, all_reduce_end_node))
+                        node.replace_input_with(var_, copy_node)
+                    else:
+                        node.replace_input_with(var_, all_reduce_end_node)
 
     return fx_module
 
@@ -413,6 +443,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
     # we need to make it replicate before
     num_return_value = fx_module._out_spec.children_specs[-1].num_leaves
 
+    all_placeholder_node = {}
+
     for node in fx_module.graph.nodes:
         if node.op == 'placeholder':
             if node.name in opt_strategy:
@@ -420,6 +452,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
             else:
                 # TODO: only support 2d device mesh here
                 shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
+
+            all_placeholder_node[node.name] = node
         elif node.op == 'call_function':
 
             # skip for create ops
@@ -484,7 +518,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                     if tgt_specs != src_specs:
                         # mismatch need to insert communication node
                         sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
-                        fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements)
+                        fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements,
+                                                     copy_innode=all_placeholder_node[in_node.name])
 
     fx_module.recompile()
 
