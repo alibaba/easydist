@@ -46,7 +46,7 @@ reduce_map = {
 CREATE_ATEN_OP = [
     torch.ops.aten.empty.memory_format, torch.ops.aten.zeros.default, torch.ops.aten.ones.default,
     torch.ops.aten.scalar_tensor.default, torch.ops.aten.arange.default,
-    torch.ops.aten.zeros.default
+    torch.ops.aten.zeros.default, torch.ops.aten.arange.start
 ]
 
 
