@@ -130,6 +130,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             # 1.2. create MetaNode
             node_sharding_info = None
             if op_name in sharding_info:
+
                 def _gen_meta(arg):
                     if isinstance(arg, Node):
                         return torch.empty(meta_info[arg.name]["shape"],

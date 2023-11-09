@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 
 sys.path.append(os.path.abspath(__file__))
 from gat import GAT

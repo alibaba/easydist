@@ -4,7 +4,7 @@ import logging
 import torch
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 
 
 def main():

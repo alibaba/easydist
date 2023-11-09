@@ -13,7 +13,7 @@ from pippy.IR import Pipe
 from pippy import split_into_equal_size
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 from easydist.torch import set_device_mesh
 from easydist.utils.testing import TorchMockDeviceMesh
 

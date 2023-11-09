@@ -5,7 +5,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from easydist import easydist_setup
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 from easydist.torch import set_device_mesh
 from easydist.utils.testing import TorchMockDeviceMesh
 

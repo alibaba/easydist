@@ -21,7 +21,7 @@ from torch.distributed._functional_collectives_impl import _wait_all
 
 import easydist.config as mdconfig
 from easydist.torch.utils import EDNodeType
-from easydist.torch.experimental.init_helper import materialize_random
+from easydist.torch.init_helper import materialize_random
 from easydist.torch.graph_profile_db import PerfDB
 
 logger = logging.getLogger(__name__)
@@ -43,8 +43,7 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                                                         node.args)
 
                 qualified_name = _get_qualified_name(node.target)
-                db_record = perf_db.get_op_perf(
-                    qualified_name, inputs_signature.__str__())
+                db_record = perf_db.get_op_perf(qualified_name, inputs_signature.__str__())
                 if db_record is not None:
                     runtime_prof_result[node.name] = db_record
                     continue
@@ -77,8 +76,7 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                 ops_elapsed_time_ = 0
                 for evt_idx in range(0, mdconfig.profile_trials):
                     # time elapsed in **milliseconds**
-                    ops_elapsed_time_ += start_evt_[
-                        evt_idx].elapsed_time(end_evt_[evt_idx])
+                    ops_elapsed_time_ += start_evt_[evt_idx].elapsed_time(end_evt_[evt_idx])
                 ops_elapsed_time_ = ops_elapsed_time_ / mdconfig.profile_trials
 
                 runtime_prof_result[node.name] = ops_elapsed_time_
@@ -86,8 +84,7 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                                        ops_elapsed_time_)
 
     broadcast_result = [runtime_prof_result]
-    torch.distributed.broadcast_object_list(
-        broadcast_result, src=0, device="cuda")
+    torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
     runtime_prof_result = broadcast_result[0]
 
     min_runtime_ms = float('inf')
@@ -100,11 +97,10 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             if node.name in runtime_prof_result:
                 # Avoid overflow
                 node.ed_info.normalized_int_runtime_ms = min(
-                    int(node.ed_info.runtime_ms / min_runtime_ms) * 2, 32768
-                )
+                    int(node.ed_info.runtime_ms / min_runtime_ms) * 2, 32768)
             else:
                 node.ed_info.normalized_int_runtime_ms = 1
-    
+
     if mdconfig.dump_prof_db and torch.distributed.get_rank() == 0:
         perf_db.persistent()
 
