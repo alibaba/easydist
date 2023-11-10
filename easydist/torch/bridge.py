@@ -47,43 +47,6 @@ def materialize(x, device):
     return x
 
 
-def shard_module(model, input_, input_strategy, device="cuda"):
-    mesh = get_device_mesh()
-
-    input_strategy = [[to_torch_spmd(i) for i in var_strategy] for var_strategy in input_strategy]
-
-    idx = 0
-    for name in dict(model.named_parameters()):
-
-        tensor_data = rgetattr(model, name).data
-        tensor_data = materialize(tensor_data, device=device)
-
-        rsetattr(
-            model, name,
-            torch.nn.parameter.Parameter(distribute_tensor(tensor_data, mesh,
-                                                           input_strategy[idx])))
-
-        with torch.no_grad():
-            rsetattr(model, name + ".grad", torch.empty_like(rgetattr(model, name).data))
-        idx += 1
-
-    for name in dict(model.named_buffers()):
-
-        tensor_data = rgetattr(model, name).data
-        tensor_data = materialize(tensor_data, device=device)
-
-        rsetattr(model, name, distribute_tensor(tensor_data, mesh, input_strategy[idx]))
-        idx += 1
-
-    shard_input = []
-    for tensor in input_:
-        tensor = materialize(tensor, device=device)
-        shard_input.append(distribute_tensor(tensor, mesh, input_strategy[idx]))
-        idx += 1
-
-    return shard_input
-
-
 def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding_info,
                      meta_info) -> MetaGraph:
     meta_graph = MetaGraph(fx_module)
@@ -131,16 +94,12 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             node_sharding_info = None
             if op_name in sharding_info:
 
-                def _gen_meta(arg):
-                    if isinstance(arg, Node):
-                        return torch.empty(meta_info[arg.name]["shape"],
-                                           dtype=meta_info[arg.name]["dtype"],
-                                           device="meta")
-                    else:
-                        # primitive data type: int, float, etc
-                        return arg
+                def _gen_meta(arg: Node):
+                    return torch.empty(meta_info[arg.name]["shape"],
+                                        dtype=meta_info[arg.name]["dtype"],
+                                        device="meta")
 
-                args_meta = pytree.tree_map(_gen_meta, node.args)
+                args_meta = pytree.tree_map_only(Node, _gen_meta, node.args)
                 args_meta = str(tuple(args_meta)) + ' | ' + str(node.kwargs)
                 if args_meta in sharding_info[op_name]:
                     node_sharding_info = sharding_info[op_name][args_meta]

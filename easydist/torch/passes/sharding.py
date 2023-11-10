@@ -15,7 +15,6 @@
 import operator
 import logging
 from typing import List
-from functools import reduce
 
 import torch
 import torch.utils._pytree as pytree
@@ -23,13 +22,12 @@ from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed._tensor import mesh_resources
 from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
-from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
-from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType
+from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
 from easydist.metashard.combination import ReduceOp
@@ -423,14 +421,6 @@ def override_args(node, invars_strategy):
         local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
 
         node.update_arg(shape_argnum, local_out_shape)
-
-
-def create_meta_from_node(node):
-    fake_args = pytree.tree_map_only(Node, lambda n: n.meta['val'], node.args)
-    fake_val = node.target(*fake_args, **node.kwargs)
-    if isinstance(fake_val, list):
-        return {'val': fake_val}
-    return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
 
 def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_map):

@@ -41,7 +41,7 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
                                    sharding_transform, sharding_transform_dtensor)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
-from easydist.torch.passes import comm_optimize, rule_override_by_graph
+from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -98,6 +98,8 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             if mdconfig.log_level <= logging.DEBUG:
                 rich.print("sharding_info:\n", sharding_info)
                 rich.print("shape_info:\n", shape_info)
+
+        fx_module = create_edinfo(fx_module, sharding_info, shape_info)
 
         # (2) translate fx.GraphModule into MetaGraph
         meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)

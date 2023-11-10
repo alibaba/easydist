@@ -64,23 +64,27 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     critical_communication = {}
     for node in fx_module.graph.nodes:
         if node.op == 'call_function' and node.ed_info.is_communication():
-            all_prev_nodes = set(find_all_prev_nodes(node))
-            all_post_nodes = set(find_all_post_nodes(node))
-            independent_nodes = set(computation_nodes) - all_prev_nodes - all_post_nodes
+            prev_nodes = set(find_all_prev_nodes(node))
+            post_nodes = set(find_all_post_nodes(node))
+            independent_nodes = set(computation_nodes) - \
+                prev_nodes - post_nodes
 
             independent_nodes_runtime = 0.0
             for indpd_node in independent_nodes:
                 independent_nodes_runtime += indpd_node.ed_info.runtime_ms
 
-            print(
-                f"{node.name} {node.ed_info.runtime_ms} {len(all_prev_nodes)},{len(all_post_nodes)},{len(independent_nodes)} {independent_nodes_runtime}"
+            node_info = f"[{node.name}] pre={len(prev_nodes)} post={len(post_nodes)} indpd={len(independent_nodes)}"
+
+            logger.debug(
+                f"{node_info} runtime={node.ed_info.runtime_ms:.4f}/{independent_nodes_runtime:.4f}"
             )
 
             # TODO need to extend if independent_nodes can not cover the communication
-            if len(independent_nodes) == 0:
+            if independent_nodes_runtime <= node.ed_info.runtime_ms:
                 critical_communication[node] = None
 
-    logger.info(f"Number of critical communication nodes: {len(critical_communication)}")
+    logger.info(
+        f"Number of critical communication nodes: {len(critical_communication)}")
 
     # Step 3: determine the strategy for each critical communication node
 
