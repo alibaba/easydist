@@ -46,7 +46,7 @@ reduce_map = {
 CREATE_ATEN_OP = [
     torch.ops.aten.empty.memory_format, torch.ops.aten.zeros.default, torch.ops.aten.ones.default,
     torch.ops.aten.scalar_tensor.default, torch.ops.aten.arange.default,
-    torch.ops.aten.zeros.default
+    torch.ops.aten.zeros.default, torch.ops.aten.arange.start
 ]
 
 
@@ -418,12 +418,7 @@ def override_args(node, invars_strategy):
 
 
 def create_meta_from_node(node):
-    fake_args = []
-    for arg in node.args:
-        if isinstance(arg, Node):
-            fake_args.append(arg.meta['val'])
-        else:
-            fake_args.append(arg)
+    fake_args = pytree.tree_map_only(Node, lambda n: n.meta['val'], node.args)
     fake_val = node.target(*fake_args, **node.kwargs)
     if isinstance(fake_val, list):
         return {'val': fake_val}
@@ -463,7 +458,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                 shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
                 continue
 
-            if ops_name == "_operator.getitem":
+            if node.target == operator.getitem:
                 shard_env[node.name] = shard_env[node.args[0].name][node.args[1]]
                 opt_strategy[node.name] = {
                     'node': node.name,
