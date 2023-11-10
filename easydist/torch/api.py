@@ -14,195 +14,196 @@
 
 import time
 import logging
+import importlib
+from functools import update_wrapper
+from typing import Any
 
-import rich
+import numpy
 import torch
-from torch._functorch.aot_autograd import aot_function, make_boxed_compiler
+import torch.utils._pytree as pytree
+from torch.distributed._tensor import DeviceMesh
 
-from easydist.metashard import metair
-from easydist.autoflow.solver import AutoFlowSolver
 import easydist.config as mdconfig
-from .sharding_interpreter import EDTorchShardingAnn
-from .utils import _sharding_ann_env
-from .bridge import torch2meta_graph, get_torch_sharding_strategy
-from .passes import eliminate_detach, fix_addmm_bias, fix_convoluation_bias, fix_embedding, sharding_transform
-from .passes.sharding import get_device_mesh
+from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
+from easydist.torch.compiler import _compile
+from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
+from easydist.torch.utils import get_input_signature
 
 logger = logging.getLogger(__name__)
 
-ENABLE_TRANSFORM = False
-BW_CONSTRAINTS = None
-INPUT_STRATEGY = None
 
+class CompiledFuncWrapper:
 
-def get_input_strategy():
-    global INPUT_STRATEGY
-    return INPUT_STRATEGY
+    def __init__(self,
+                 func,
+                 tracing_mode="fake",
+                 cuda_graph=True,
+                 enable_mono_graph=False,
+                 compile_only=False) -> None:
+        update_wrapper(self, func)
+        self.original_func = func
 
+        self.compiled_func = None
+        self.tracing_mode = tracing_mode
+        self.enable_cuda_graph = cuda_graph
+        self.enable_mono_graph = enable_mono_graph
+        self.compile_only = compile_only
 
-def enable_transform():
-    global ENABLE_TRANSFORM
-    ENABLE_TRANSFORM = True
+        self.init_helper = SetParaInitHelper()
 
+        self.all_input_signature = []
+        self.graph_list = {}
 
-def _get_output_strategy(opt_strategy, meta_graph, input_strategy):
-    partial_strategy = {}
-    for op in meta_graph.op_list:
-        op_key = op.unique_key()
-        if op_key in opt_strategy:
-            for idx, var in enumerate(op.outvars):
-                if var in meta_graph.output_list:
-                    strategy = opt_strategy[op_key]['strategy'].out_strtg_group.get_var_strtg(idx)
-                    partial_strategy[var] = strategy
+        self.cuda_graph_space = {}
+        self.graph_pool = None
 
-    for var in meta_graph.input_list:
-        if var in meta_graph.output_list:
-            if var in input_strategy:
-                partial_strategy[var] = input_strategy[var]
+    def register_input_signature(self, *args: Any, **kwargs: Any) -> str:
 
-    return partial_strategy
+        input_signature = get_input_signature(*args, **kwargs)
 
+        if input_signature not in self.all_input_signature:
 
-def _get_input_strategy(opt_strategy, meta_graph):
-    partial_strategy = {}
-    for op in reversed(meta_graph.op_list):
-        op_key = op.unique_key()
-        if op_key in opt_strategy:
-            for idx, var in enumerate(op.invars):
-                if var in meta_graph.input_list:
-                    strategy = opt_strategy[op_key]['strategy'].in_strtg_group.get_var_strtg(idx)
-                    partial_strategy[var] = strategy
+            self.all_input_signature.append(input_signature)
+            logger.info(f"[Compile API] register input signature: {input_signature}")
 
-    partial_strategy_list = []
+            if self.enable_cuda_graph:
+                self.cuda_graph_space[input_signature] = {
+                    "cuda_graph": None,
+                    "cuda_graph_input": None,
+                    "cuda_graph_output": None,
+                }
 
-    for var in meta_graph.input_list:
-        if var in partial_strategy:
-            partial_strategy_list.append(partial_strategy[var])
+        return input_signature
+
+    def register_cpu_module(self, cpu_module):
+        self.init_helper = CpuModuleInitHelper(cpu_module)
+
+    def set_init_helper(self, init_helper):
+        self.init_helper = init_helper
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+
+        input_signature = self.register_input_signature(*args, **kwargs)
+
+        # skip compile when only one device
+        world_size = torch.distributed.get_world_size()
+        need_compile = world_size >= 2
+        if get_device_mesh() is not None:
+            need_compile = device_mesh_world_size() >= 2
+
+        # override need_compile with forced_compile env var
+        if mdconfig.forced_compile:
+            need_compile = True
+
+        if need_compile and self.compiled_func is None:
+            mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
+            mesh = DeviceMesh("cuda", mesh_shape.tolist())
+
+            if get_device_mesh() == None:
+                set_device_mesh(mesh)
+
+            self.compiled_func = _compile(self.original_func, self.tracing_mode, self.init_helper,
+                                          input_signature, args, kwargs)
+            self.graph_list[input_signature] = self.compiled_func.graph
+            # release the cpu module when finised pre-shard in _compiler
+            self.init_helper = None
+        if self.compile_only:
+            return self.compiled_func
+
+        def run_func(*args, **kwargs):
+            if self.compiled_func:
+                if input_signature not in self.graph_list:
+                    if self.enable_mono_graph:
+                        mono_graph = self.compiled_func.compile_mono_graph(*args, **kwargs)
+                        self.graph_list[input_signature] = mono_graph
+                        logger.info(f"[Compile API] compile mono graph for {input_signature}")
+                    else:
+                        raise RuntimeError(
+                            "Input mismatch. If you are sure that different inputs do not change the graph, "
+                            "you can try turning on the enable_mono_graph option.")
+                graph = self.graph_list[input_signature]
+                output = self.compiled_func.run_with_graph(graph, *args, **kwargs)
+                if importlib.util.find_spec("torch.distributed._functional_collectives"):
+                    # wait all AsyncCollectiveTensor and unwrap AsyncCollectiveTensor
+                    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+                    from torch.distributed._functional_collectives_impl import _wait_all
+                    _wait_all()
+
+                    def wait_unwarp_fn(async_coll_tensor_):
+                        return async_coll_tensor_.elem
+
+                    return pytree.tree_map_only(AsyncCollectiveTensor, wait_unwarp_fn, output)
+                else:
+                    return output
+            else:
+                return self.original_func(*args, **kwargs)
+
+        if self.enable_cuda_graph:
+            current_space = self.cuda_graph_space[input_signature]
+            if current_space["cuda_graph"] is None:
+                logger.info("[Compile API] cuda graph warming up...")
+
+                flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
+                current_space["cuda_graph_input"] = []
+                for f_args in flatten_args:
+                    if isinstance(f_args, torch.Tensor):
+                        current_space["cuda_graph_input"].append(
+                            torch.empty_like(f_args).copy_(f_args))
+                    else:
+                        current_space["cuda_graph_input"].append(f_args)
+                args, kwargs = pytree.tree_unflatten(current_space["cuda_graph_input"], args_specs)
+
+                # warm up
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    current_space["cuda_graph_output"] = run_func(*args, **kwargs)
+                torch.cuda.current_stream().wait_stream(s)
+                torch.cuda.synchronize()
+
+                # sleep to prevent cuda error when cuda graph capture.
+                time.sleep(2)
+
+                current_space["cuda_graph"] = torch.cuda.CUDAGraph()
+
+                with torch.cuda.graph(current_space["cuda_graph"], self.graph_pool):
+                    current_space["cuda_graph_output"] = run_func(*args, **kwargs)
+
+                # assign the pool of first cuda graph as self.graph_pool
+                if self.graph_pool is None:
+                    self.graph_pool = current_space["cuda_graph"].pool()
+            else:
+                flatten_args, args_specs = pytree.tree_flatten([args, kwargs])
+                for static_input, outside_input in zip(current_space["cuda_graph_input"],
+                                                       flatten_args):
+                    if isinstance(static_input, torch.Tensor):
+                        static_input.copy_(outside_input)
+
+            current_space["cuda_graph"].replay()
+            return current_space["cuda_graph_output"]
         else:
-            partial_strategy_list.append(
-                [metair.SPMD(metair.SPMD.REPLICATE),
-                 metair.SPMD(metair.SPMD.REPLICATE)])
-
-    return partial_strategy, partial_strategy_list
+            return run_func(*args, **kwargs)
 
 
-@make_boxed_compiler
-def easydist_shard(fx_module: torch.fx.GraphModule, inps):
+def easydist_compile(func=None,
+                     tracing_mode="fake",
+                     cuda_graph=True,
+                     enable_mono_graph=False,
+                     use_hint=False,
+                     liveness_only_input=False,
+                     max_solver_time=float("inf"),
+                     compile_only=False):
 
-    global BW_CONSTRAINTS, INPUT_STRATEGY
+    mdconfig.use_hint = use_hint
+    mdconfig.liveness_only_input = liveness_only_input
+    mdconfig.max_seconds_same_incumbent = max_solver_time
 
-    fx_module = fix_embedding(fx_module)
-    fx_module = fix_addmm_bias(fx_module)
-    fx_module = fix_convoluation_bias(fx_module)
-    fx_module = eliminate_detach(fx_module)
-    fx_module.recompile()
-    if mdconfig.log_level <= logging.DEBUG:
-        print(fx_module.graph)
+    if func:
+        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
+    else:
 
-    with _sharding_ann_env():
-        start_t = time.perf_counter()
-        sharding_interpreter = EDTorchShardingAnn(fx_module)
-        sharding_info, fwd_shape_info = sharding_interpreter.run(*inps)
-        logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print("sharding_info:\n", sharding_info)
-            rich.print("fwd_shape_info:\n", fwd_shape_info)
+        def wrapper(func):
+            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph,
+                                       compile_only)
 
-    meta_graph = torch2meta_graph(fx_module, sharding_info, fwd_shape_info)
-
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(meta_graph)
-
-    device_mesh = get_device_mesh()
-    device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
-
-    solver = AutoFlowSolver(device_mesh_shape, BW_CONSTRAINTS)
-    solver.add_graph(meta_graph)
-    start_t = time.perf_counter()
-    count_invars = BW_CONSTRAINTS is None
-    opt_strategy = solver.ilp_optimize(count_invars)
-    logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
-    # start_t = time.perf_counter()
-    # beam_search_strategy = solver.beam_search()
-    # logger.info(f"[AutoFlowSolver.beam_search]: {time.perf_counter() - start_t} s.")
-
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print(opt_strategy)
-
-    if BW_CONSTRAINTS is None:
-        strategy_map, INPUT_STRATEGY = _get_input_strategy(opt_strategy, meta_graph)
-        BW_CONSTRAINTS = _get_output_strategy(opt_strategy, meta_graph, strategy_map)
-
-    if ENABLE_TRANSFORM:
-        sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
-
-        if mdconfig.log_level <= logging.DEBUG:
-            print(sharding_strategy)
-
-        fx_module = sharding_transform(fx_module, sharding_strategy)
-        fx_module = fix_embedding(fx_module, recover=True)
-
-        if mdconfig.log_level <= logging.DEBUG:
-            print(fx_module.graph)
-
-    return fx_module
-
-
-def md_aot_module(mod: torch.nn.Module, *args, **kwargs) -> torch.nn.Module:
-    """
-    Traces the forward and backward graph of :attr:`mod` using torch dispatch
-    tracing mechanism. It is wrapper function, that underneath uses
-    :func:`aot_function` to perform tracing and compilation.
-
-    :func:`aot_module` lifts the parameters and buffers of ``nn.Module`` as inputs
-    to a new callable which is then compiled through :func:`aot_function`.
-
-    .. warning::
-        This API is experimental and likely to change.
-
-    Args:
-        mod (Callable): A ``nn.Module`` module.
-        args : args to be passed to :func:`aot_function`
-        kwargs : kwargs to be passed to :func:`aot_function`
-
-    Returns:
-        Returns a ``nn.Module`` that retains the eager behavior of the original
-        :attr:`mod`, but with forward and backward graph compiled.
-
-    """
-    # See Note: [Fake Modules and AOTAutograd]
-    torch._dynamo.utils.assert_no_fake_params_or_buffers(mod)
-
-    def functional_call(named_params, named_buffers, *args, **kwargs):
-        params_and_buffers = {**named_params, **named_buffers}
-        return torch.func.functional_call(mod, params_and_buffers, args, kwargs)
-
-    named_params = dict(mod.named_parameters(remove_duplicate=False))
-    named_buffers = dict(mod.named_buffers(remove_duplicate=False))
-    num_params_buffers = len(named_params) + len(named_buffers)
-    compiled_f = aot_function(functional_call,
-                              num_params_buffers=num_params_buffers,
-                              *args,
-                              **kwargs)
-
-    class AOTModule(torch.nn.Module):
-
-        def __init__(self):
-            super().__init__()
-            self.orig_module = mod
-
-        def forward(self, *args, **kwargs):
-            named_params = dict(mod.named_parameters(remove_duplicate=False))
-            named_buffers = dict(mod.named_buffers(remove_duplicate=False))
-            return compiled_f(
-                named_params,
-                named_buffers,
-                *args,
-                **kwargs,
-            )
-
-    return AOTModule()
-
-
-def compile(mod: torch.nn.Module):
-    return md_aot_module(mod, fw_compiler=easydist_shard, bw_compiler=easydist_shard)
+        return wrapper

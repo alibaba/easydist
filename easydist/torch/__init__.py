@@ -18,7 +18,7 @@ import torch
 from torch._functorch import config
 from torch.distributed._tensor.op_schema import OpSchema
 
-from .api import compile, enable_transform, get_input_strategy, easydist_shard
+from .api import easydist_compile
 from .bridge import shard_module, torch2meta_graph
 from .passes.sharding import sharding_transform
 from .device_mesh import set_device_mesh, get_device_mesh
@@ -31,8 +31,7 @@ if hasattr(config, "use_fake_tensor"):
 
 __all__ = [
     'EDTorchShardingAnn', 'sharding_transform', 'set_device_mesh', 'get_device_mesh',
-    'torch2meta_graph', 'compile', 'easydist_shard', 'enable_transform', 'shard_module',
-    'get_input_strategy'
+    'torch2meta_graph', 'shard_module', 'easydist_compile'
 ]
 
 
@@ -53,16 +52,14 @@ if "2.1.0" in torch.__version__:
     def hot_fix_opschema_hash(self):
         # NOTE: we turn kwargs_schema into a frozenset to hash as it would not be nested dict
         frozen_set_kwargs_schema = frozenset(self.kwargs_schema.items())
-        return hash(
-            (
-                self.func_schema.name,
-                tuple(self.func_schema.arguments),
-                tuple(self.func_schema.returns),
-                self.func_schema.name,
-                tuple(tuple(e) if isinstance(e, list) else e for e in self.args_schema),
-                frozen_set_kwargs_schema,
-            )
-        )
+        return hash((
+            self.func_schema.name,
+            tuple(self.func_schema.arguments),
+            tuple(self.func_schema.returns),
+            self.func_schema.name,
+            tuple(tuple(e) if isinstance(e, list) else e for e in self.args_schema),
+            frozen_set_kwargs_schema,
+        ))
 
     OpSchema.__hash__ = hot_fix_opschema_hash
 
@@ -89,21 +86,21 @@ if "2.1.0" in torch.__version__:
             if isinstance(placement, Shard):
                 shard_dim = placement.dim
                 assert (
-                    shard_dim < self.ndim
-                ), f"Sharding dim {shard_dim} greater than tensor ndim {self.ndim}"
+                    shard_dim
+                    < self.ndim), f"Sharding dim {shard_dim} greater than tensor ndim {self.ndim}"
                 local_shard_size, _ = placement._local_shard_size_on_dim(
-                    local_shape[shard_dim], mesh_dim_size, my_coordinate
-                )
+                    local_shape[shard_dim], mesh_dim_size, my_coordinate)
                 assert isinstance(local_shard_size, int)
                 local_shape[shard_dim] = local_shard_size
         return tuple(local_shape)
-    
+
     assert not hasattr(DTensorSpec, "local_shape")
     setattr(DTensorSpec, "local_shape", property(local_shape))
-    
+
     # Continue：fix: AttributeError: 'DeviceMesh' object has no attribute 'get_coordinate_on_dim'
     from torch.distributed._tensor.device_mesh import DeviceMesh
     from typing import Optional
+
     # Borrow from https://github.com/pytorch/pytorch/blob/e9ebda29d87ce0916ab08c06ab26fd3766a870e5/torch/distributed/_tensor/device_mesh.py#L294C1-L299C81
     # which was removed in 2.1.0
     def get_coordinate_on_dim(self, dim: int) -> Optional[int]:
@@ -112,6 +109,6 @@ if "2.1.0" in torch.__version__:
         dimension of the mesh. If this rank is not part of the mesh, return None.
         """
         return self._coordinate_on_dim[dim] if self._coordinate_on_dim else None
-    
+
     assert not hasattr(DeviceMesh, "get_coordinate_on_dim")
     setattr(DeviceMesh, "get_coordinate_on_dim", get_coordinate_on_dim)

@@ -72,7 +72,9 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             for indpd_node in independent_nodes:
                 independent_nodes_runtime += indpd_node.ed_info.runtime_ms
 
-            print(f"{node.name} {node.ed_info.runtime_ms} {len(all_prev_nodes)},{len(all_post_nodes)},{len(independent_nodes)} {independent_nodes_runtime}")
+            print(
+                f"{node.name} {node.ed_info.runtime_ms} {len(all_prev_nodes)},{len(all_post_nodes)},{len(independent_nodes)} {independent_nodes_runtime}"
+            )
 
             # TODO need to extend if independent_nodes can not cover the communication
             if len(independent_nodes) == 0:
@@ -83,5 +85,5 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # Step 3: determine the strategy for each critical communication node
 
     # Step 4: tile the critical communication nodes and the computation context
-    
+
     return fx_module

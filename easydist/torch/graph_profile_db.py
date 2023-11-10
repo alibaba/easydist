@@ -18,7 +18,6 @@ import logging
 
 import easydist.config as mdconfig
 
-
 _logger = logging.getLogger(__name__)
 
 
@@ -37,7 +36,7 @@ class PerfDB:
 
     def record_op_perf(self, key_l1, key_l2, value):
         if key_l1 not in self.db:
-            self.db[key_l1] = dict()    
+            self.db[key_l1] = dict()
         self.db[key_l1][key_l2] = value
 
     def persistent(self):

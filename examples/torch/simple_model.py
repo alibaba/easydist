@@ -11,7 +11,7 @@ from torch.distributed.utils import _sync_module_states
 from torch.utils.checkpoint import checkpoint
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 
 
 def broadcast_module(model):
