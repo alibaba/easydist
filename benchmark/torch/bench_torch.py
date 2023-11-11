@@ -5,28 +5,19 @@ import os
 import sys
 from functools import partial
 
-import numpy
 import torch
 import torch.optim as optim
 import torch.utils._pytree as pytree
-from torch.distributed._tensor import DeviceMesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from easydist.torch.experimental.api import easydist_compile
-from easydist.torch import (enable_transform, get_input_strategy, compile, set_device_mesh,
-                            shard_module)
-from easydist.utils.testing import TorchMockDeviceMesh
-from easydist import easydist_setup
+from easydist import easydist_setup, mdconfig
+from easydist.torch.api import easydist_compile
 from easydist.utils.timer import EDTimer
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from benchmark.torch.model import GPT, GATLayer, wresnet50
 from benchmark.bench_case import GPTCase, ResNetCase, GATCase
-
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
-                    datefmt='%m/%d %H:%M:%S',
-                    level=logging.INFO)
 
 
 def get_gpt_case(device="cuda"):
@@ -129,11 +120,6 @@ def to_meta(node_output):
 
 
 def bench_easydist(model, data_in):
-    world_size = torch.distributed.get_world_size()
-
-    mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
-    mesh = DeviceMesh("cuda", mesh_shape.tolist())
-    set_device_mesh(mesh)
 
     if not isinstance(data_in, list):
         data_in = [data_in]
@@ -143,7 +129,7 @@ def bench_easydist(model, data_in):
 
     optimizer = optim.SGD(model.parameters(), lr=0.001)
 
-    @easydist_compile()
+    @easydist_compile(cuda_graph=False)
     def train_step(model, optimizer, data_in):
         output_ = model(*data_in)
         output_grad = torch.ones_like(output_)
@@ -168,72 +154,9 @@ def bench_easydist(model, data_in):
     print(f"[{local_rank}] Time: {elaps_time}")
 
 
-def bench_easydist_old(model, data_in):
-    world_size = torch.distributed.get_world_size()
-
-    mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
-    mesh = DeviceMesh("cuda", mesh_shape.tolist())
-
-    mock_mesh = TorchMockDeviceMesh(*(mesh_shape.shape))
-    set_device_mesh(mock_mesh)
-
-    enable_transform()
-
-    compiled_module = compile(model)
-
-    if not isinstance(data_in, list):
-        data_in = [data_in]
-
-    if model.device == torch.device("meta"):
-        data_in = pytree.tree_map(to_meta, data_in)
-
-    out = compiled_module(*data_in)
-    try:
-        out_grad = torch.ones_like(out)
-        out.backward(out_grad)
-    except:
-        pass
-
-    set_device_mesh(mesh)
-    data_in = shard_module(compiled_module.orig_module, data_in, get_input_strategy())
-
-    # handle causal_mask for GPT
-    if isinstance(compiled_module.orig_module, GPT):
-        for idx in range(len(compiled_module.orig_module.blocks)):
-
-            tensor_data = compiled_module.orig_module.blocks[idx].attn.core_attention.causal_mask
-
-            if tensor_data.device == torch.device("meta"):
-                seq_len = tensor_data.shape[-1]
-                tensor_data = torch.tril(
-                    torch.ones((seq_len, seq_len), dtype=torch.uint8,
-                               device="cuda")).view(1, 1, seq_len, seq_len).bool()
-
-            compiled_module.orig_module.blocks[idx].attn.core_attention.causal_mask = tensor_data
-
-    optimizer = optim.SGD(compiled_module.orig_module.parameters(), lr=0.001)
-
-    def train_step():
-        optimizer.zero_grad()
-        out = compiled_module(*data_in)
-        out_grad = torch.ones_like(out)
-        out.backward(out_grad)
-        optimizer.step()
-
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-
-    timer = EDTimer(train_step, in_ms=False)
-
-    elaps_time = timer.time()
-    peak_memory = torch.cuda.max_memory_allocated()
-
-    print(f"Memory: {peak_memory / 1024 / 1024 / 1024} GB")
-    print(f"Time: {elaps_time}")
-
-
 def main():
     # setup easydist
+    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda")
 
     # setup distributed
@@ -241,10 +164,9 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    model, data_in = get_gpt_case(device="meta")
+    model, data_in = get_gpt_case(device="cuda")
 
     bench_easydist(model, data_in)
-
 
 
 if __name__ == '__main__':

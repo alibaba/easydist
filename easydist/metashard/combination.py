@@ -88,7 +88,9 @@ class CombinationFunc:
     def reduce(sharded_tensor, ops=ReduceOp.SUM):
         init = platform.zeros_like(sharded_tensor[0])
         num_elem = len(sharded_tensor)
-        ratio = 1.
+        # Prevents precision conversion (int -> float)
+        # (NOTE) the precision of AVG need to investigate
+        ratio = 1
         assert ops in [ReduceOp.SUM, ReduceOp.MAX, ReduceOp.MIN, ReduceOp.AVG]
         if ops == ReduceOp.SUM:
             reduce_func_ = platform.add

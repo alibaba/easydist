@@ -35,7 +35,9 @@ def materialize_zero(tensor, materialization_device):
 
 
 @torch.no_grad()
-def materialize_random(tensor, materialization_device):
+def materialize_random(tensor, materialization_device=None):
+    if materialization_device is None:
+        materialization_device = tensor.device
     if tensor.dtype == torch.bool:
         return torch.rand(tensor.size(), dtype=torch.float, device=materialization_device) > 0.5
     elif torch.is_floating_point(tensor):

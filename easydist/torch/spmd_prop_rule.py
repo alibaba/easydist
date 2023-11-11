@@ -27,6 +27,7 @@ extra_pointwise_op = [
 for op in extra_pointwise_op:
     register_prop_rule(op)(pointwise_rule)
 
+
 # from torch/distributed/_spmd/experimental_ops.py on pytorch main branch
 # copy it because it is not ready in released pytorch
 @register_prop_rule(aten.native_layer_norm.default)  # pyre-ignore
@@ -256,7 +257,7 @@ def _prop_native_group_norm(op_schema: OpSchema) -> OutputSharding:
         kwargs_schema=op_schema.kwargs_schema,
     )
 
-    return OutputSharding(output_spec=(input, stats_spec, stats_spec), 
+    return OutputSharding(output_spec=(input, stats_spec, stats_spec),
                           schema_suggestions=[suggested_schema])
 
 
@@ -803,15 +804,16 @@ def _prop_stack(op_schema: OpSchema) -> OutputSharding:
     return OutputSharding(output_spec=get_dtensor_spec(
         mesh=tensors[0].mesh, shape=output_shape, placements=tensors[0].placements))
 
+
 # aten._foreach_pow not defined in PyTorch < 2.1.0
 if "_foreach_pow" in torch.ops.aten.__dir__():
+
     @register_prop_rule([aten._foreach_pow.ScalarAndTensor])  # pyre-ignore
     def _prop__foreach_pow_scalar_and_tensor(op_schema: OpSchema):
         scala, exponent = op_schema.args_schema
-        assert isinstance(exponent, list) and all(
-            isinstance(s, DTensorSpec) for s in exponent
-        )
+        assert isinstance(exponent, list) and all(isinstance(s, DTensorSpec) for s in exponent)
         return OutputSharding(output_spec=exponent)
+
 
 if "_unsafe_index" in torch.ops.aten.__dir__():
     register_prop_rule(aten._unsafe_index.Tensor)(prop_index)

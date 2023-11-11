@@ -139,7 +139,8 @@ class EDTorchShardingAnn(Interpreter):
                 self.env = {}
                 return self.sharding_info, self.shape_info
 
-    def placeholder(self, target : 'Target', args : Tuple[Argument, ...], kwargs : Dict[str, Any]) -> Any:
+    def placeholder(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str,
+                                                                                     Any]) -> Any:
         """
         Execute a ``placeholder`` node. Note that this is stateful:
         ``Interpreter`` maintains an internal iterator over
@@ -171,7 +172,8 @@ class EDTorchShardingAnn(Interpreter):
                 if isinstance(output, torch.Tensor):
                     out_meta_str = str(output)
                     if out_meta_str not in self.sharding_info["placeholder"]:
-                        sharding_ann, combination_ann = preset_meta_spmd("placeholder", (output, kwargs))
+                        sharding_ann, combination_ann = preset_meta_spmd(
+                            "placeholder", (output, kwargs))
                         if sharding_ann or combination_ann:
                             self.sharding_info["placeholder"][out_meta_str] = {
                                 "sharding_ann": sharding_ann,
@@ -182,9 +184,12 @@ class EDTorchShardingAnn(Interpreter):
                 if len(args) > 0:
                     return args[0]
                 else:
-                    raise RuntimeError(f'Expected positional argument for parameter {target}, but one was not passed in!') from si
+                    raise RuntimeError(
+                        f'Expected positional argument for parameter {target}, but one was not passed in!'
+                    ) from si
 
-    def get_attr(self, target : 'Target', args : Tuple[Argument, ...], kwargs : Dict[str, Any]) -> Any:
+    def get_attr(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str,
+                                                                                  Any]) -> Any:
         """
         Execute a ``get_attr`` node. Will retrieve an attribute
         value from the ``Module`` hierarchy of ``self.module``.

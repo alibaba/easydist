@@ -9,7 +9,7 @@ import torch.utils._pytree as pytree
 from diffusers import EulerDiscreteScheduler, StableDiffusionPipeline
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 
 pytree._register_pytree_node(
     diffusers.models.unet_2d_condition.UNet2DConditionOutput, lambda x: ([x.sample], None),
