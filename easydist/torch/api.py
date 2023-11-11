@@ -104,7 +104,7 @@ class CompiledFuncWrapper:
 
             self.compiled_func = _compile(self.original_func, self.tracing_mode, self.init_helper,
                                           input_signature, args, kwargs)
-            self.graph_list[input_signature] = self.compiled_func.graph
+            self.graph_list[input_signature] = self.compiled_func.graph_mod
             # release the cpu module when finised pre-shard in _compiler
             self.init_helper = None
         if self.compile_only:

@@ -18,7 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial
-from typing import Any, cast, Tuple, Dict
+from typing import Any, cast
 from contextlib import nullcontext
 
 import numpy
@@ -187,7 +187,34 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             assert opt is None, "Only support single Optimizer in args now"
             opt = arg
 
-    params, buffers, named_states = extract_states(init_helper, module, opt)
+    params, buffers = {}, {}
+    if module is not None:
+        params = dict(module.named_parameters())
+        buffers = dict(module.named_buffers())
+
+        if isinstance(init_helper, SetParaInitHelper):
+            init_helper.module = module
+
+    named_states = {}
+
+    if opt is not None:
+        # assign grad and warm up optimizer
+        mode = nullcontext()
+        for name in dict(module.named_parameters()):
+            with torch.no_grad():
+                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+                if isinstance(rgetattr(module, name).data, FakeTensor):
+                    mode = FakeTensorMode()
+        with mode:
+            opt.step()
+            opt.zero_grad(True)
+
+        for n, p in params.items():
+            if p in opt.state:
+                named_states[n] = opt.state[p]  # type: ignore[index]
+                # if step in state, reduce one for warmup step.
+                if 'step' in named_states[n]:
+                    named_states[n]['step'] -= 1
 
     flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
@@ -353,8 +380,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     class EDCompiledFunc:
 
-        def __init__(self, graph) -> None:
-            self.graph = graph
+        def __init__(self, graph_mod) -> None:
+            self.graph_mod = graph_mod
 
         @torch.no_grad()
         def compiled_func(self, graph, *args, **kwargs):
@@ -393,7 +420,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             return local_out
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            return self.compiled_func(self.graph, *args, **kwargs)
+            return self.compiled_func(self.graph_mod, *args, **kwargs)
 
         def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
             return self.compiled_func(graph, *args, **kwargs)
@@ -434,35 +461,3 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
         module.to("meta")
 
     return EDCompiledFunc(sharded_graph)
-
-def extract_states(init_helper, module: torch.nn.Module, opt: torch.optim.Optimizer) -> Tuple[Dict[str, torch.nn.Parameter], Dict[str, torch.Tensor], Dict[str, Any]]:
-    params, buffers = {}, {}
-    if module is not None:
-        params = dict(module.named_parameters())
-        buffers = dict(module.named_buffers())
-
-        if isinstance(init_helper, SetParaInitHelper):
-            init_helper.module = module
-
-    named_states = {}
-
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = FakeTensorMode()
-        with mode:
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
-
-    return params,buffers,named_states

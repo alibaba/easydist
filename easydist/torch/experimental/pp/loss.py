@@ -1,4 +1,6 @@
+# Modified from PiPPy
 import torch
+
 
 class LossWrapper(torch.nn.Module):
     """
@@ -36,14 +38,13 @@ class LossWrapper(torch.nn.Module):
             "This instance of LossWrapper does not have an overridden"
             "forward(). Please implement forward() to specify the arguments, "
             "connection between the module and loss, and loss output "
-            "value."
-        )
+            "value.")
 
 
 class TrivialLossWrapper(LossWrapper):
+
     def forward(self, x, targets):
         model_out = self.module(x)
         return self.loss_fn(model_out, targets)
 
     loss_spec = True
-
