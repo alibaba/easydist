@@ -18,7 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial
-from typing import Any, cast
+from typing import Any, cast, Tuple, Dict
 from contextlib import nullcontext
 
 import numpy
@@ -187,34 +187,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             assert opt is None, "Only support single Optimizer in args now"
             opt = arg
 
-    params, buffers = {}, {}
-    if module is not None:
-        params = dict(module.named_parameters())
-        buffers = dict(module.named_buffers())
-
-        if isinstance(init_helper, SetParaInitHelper):
-            init_helper.module = module
-
-    named_states = {}
-
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = FakeTensorMode()
-        with mode:
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
+    params, buffers, named_states = extract_states(init_helper, module, opt)
 
     flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
@@ -461,3 +434,35 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
         module.to("meta")
 
     return EDCompiledFunc(sharded_graph)
+
+def extract_states(init_helper, module: torch.nn.Module, opt: torch.optim.Optimizer) -> Tuple[Dict[str, torch.nn.Parameter], Dict[str, torch.Tensor], Dict[str, Any]]:
+    params, buffers = {}, {}
+    if module is not None:
+        params = dict(module.named_parameters())
+        buffers = dict(module.named_buffers())
+
+        if isinstance(init_helper, SetParaInitHelper):
+            init_helper.module = module
+
+    named_states = {}
+
+    if opt is not None:
+        # assign grad and warm up optimizer
+        mode = nullcontext()
+        for name in dict(module.named_parameters()):
+            with torch.no_grad():
+                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+                if isinstance(rgetattr(module, name).data, FakeTensor):
+                    mode = FakeTensorMode()
+        with mode:
+            opt.step()
+            opt.zero_grad(True)
+
+        for n, p in params.items():
+            if p in opt.state:
+                named_states[n] = opt.state[p]  # type: ignore[index]
+                # if step in state, reduce one for warmup step.
+                if 'step' in named_states[n]:
+                    named_states[n]['step'] -= 1
+
+    return params,buffers,named_states
