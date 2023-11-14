@@ -1,19 +1,28 @@
 # Modified from PiPPy
 import copy
-import operator
 import logging
+import operator
+from contextlib import nullcontext
 from enum import Enum
-from typing import Dict, Optional, Union, Callable, Any
+from functools import partial
+from typing import Any, Callable, Dict, Optional, Union, cast
 
 import torch
+import torch.utils._pytree as pytree
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx.passes.split_module import split_module
+from torch.nn.utils import stateless
 
-from easydist.torch.compiler import _compile
-from easydist.torch.experimental.pp.loss import TrivialLossWrapper
-from easydist.torch.experimental.pp.backward import _insert_stage_symbolic_backward
-from easydist.torch.init_helper import SetParaInitHelper, meta_to_real
-from easydist.torch.utils import get_input_signature
-from easydist.torch.utils import to_meta
+from easydist.torch.compiler import preprocess_traced_graph
+from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
+from easydist.torch.experimental.pp.backward import (_insert_stage_symbolic_backward,
+                                                     stage_backward)
+from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
+from easydist.torch.experimental.pp.my_proxy_tensor import my_make_fx
+from easydist.torch.init_helper import SetParaInitHelper
+from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
+from easydist.utils import rgetattr, rsetattr
 
 
 class MultiUseParameterConfig(Enum):
@@ -23,12 +32,11 @@ class MultiUseParameterConfig(Enum):
 
 MultiUseParamSpec = Union[MultiUseParameterConfig, Dict[str, MultiUseParameterConfig]]
 
-_pipeline_tracer = None
-
 
 def pipe_split():
-    if _pipeline_tracer is not None and hasattr(_pipeline_tracer, "graph"):
-        _pipeline_tracer.graph.call_function(pipe_split, (), {})
+    pipeline_tracer = get_pipeline_tracer()
+    if pipeline_tracer is not None and hasattr(pipeline_tracer, "graph"):
+        pipeline_tracer.graph.call_function(pipe_split, (), {})
 
 
 class PipeSplitWrapper(torch.nn.Module):
@@ -75,8 +83,75 @@ def annotate_split_points(mod: torch.nn.Module, spec: Dict[str, PipeSplitWrapper
         setattr(predecessor_module, atoms[-1], wrapped_mod)
 
 
+def trace_stateless(tracing_mode, init_helper, func, args, kwargs, module, opt):
+    params, buffers = {}, {}
+    if module is not None:
+        params = dict(module.named_parameters())
+        buffers = dict(module.named_buffers())
+
+        if isinstance(init_helper, SetParaInitHelper):
+            init_helper.module = module
+
+    named_states = {}
+
+    if opt is not None:
+        # assign grad and warm up optimizer
+        mode = nullcontext()
+        for name in dict(module.named_parameters()):
+            with torch.no_grad():
+                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+                if isinstance(rgetattr(module, name).data, FakeTensor):
+                    mode = FakeTensorMode()
+        with mode:
+            opt.step()
+            opt.zero_grad(True)
+
+        for n, p in params.items():
+            if p in opt.state:
+                named_states[n] = opt.state[p]  # type: ignore[index]
+                # if step in state, reduce one for warmup step.
+                if 'step' in named_states[n]:
+                    named_states[n]['step'] -= 1
+
+    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+
+    # fix for sgd withtout momentum
+    if all(state is None for state in flat_named_states):
+        named_states = {}
+        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+
+    state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
+
+    def stateless_func(func, params, buffers, named_states, args, kwargs):
+        with stateless._reparametrize_module(
+                cast(torch.nn.Module, module), {
+                    **params,
+                    **buffers
+                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
+                    opt, named_states, params) if opt else nullcontext():
+            ret = func(*args, **kwargs)
+
+        grads = {k: v.grad for k, v in params.items()}
+        return params, buffers, named_states, grads, ret
+
+    with _enable_compile():
+        # TODO @botbw: get fx_tracer out of make_fx
+        traced_graph = my_make_fx(partial(stateless_func, func),
+                                  tracing_mode=tracing_mode,
+                                  decomposition_table=EASYDIST_DECOMP_TABLE,
+                                  _allow_non_fake_inputs=False)(params, buffers, named_states,
+                                                                args, kwargs)
+
+    # pipe split will be removed if eliminate_dead_code here
+    # traced_graph.graph.eliminate_dead_code()
+    traced_graph = preprocess_traced_graph(traced_graph)
+    traced_graph.recompile()
+    return params, buffers, named_states, state_tensor_num, traced_graph
+
+
 def _from_tracing(
     mod: torch.nn.Module,
+    *args,
     multi_use_param_spec: Optional[MultiUseParamSpec] = None,
     tracer=None,
     output_loss_value_spec=None,
@@ -86,25 +161,34 @@ def _from_tracing(
     **kwargs,
 ):
     # TODO: abstract partitioning policy
-    global _pipeline_tracer
-    old__pipeline_tracer = _pipeline_tracer
-    _pipeline_tracer = tracer or torch.fx.Tracer()
+    old__pipeline_tracer = get_pipeline_tracer()
+    tracer = tracer or torch.fx.Tracer()
+    set_pipeline_tracer(tracer)
     try:
         # TODO: tracing policy
         if deep_copy_module:
             mod = copy.deepcopy(mod)  # because further pipe building activities can modify mod
-        graph = _pipeline_tracer.trace(mod, **kwargs)
+        graph_torch = tracer.trace(mod, **kwargs)
 
-        traced = torch.fx.GraphModule(mod, graph)
+        gm_torch = torch.fx.GraphModule(mod, graph_torch)
     finally:
-        _pipeline_tracer = old__pipeline_tracer
+        set_pipeline_tracer(old__pipeline_tracer)
 
     if split_policy is not None:
-        traced = split_policy(traced)
+        gm_torch = split_policy(gm_torch)
 
-    return _from_traced(
+    def forward(*args):
+        return gm_torch(*args)
+
+    params, buffers, named_states, state_tensor_num, traced_gm = trace_stateless(
+        "fake", None, forward, args, kwargs, mod, None)
+
+    # sample_input = to_meta(sample_input)
+    # ShapeProp(traced_gm).propagate(sample_input)
+
+    return params, buffers, named_states, _from_traced(
         mod,
-        traced,
+        traced_gm,
         multi_use_param_spec,
         output_loss_value_spec=output_loss_value_spec,
         return_to_0=return_to_0,
@@ -461,6 +545,7 @@ def _from_traced(
     generated_loss_spec = output_loss_value_spec
 
     if mod.training or output_loss_value_spec is not None:
+        assert False, "not support training mode"
         loss_node, output_node, generated_loss_spec = _find_loss_output(
             mod, split.graph, output_loss_value_spec)
         if loss_node is not None:
@@ -484,36 +569,46 @@ def _from_traced(
     return split
 
 
-# TODO @botbw: api design? other tracing mode?
+def run_local_split_gm(split_gm, *args):
+    executor = DetachExecutor(split_gm)
+    return executor.run(*args)
 
 
-def split_and_compile(module: torch.nn.Module, *args, **kwargs):
+class DetachExecutor(torch.fx.Interpreter):
     """
-    model => (sub1, sub2, sub3) => (compiled1, compiled2, compiled3)
+    Special interpreter to run the split_gm in testing that detaches all inputs to
+    a module invocation. This is needed so that the values at the boundary are
+    leaf modules in autograd execution.
     """
-    splited_gm: torch.fx.GraphModule = _from_tracing(mod=module, **kwargs)
-    for arg in args:
-        if isinstance(arg, torch.Tensor):
-            device = arg.device
-            break
-    for name, sub_gm in splited_gm.named_children():
-        assert isinstance(sub_gm, torch.fx.GraphModule)
 
-        def forward(mod, *args):
-            return mod.forward(*args)
+    def __init__(self, module, garbage_collect_values=True):
+        garbage_collect_values = False
+        super().__init__(module, garbage_collect_values)
+        self.value_remap = {}
 
-        signature = get_input_signature(sub_gm, *args)
+    def run(self, *args, initial_env=None):
+        self.value_remap = {}
+        return super().run(*args, initial_env=initial_env)
 
-        args = [meta_to_real(t, device) for t in args]
-        compiled_forward = _compile(forward, "fake", SetParaInitHelper(), signature,
-                                    (sub_gm, *args), {})
-        compiled_gm = torch.fx.GraphModule(sub_gm, compiled_forward.graph_mod.graph)
-        setattr(splited_gm, name, compiled_gm)
+    def call_module(self, target, args, kwargs):
 
-        # need to run with DetachExecutor if sub_gm comes from PiPPy compiler
-        args = [to_meta(t) if isinstance(t, torch.Tensor) else t for t in args]
-        args = sub_gm(*args)
-        if not isinstance(args, tuple):
-            args = (args, )
+        def detach_tensors(a):
+            if isinstance(a, torch.Tensor) and a.requires_grad:
+                if a not in self.value_remap:
+                    new_val = a.detach().requires_grad_(True)
+                    self.value_remap[a] = new_val
+                return self.value_remap[a]
+            else:
+                return a
 
-    return splited_gm
+        args = torch.fx.node.map_aggregate(args, detach_tensors)
+        kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+
+        return super().call_module(target, args, kwargs)
+
+    def call_function(self, target, args, kwargs):
+        # HACK to reroute saved input tensors to point to the detach()ed version
+        if target == stage_backward:
+            kwargs = dict(kwargs)
+            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
+        return super().call_function(target, args, kwargs)

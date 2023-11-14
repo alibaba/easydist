@@ -380,8 +380,8 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     class EDCompiledFunc:
 
-        def __init__(self, graph_mod) -> None:
-            self.graph_mod = graph_mod
+        def __init__(self, graph) -> None:
+            self.graph = graph
 
         @torch.no_grad()
         def compiled_func(self, graph, *args, **kwargs):
@@ -420,7 +420,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             return local_out
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            return self.compiled_func(self.graph_mod, *args, **kwargs)
+            return self.compiled_func(self.graph, *args, **kwargs)
 
         def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
             return self.compiled_func(graph, *args, **kwargs)

@@ -1,7 +1,6 @@
 # Modified from PiPPy
-from typing import List
 import logging
-from typing import Dict, Callable, Tuple, List
+from typing import Callable, Dict, List, Tuple
 
 import torch
 

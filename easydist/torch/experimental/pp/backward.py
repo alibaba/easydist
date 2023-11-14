@@ -1,12 +1,10 @@
-# Modified from PiPPy
-from typing import List
+'''
+Adapted from 
+'''
 import operator
-from typing import Dict, Optional, Union, Tuple, List
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from torch.fx.passes.split_module import split_module
-
-from easydist.torch.experimental.pp.debug import map_debug_info
 
 
 def stage_backward(
@@ -88,6 +86,16 @@ def stage_backward(
         )
         """
     except Exception as e:
+
+        def friendly_debug_info(v):
+            if isinstance(v, torch.Tensor):
+                return f"Tensor({v.shape}, grad={v.requires_grad})"
+            else:
+                return str(v)
+
+        def map_debug_info(a):
+            return torch.fx.node.map_aggregate(a, friendly_debug_info)
+
         exc_msg = f"""
         {repr(e)}
         Failed to run backward stage {stage_info}

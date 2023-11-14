@@ -21,7 +21,4 @@ def eliminate_detach(fx_graph: fx.GraphModule):
         if node.op == 'call_function':
             if _get_qualified_name(node.target) == 'torch.ops.aten.detach.default':
                 node.replace_all_uses_with(node.args[0])
-
-    fx_graph.graph.eliminate_dead_code()
-
     return fx_graph

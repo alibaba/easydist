@@ -28,13 +28,6 @@ def fake_to_real(e):
         return e
 
 
-def meta_to_real(e: torch.Tensor, device: torch.device):
-    if isinstance(e, torch.Tensor) and e.is_meta:
-        out = torch.zeros_like(e, device=device)
-        return out
-    return e
-
-
 @torch.no_grad()
 def materialize_zero(tensor, materialization_device):
     tensor = fake_to_real(tensor)
