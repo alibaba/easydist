@@ -1,5 +1,5 @@
 '''
-Adapted from 
+Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b262d5d697d37b/pippy/backward.py
 '''
 import operator
 from typing import Dict, List, Optional, Tuple, Union
@@ -7,12 +7,32 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 
+class BackStage(torch.nn.Module):
+
+    def __init__(self, name, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.name = f"backward_{name}"
+        self._stage_backward = stage_backward
+        self.compiled = False
+
+    def forward(
+        self,
+        stage_output,
+        output_grads,
+        input_values,
+        outputs_with_grads_idxs: List[int],
+        stage_info: str,
+    ):
+        return self._stage_backward(stage_output, output_grads, input_values,
+                                    outputs_with_grads_idxs, stage_info)
+
+
 def stage_backward(
     stage_output,
     output_grads,
     input_values,
-    stage_info: str,
     outputs_with_grads_idxs: List[int],
+    stage_info: str,
 ):
     """
     Given the input value(s) and the corresponding gradient for the output
@@ -124,12 +144,9 @@ def _null_coalesce_accumulate(lhs, rhs):
         return torch.add(lhs, rhs)
 
 
-def _insert_stage_symbolic_backward(
-    g: torch.fx.Graph,
-    loss_node: torch.fx.Node,
-    output_node: torch.fx.Node,
-    return_to_0: bool,
-):
+def _insert_stage_symbolic_backward(g: torch.fx.Graph, loss_node: torch.fx.Node,
+                                    output_node: torch.fx.Node, return_to_0: bool,
+                                    num_stages: int):
     # Collect metadata about tuple output values. TODO: move this to split_module or FX IR
     tuples: Dict[torch.fx.Node, Tuple] = {}
     for node in reversed(g.nodes):
@@ -204,19 +221,22 @@ def _insert_stage_symbolic_backward(
                 output_grads = ((output_grads, )
                                 if not isinstance(output_grads, tuple) else output_grads)
 
-                grad_call = g.call_function(
-                    stage_backward,
-                    kwargs={
-                        "stage_output": stage_output,
-                        "output_grads": output_grads,
-                        "input_values": list(node.all_input_nodes),
-                        "outputs_with_grads_idxs": outputs_with_grads_idxs,
-                    },
+                num_stages -= 1
+                back_stage = BackStage(num_stages)
+                setattr(g.owning_module, back_stage.name, back_stage)
+                grad_call = g.call_module(
+                    back_stage.name,
+                    args=(  # TODO @botbw: better way to do this? use kwargs instead
+                        tuple(stage_output),
+                        tuple(output_grads),
+                        tuple(node.all_input_nodes),
+                        tuple(outputs_with_grads_idxs),
+                    ),
                 )
                 # Insert backward stage debug info
-                kwargs_copy = dict(grad_call.kwargs)
-                kwargs_copy["stage_info"] = f"{grad_call} for stage {node.format_node()}"
-                grad_call.kwargs = kwargs_copy
+                args_copy = list(grad_call.args)
+                args_copy.append(f"{grad_call} for stage {node.format_node()}")
+                grad_call.args = tuple(args_copy)
 
                 grad_call_proxy = torch.fx.Proxy(grad_call)
                 grads, barrier_token = (

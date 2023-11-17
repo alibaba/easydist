@@ -1,4 +1,6 @@
-# Modified from PiPPy
+'''
+Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b262d5d697d37b/pippy/IR.py#L280
+'''
 import copy
 import logging
 import operator
@@ -10,16 +12,17 @@ from typing import Any, Callable, Dict, Optional, Union, cast
 import torch
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+# from easydist.torch.experimental.pp.my_proxy_tensor import my_make_fx
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.split_module import split_module
 from torch.nn.utils import stateless
 
 from easydist.torch.compiler import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
-from easydist.torch.experimental.pp.backward import (_insert_stage_symbolic_backward,
+from easydist.torch.experimental.pp.backward import (BackStage, _insert_stage_symbolic_backward,
                                                      stage_backward)
 from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
-from easydist.torch.experimental.pp.my_proxy_tensor import my_make_fx
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
@@ -83,70 +86,27 @@ def annotate_split_points(mod: torch.nn.Module, spec: Dict[str, PipeSplitWrapper
         setattr(predecessor_module, atoms[-1], wrapped_mod)
 
 
-def trace_stateless(tracing_mode, init_helper, func, args, kwargs, module, opt):
-    params, buffers = {}, {}
-    if module is not None:
-        params = dict(module.named_parameters())
-        buffers = dict(module.named_buffers())
+def trace_func(tracing_mode, func_forward, args, kwargs):
+    func_ret_value = None
 
-        if isinstance(init_helper, SetParaInitHelper):
-            init_helper.module = module
-
-    named_states = {}
-
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = FakeTensorMode()
-        with mode:
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
-
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-    # fix for sgd withtout momentum
-    if all(state is None for state in flat_named_states):
-        named_states = {}
-        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-    state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
-
-    def stateless_func(func, params, buffers, named_states, args, kwargs):
-        with stateless._reparametrize_module(
-                cast(torch.nn.Module, module), {
-                    **params,
-                    **buffers
-                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-                    opt, named_states, params) if opt else nullcontext():
-            ret = func(*args, **kwargs)
-
-        grads = {k: v.grad for k, v in params.items()}
-        return params, buffers, named_states, grads, ret
+    def wrapper(func, *args, **kwargs):
+        nonlocal func_ret_value
+        ret = func(*args, **kwargs)
+        func_ret_value = ret
+        return ret
 
     with _enable_compile():
-        # TODO @botbw: get fx_tracer out of make_fx
-        traced_graph = my_make_fx(partial(stateless_func, func),
-                                  tracing_mode=tracing_mode,
-                                  decomposition_table=EASYDIST_DECOMP_TABLE,
-                                  _allow_non_fake_inputs=False)(params, buffers, named_states,
-                                                                args, kwargs)
+        traced_graph = make_fx(partial(wrapper, func_forward),
+                               tracing_mode=tracing_mode,
+                               decomposition_table=EASYDIST_DECOMP_TABLE,
+                               _allow_non_fake_inputs=False)(*args, **kwargs)
 
     # pipe split will be removed if eliminate_dead_code here
     # traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
-    return params, buffers, named_states, state_tensor_num, traced_graph
+
+    return func_ret_value, traced_graph
 
 
 def _from_tracing(
@@ -167,7 +127,8 @@ def _from_tracing(
     try:
         # TODO: tracing policy
         if deep_copy_module:
-            mod = copy.deepcopy(mod)  # because further pipe building activities can modify mod
+            # because further pipe building activities can modify mod
+            mod = copy.deepcopy(mod)
         graph_torch_forward = tracer.trace(mod, **kwargs)
         gm_torch_forward = torch.fx.GraphModule(mod, graph_torch_forward)
     finally:
@@ -176,23 +137,16 @@ def _from_tracing(
     if split_policy is not None:
         gm_torch_forward = split_policy(gm_torch_forward)
 
-    gm_torch_complete = _from_traced(mod, gm_torch_forward, multi_use_param_spec,
-                                     output_loss_value_spec, return_to_0)
-    
-    return gm_torch_complete
-    # def forward(*args):
-    #     return gm_torch_forward(*args)
+    gm_split = _from_traced(mod, gm_torch_forward, multi_use_param_spec, output_loss_value_spec,
+                            return_to_0)
 
-    # params, buffers, named_states, state_tensor_num, traced_gm = trace_stateless(
-    #     "fake", None, forward, args, kwargs, mod, None)
+    executor = CompileInterpreter(gm_split)
+    executor.run(*args)
 
-    # return params, buffers, named_states, _from_traced(
-    #     mod,
-    #     traced_gm,
-    #     multi_use_param_spec,
-    #     output_loss_value_spec=output_loss_value_spec,
-    #     return_to_0=return_to_0,
-    # )
+    for name, (ret_val, compiled_mod) in executor.compiled.items():
+        setattr(gm_split, name, compiled_mod)
+
+    return gm_split
 
 
 def _find_loss_from_output_and_spec(output_val, spec_val):
@@ -548,12 +502,8 @@ def _from_traced(
         loss_node, output_node, generated_loss_spec = _find_loss_output(
             mod, split.graph, output_loss_value_spec)
         if loss_node is not None:
-            _insert_stage_symbolic_backward(
-                split.graph,
-                loss_node,
-                output_node,
-                return_to_0,
-            )
+            _insert_stage_symbolic_backward(split.graph, loss_node, output_node, return_to_0,
+                                            num_stages)
             split.recompile()
             has_loss_and_backward = True
             logging.info("Pipeline is in training mode, backward pass generated")
@@ -569,7 +519,7 @@ def _from_traced(
 
 
 def run_local_split_gm(split_gm, *args):
-    executor = CompileInterpreter(split_gm)
+    executor = DetachExecutor(split_gm)
     return executor.run(*args)
 
 
@@ -600,31 +550,25 @@ class DetachExecutor(torch.fx.Interpreter):
             else:
                 return a
 
-        args = torch.fx.node.map_aggregate(args, detach_tensors)
-        kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+        submod = self.fetch_attr(target)
+
+        if isinstance(submod, BackStage):
+            args = list(args)
+            args[2] = [self.value_remap.get(v, v) for v in args[2]]
+            kwargs = {}
+        else:
+            args = torch.fx.node.map_aggregate(args, detach_tensors)
+            kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
 
         return super().call_module(target, args, kwargs)
 
-    def call_function(self, target, args, kwargs):
-        # HACK to reroute saved input tensors to point to the detach()ed version
-        if target == stage_backward:
-            kwargs = dict(kwargs)
-            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
-        return super().call_function(target, args, kwargs)
-
-
 
 class CompileInterpreter(torch.fx.Interpreter):
-    """
-    Special interpreter to run the split_gm in testing that detaches all inputs to
-    a module invocation. This is needed so that the values at the boundary are
-    leaf modules in autograd execution.
-    """
 
     def __init__(self, module):
         super().__init__(module, False)
         self.value_remap = {}
-        self.compiled_func = {}
+        self.compiled = {}
         self.stage_cnt = 0
 
     def run(self, *args, initial_env=None):
@@ -641,20 +585,18 @@ class CompileInterpreter(torch.fx.Interpreter):
                 return self.value_remap[a]
             else:
                 return a
-        args = torch.fx.node.map_aggregate(args, detach_tensors)
-        kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+
         submod = self.fetch_attr(target)
 
-        self.compiled_func[target] = trace_stateless("fake", None, submod.forward, args, kwargs, submod, None)
-        self.stage_cnt += 1
+        if isinstance(submod, BackStage):
+            args = list(args)
+            args[2] = [self.value_remap.get(v, v) for v in args[2]]
+            kwargs = {}
+        else:
+            args = torch.fx.node.map_aggregate(args, detach_tensors)
+            kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
 
-        return super().call_module(target, args, kwargs)
+        ret = trace_func("real", submod.forward, args, kwargs)
+        self.compiled[target] = ret
 
-    def call_function(self, target, args, kwargs):
-        # HACK to reroute saved input tensors to point to the detach()ed version
-        if target == stage_backward:
-            kwargs = dict(kwargs)
-            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
-            self.compiled_func[f'backward_{self.stage_cnt}'] = trace_stateless("fake", None, stage_backward, args, kwargs, None, None)
-            self.stage_cnt -= 1
-        return super().call_function(target, args, kwargs)
+        return ret[0]

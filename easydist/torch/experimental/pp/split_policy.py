@@ -1,4 +1,6 @@
-# Modified from PiPPy
+'''
+Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b262d5d697d37b/pippy/IR.py#L280
+'''
 import logging
 from typing import Callable, Dict, List, Tuple
 
