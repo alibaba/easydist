@@ -97,7 +97,11 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             if node.name in runtime_prof_result:
                 # Avoid overflow
                 node.ed_info.normalized_int_runtime_ms = min(
-                    int(node.ed_info.runtime_ms / min_runtime_ms) * 2, 32768)
+                    max(int(node.ed_info.runtime_ms / min_runtime_ms / 100), 1), int(32768 / 10)
+                )
+                #node.ed_info.normalized_int_runtime_ms = min(
+                #    int(node.ed_info.runtime_ms / min_runtime_ms), 32768
+                #)
             else:
                 node.ed_info.normalized_int_runtime_ms = 1
 

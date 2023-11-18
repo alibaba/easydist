@@ -20,6 +20,8 @@ from ortools.sat.python import cp_model
 from itertools import product
 from mip import Model, xsum, BINARY
 
+import easydist.config as mdconfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,13 +155,51 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL:
-        logger.info("RCPSP: Optimal found")
         res = []
         for i in range(len(task_data)):
             res.append(solver.Value(task_starts[i]))
         return np.argsort(res)
     else:
         raise RuntimeError("RCPSP: No solution found!")
+
+
+def rcpsp_data_select(task_data, select_mask):
+
+    raw_data_selected = [task_data[i] for i in range(len(task_data)) if select_mask[i] == 1]
+    keys_selected = [raw_data[0] for raw_data in raw_data_selected]
+
+    # dependency redundancies removal
+    data_selected = [(key, duration, [dp for dp in dependencies if dp in keys_selected], resource_uses)
+                        for (key, duration, dependencies, resource_uses) in raw_data_selected]
+                
+    return data_selected
+
+
+def rcpsp_reorder(task_data, select_mask, schedule):
+
+    task_data_buffer = [task_data[i] for i in range(len(task_data)) if select_mask[i] == 1]
+    assert(len(task_data_buffer) == len(schedule))
+
+    idx = 0
+    for i, mask in enumerate(select_mask):
+        if mask == 1:
+            task_data[i] = task_data_buffer[schedule[idx]]
+            idx += 1
+    return task_data
+
+
+def rcpsp_data_transform(task_data, resource_to_id, resource_num):
+    transformed_task_data = []
+    key_to_id = {}
+    for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
+        key_to_id[task_key] = i
+        resource_in_use = [0] * resource_num
+        for r, amount in resource_uses:
+            resource_in_use[resource_to_id[r]] = amount
+        transformed_task_data.append((i, duration, 
+                                      [key_to_id[dp] for dp in dependencies], 
+                                      resource_in_use))
+    return transformed_task_data
 
 
 def rcpsp(task_data, available_resources, rec_dep_mask, method):
@@ -169,6 +209,8 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
     Args:
     task_data: [(task_key, duration, predecessor, resource_usage)]
     available_resources (dict): a mapping from resources to its available amount
+    rec_dep_mask: denoting whether recouce live along dependencies
+    method: how to perform rcpsp scheduling
 
     Returns:
     An ordering of index representing the scheduled order
@@ -183,23 +225,18 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
         resource_to_id[resource] = i
         resource_capacities.append(available_resources[resource])
 
-    transformed_task_data = []
-    key_to_id = {}
-    id_to_key = {}
-    for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
-        key_to_id[task_key] = i
-        id_to_key[i] = task_key
-        resource_in_use = [0] * resource_num
-        for r, amount in resource_uses:
-            resource_in_use[resource_to_id[r]] = amount
-        transformed_task_data.append(
-            (i, duration, [key_to_id[dp] for dp in dependencies], resource_in_use))
 
     if method == 'general':
 
-        schedule = rcpsp_general(transformed_task_data, resource_capacities, rec_dep_mask)
+        transformed_task_data = rcpsp_data_transform(task_data, resource_to_id, resource_num)
+
+        schedule = rcpsp_general(transformed_task_data, resource_capacities, 
+                                 rec_dep_mask)
 
     elif method == 'genetic':
+
+        transformed_task_data = rcpsp_data_transform(task_data, resource_to_id, resource_num)
+
         num_tasks = len(task_data)
         processing_time = [0] * len(num_tasks)
         resource_consumption = [[]] * len(num_tasks)
@@ -212,6 +249,48 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
         schedule = rcpsp_genetic(num_tasks, processing_time, resource_consumption,
                                  resource_capacities, precedence_relations)
 
+    elif method == 'odd_even':
+        _task_data = [task for task in task_data]
+        num_tasks = len(_task_data)
+        schedule = [i for i in range(num_tasks)]
+        
+        rg = 250
+        odd_oven_points = [i * rg for i in range(int(num_tasks / rg))]
+        odd_oven_points.append(num_tasks - 1)
+
+        for _ in range(mdconfig.rcpsp_iter_round):
+            # odd round
+            for p in range(len(odd_oven_points) - 1):
+
+                select_mask = [0] * num_tasks
+                for i in range(odd_oven_points[p], min(odd_oven_points[p + 1], num_tasks)):
+                    select_mask[i] = 1
+
+                data_selected = rcpsp_data_select(_task_data, select_mask)
+                transformed_task_data = rcpsp_data_transform(data_selected, resource_to_id, resource_num)
+
+                _schedule = rcpsp_general(transformed_task_data, resource_capacities, rec_dep_mask)
+                
+                _task_data = rcpsp_reorder(_task_data, select_mask, _schedule)
+                schedule = rcpsp_reorder(schedule, select_mask, _schedule)
+
+            # even round
+            for p in range(1, len(odd_oven_points) - 1):
+
+                select_mask = [0] * num_tasks
+                for i in range(max(0, odd_oven_points[p] - int(rg / 2)), 
+                            min(odd_oven_points[p + 1] + int(rg / 2), num_tasks)):
+                    select_mask[i] = 1
+
+                data_selected = rcpsp_data_select(_task_data, select_mask)
+                transformed_task_data = rcpsp_data_transform(data_selected, resource_to_id, resource_num)
+
+                _schedule = rcpsp_general(transformed_task_data, resource_capacities, rec_dep_mask)
+                
+                _task_data = rcpsp_reorder(_task_data, select_mask, _schedule)
+                schedule = rcpsp_reorder(schedule, select_mask, _schedule)
+
+    logger.info("RCPSP: Optimal found")
     return schedule
 
 
