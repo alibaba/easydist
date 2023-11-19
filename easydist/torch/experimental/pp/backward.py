@@ -3,15 +3,15 @@ Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b26
 '''
 import operator
 from typing import Dict, List, Optional, Tuple, Union
-
+from torch._subclasses.fake_tensor import FakeTensor
 import torch
 
 
 class BackStage(torch.nn.Module):
-
+    name = "backward_"
     def __init__(self, name, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.name = f"backward_{name}"
+        self.name = self.name + str(name)
         self._stage_backward = stage_backward
         self.compiled = False
 
@@ -89,7 +89,9 @@ def stage_backward(
 
         grad_inputs = []
         for val in input_values:
-            if isinstance(val, torch.Tensor):
+            if isinstance(val, FakeTensor): # TODO @botbw: better way to do this
+                grad_inputs.append(val.clone())
+            elif isinstance(val, torch.Tensor):
                 grad_inputs.append(val.grad)
             else:
                 grad_inputs.append(None)

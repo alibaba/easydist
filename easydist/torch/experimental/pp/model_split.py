@@ -7,9 +7,11 @@ import operator
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Any, Callable, Dict, Optional, Union, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import torch
+from torch import Tensor
+from torch.nn.parameter import Parameter
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 # from easydist.torch.experimental.pp.my_proxy_tensor import my_make_fx
@@ -85,28 +87,143 @@ def annotate_split_points(mod: torch.nn.Module, spec: Dict[str, PipeSplitWrapper
         wrapped_mod = PipeSplitWrapper(mod_to_wrap, split_type)
         setattr(predecessor_module, atoms[-1], wrapped_mod)
 
+class EDCompiledModule(torch.nn.Module):
+    stateless_func: Callable
+    def __init__(self, stateless_func: Callable, params=None, buffers=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stateless_func = stateless_func
+        self.name_mapping = {}
+        if params is not None:
+            self.update_params(params)
+        if buffers is not None:
+            self.update_buffers(buffers)
 
-def trace_func(tracing_mode, func_forward, args, kwargs):
-    func_ret_value = None
+    def update_params(self, params):
+        self.ed_params = params
+        for pname, param in params.items():
+            mapped_name = pname.replace('.', '_')
+            self.name_mapping[mapped_name] = pname
+            self.register_parameter(mapped_name, param)
 
-    def wrapper(func, *args, **kwargs):
-        nonlocal func_ret_value
-        ret = func(*args, **kwargs)
-        func_ret_value = ret
-        return ret
+    def update_buffers(self, buffers):
+        self.ed_buffers = buffers
+        for bname, buffer in buffers.items():
+            mapped_name = bname.replace('.', '_')
+            self.name_mapping[mapped_name] = bname
+            self.register_buffer(mapped_name, buffer)
+
+    def named_parameters(self, prefix: str = '', recurse: bool = True, remove_duplicate: bool = True) -> Iterator[Tuple[str, Parameter]]:
+        iter_unmapped = super().named_parameters(prefix, recurse, remove_duplicate)
+        return map(lambda pair: (self.name_mapping[pair[0]], pair[1]), iter_unmapped)
+
+    def named_buffers(self, prefix: str = '', recurse: bool = True) -> Iterator[Tuple[str, Tensor]]:
+        iter_unmapped = super().named_buffers(prefix, recurse)
+        return map(lambda pair: (self.name_mapping[pair[0]], pair[1]), iter_unmapped)
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        raise NotImplementedError("state_dict not implemented")
+
+class EDCompiledBackward:
+    def __init__(self, forward_mod, stateless_backward):
+        self.forward_mod = forward_mod
+        self.stateless_backward = stateless_backward
+
+    def __call__(
+        self,
+        stage_output,
+        output_grads,
+        input_values,
+        outputs_with_grads_idxs: List[int],
+        stage_info: str,
+    ):
+        params = dict(self.forward_mod.named_parameters())
+        grad_inputs, barrier_token, grads, params = self.stateless_backward(params, stage_output, output_grads, input_values, outputs_with_grads_idxs, stage_info)
+        
+        for pname in params:
+            params[pname].grad = grads[pname]
+
+        self.forward_mod.update_params(params)
+
+        return grad_inputs, barrier_token
+
+
+
+def trace_backward(tracing_mode, forward_mod, backward_mod, args, kwargs):
+    executor_ret = None
+
+    def stateless_backward(params, stage_output, output_grads, input_values, outputs_with_grads_idxs, stage_info):
+        nonlocal executor_ret
+        grad_inputs, barrier_token = backward_mod(stage_output, output_grads, input_values, outputs_with_grads_idxs, stage_info)
+        executor_ret = (grad_inputs, barrier_token)
+        grads = {k: v.grad for k, v in params.items()}
+        return grad_inputs, barrier_token, grads, params
+
+    params = dict(forward_mod.named_parameters())
+    with _enable_compile():
+        gm = make_fx(stateless_backward,
+                        tracing_mode=tracing_mode,
+                        decomposition_table=EASYDIST_DECOMP_TABLE,
+                        _allow_non_fake_inputs=False)(params, *args, **kwargs)
+
+    gm.graph.eliminate_dead_code()
+    gm = preprocess_traced_graph(gm)
+    gm.recompile()
+
+    return executor_ret, EDCompiledBackward(forward_mod, gm.forward)
+
+
+class EDCompiledForward(EDCompiledModule):
+
+    def __init__(self, stateless_forward, params, buffers) -> None:
+        super().__init__(stateless_forward, params, buffers)
+
+    def forward(self, *args, **kwargs):
+        params = self.ed_params
+        buffers = self.ed_buffers
+
+        output, params, buffers, grads = self.stateless_func(
+            params, buffers, args, kwargs)
+
+        for pname in params:
+            params[pname].grad = grads[pname]
+
+        self.update_params(params)
+        self.update_buffers(buffers)
+
+        return output
+
+def trace_forward(tracing_mode, module, args, kwargs):
+    executor_ret = None
+
+    def stateless_forward(params, buffers, args, kwargs):
+        nonlocal executor_ret
+        with stateless._reparametrize_module(
+                cast(torch.nn.Module, module), {
+                    **params,
+                    **buffers
+                }, tie_weights=True) if module else nullcontext():
+            executor_ret = output = module(*args, **kwargs)
+
+        params = dict(module.named_parameters())
+        grads = {k: v.grad for k, v in params.items()}
+        buffers = dict(module.named_buffers())
+
+        return output, params, buffers, grads
+
+    params = dict(module.named_parameters())
+    buffers = dict(module.named_buffers())
 
     with _enable_compile():
-        traced_graph = make_fx(partial(wrapper, func_forward),
+        gm = make_fx(stateless_forward,
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
-                               _allow_non_fake_inputs=False)(*args, **kwargs)
+                               _allow_non_fake_inputs=False)(params, buffers, args, kwargs)
 
-    # pipe split will be removed if eliminate_dead_code here
-    # traced_graph.graph.eliminate_dead_code()
-    traced_graph = preprocess_traced_graph(traced_graph)
-    traced_graph.recompile()
+    gm.graph.eliminate_dead_code()
+    gm = preprocess_traced_graph(gm)
+    gm.recompile()
 
-    return func_ret_value, traced_graph
+    return executor_ret, EDCompiledForward(gm.forward, params, buffers)
 
 
 def _from_tracing(
@@ -144,7 +261,12 @@ def _from_tracing(
     executor.run(*args)
 
     for name, (ret_val, compiled_mod) in executor.compiled.items():
+        delattr(gm_split, name)
         setattr(gm_split, name, compiled_mod)
+
+    # TODO @botbw debug
+    for name, param in gm_split.named_parameters():
+        setattr(gm_split, name, None)
 
     return gm_split
 
@@ -550,9 +672,7 @@ class DetachExecutor(torch.fx.Interpreter):
             else:
                 return a
 
-        submod = self.fetch_attr(target)
-
-        if isinstance(submod, BackStage):
+        if BackStage.name in target:
             args = list(args)
             args[2] = [self.value_remap.get(v, v) for v in args[2]]
             kwargs = {}
@@ -592,11 +712,15 @@ class CompileInterpreter(torch.fx.Interpreter):
             args = list(args)
             args[2] = [self.value_remap.get(v, v) for v in args[2]]
             kwargs = {}
+            # TODO: @botbw
+            forward_mod = self.compiled[f"submod_{target[-1]}"][1]
+            ret = trace_backward("fake", forward_mod, submod, args, kwargs)
+
         else:
             args = torch.fx.node.map_aggregate(args, detach_tensors)
-            kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+            kwargs = dict(torch.fx.node.map_aggregate(kwargs, detach_tensors))
+            ret = trace_forward("fake", submod, args, kwargs)
 
-        ret = trace_func("real", submod.forward, args, kwargs)
         self.compiled[target] = ret
 
         return ret[0]
