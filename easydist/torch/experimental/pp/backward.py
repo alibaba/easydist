@@ -9,9 +9,10 @@ import torch
 
 class BackStage(torch.nn.Module):
     name = "backward_"
-    def __init__(self, name, *args, **kwargs) -> None:
+    def __init__(self, forward_name, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.name = self.name + str(name)
+        self.forward_name = forward_name
+        self.name = self.name + str(forward_name)
         self._stage_backward = stage_backward
         self.compiled = False
 
@@ -89,9 +90,7 @@ def stage_backward(
 
         grad_inputs = []
         for val in input_values:
-            if isinstance(val, FakeTensor): # TODO @botbw: better way to do this
-                grad_inputs.append(val.clone())
-            elif isinstance(val, torch.Tensor):
+            if isinstance(val, torch.Tensor):
                 grad_inputs.append(val.grad)
             else:
                 grad_inputs.append(None)
@@ -223,8 +222,7 @@ def _insert_stage_symbolic_backward(g: torch.fx.Graph, loss_node: torch.fx.Node,
                 output_grads = ((output_grads, )
                                 if not isinstance(output_grads, tuple) else output_grads)
 
-                num_stages -= 1
-                back_stage = BackStage(num_stages)
+                back_stage = BackStage(node.target)
                 setattr(g.owning_module, back_stage.name, back_stage)
                 grad_call = g.call_module(
                     back_stage.name,
