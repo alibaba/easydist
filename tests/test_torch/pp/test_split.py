@@ -6,8 +6,7 @@ import torch
 from torchvision.models import alexnet, resnet18, vgg19
 
 from easydist.torch.experimental.pp.loss_wrapper import LossWrapper
-from easydist.torch.experimental.pp.model_split import (split,
-                                                        run_local_split_gm, compile_splited)
+from easydist.torch.experimental.pp.model_split import (compile_splited, run_local_split_gm, split)
 from easydist.torch.experimental.pp.split_policy import split_into_equal_size
 
 
@@ -28,8 +27,10 @@ def reproduce(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def loss_fn(x):
     return x.mean()
+
 
 class OutputLossWrapper(LossWrapper):
 
@@ -75,14 +76,13 @@ def test_split(model_class):
     assert torch.allclose(out_split, out_torch, atol=1e-5)
     assert torch.allclose(loss_split, loss_torch, atol=1e-5)
     assert len(buffer_split) == len(buffer_torch) and all(
-        torch.allclose(b1, b2, atol=1e-5)
-        for b1, b2 in zip(buffer_split, buffer_torch))
+        torch.allclose(b1, b2, atol=1e-5) for b1, b2 in zip(buffer_split, buffer_torch))
     # assert len(grad_split) == len(grad_torch) and all(
     #     torch.allclose(g1, g2, atol=1e-5)
-        # for g1, g2 in zip(grad_split, grad_torch))
+    # for g1, g2 in zip(grad_split, grad_torch))
     assert len(param_split) == len(param_torch) and all(
-            torch.allclose(p1, p2, atol=1e-5)
-            for p1, p2 in zip(param_split, param_torch))
+        torch.allclose(p1, p2, atol=1e-5) for p1, p2 in zip(param_split, param_torch))
+
 
 if __name__ == "__main__":
     test_split(resnet18)

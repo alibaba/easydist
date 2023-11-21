@@ -3,12 +3,13 @@ Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b26
 '''
 import operator
 from typing import Dict, List, Optional, Tuple, Union
-from torch._subclasses.fake_tensor import FakeTensor
+
 import torch
 
 
 class BackStage(torch.nn.Module):
     name = "backward_"
+
     def __init__(self, forward_name, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.forward_name = forward_name
