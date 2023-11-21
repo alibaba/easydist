@@ -493,12 +493,8 @@ class EDCompiledForward(torch.nn.Module):
         params = dict(self.named_parameters_orig())
         buffers = dict(self.named_buffers_orig())
 
-        output, params, buffers, grads = self.stateless_forward(params, buffers, args, kwargs)
+        output, buffers = self.stateless_forward(params, buffers, args, kwargs)
 
-        for pname in params:
-            params[pname].grad = grads[pname]
-
-        self.update_params(params)
         self.update_buffers(buffers)
 
         return output
@@ -518,12 +514,12 @@ class EDCompiledBackward:
         outputs_with_grads_idxs: List[int],
         stage_info: str,
     ):
-        params = dict(self.ed_forward.named_parameters())
-        buffers = dict(self.ed_forward.named_buffers())
+        params = dict(self.ed_forward.named_parameters_orig())
+        buffers = dict(self.ed_forward.named_buffers_orig())
 
-        grad_inputs, barrier_token, grads, params, buffers = self.stateless_backward(
-            params, buffers, stage_output, output_grads, input_values, outputs_with_grads_idxs,
-            stage_info)
+        grad_inputs, barrier_token, grads, params = self.stateless_backward(
+            params, stage_output, output_grads, input_values,
+                           outputs_with_grads_idxs, stage_info)
 
         for pname in params:
             params[pname].grad = grads[pname]
@@ -534,41 +530,32 @@ class EDCompiledBackward:
         return grad_inputs, barrier_token
 
 
-def trace_backward(tracing_mode, ed_forward, backward_mod, args, kwargs):
+def trace_backward(tracing_mode, ed_forward, params, backward_mod, args, kwargs):
     executor_ret = None
 
-    def stateless_backward(params, buffers, stage_output, output_grads, input_values,
+    def stateless_backward(params, stage_output, output_grads, input_values,
                            outputs_with_grads_idxs, stage_info):
         nonlocal executor_ret
-        with stateless._reparametrize_module(cast(torch.nn.Module, ed_forward), {
-                **params,
-                **buffers
-        },
-                                             tie_weights=True):
-            grad_inputs, barrier_token = backward_mod(stage_output, output_grads, input_values,
-                                                      outputs_with_grads_idxs, stage_info)
-        executor_ret = (grad_inputs, barrier_token)
+        grad_inputs, barrier_token = backward_mod(stage_output, output_grads, input_values,
+                                                    outputs_with_grads_idxs, stage_info)
+        executor_ret = ((grad_inputs, barrier_token),)
         grads = {k: v.grad for k, v in params.items()}
-        return grad_inputs, barrier_token, grads, params, buffers
-
-    params = dict(ed_forward.named_parameters())
-    buffers = dict(ed_forward.named_buffers())
+        return grad_inputs, barrier_token, grads, params
 
     with _enable_compile():
         gm = make_fx(stateless_backward,
                      tracing_mode=tracing_mode,
                      decomposition_table=EASYDIST_DECOMP_TABLE,
-                     _allow_non_fake_inputs=False)(params, buffers, *args, **kwargs)
+                     _allow_non_fake_inputs=False)(params, *args, **kwargs)
 
     gm.graph.eliminate_dead_code()
     gm = preprocess_traced_graph(gm)
     gm.recompile()
 
-    return executor_ret, EDCompiledBackward(ed_forward, gm.forward)
+    return executor_ret, EDCompiledBackward(ed_forward, gm.forward) # TODO @botbw: pass ed_forwad
 
 
 def trace_forward(tracing_mode, module, args, kwargs):
-
     executor_ret = None
 
     def stateless_forward(params, buffers, args, kwargs):
@@ -576,13 +563,13 @@ def trace_forward(tracing_mode, module, args, kwargs):
         with stateless._reparametrize_module(cast(torch.nn.Module, module), {
                 **params,
                 **buffers
-        },
-                                             tie_weights=True):
-            executor_ret = output = module(*args, **kwargs)
+            },
+            tie_weights=True):
+            output = module(*args, **kwargs)
 
-        grads = {k: v.grad for k, v in params.items()}
+        executor_ret = (output, params, buffers, args)
 
-        return output, params, buffers, grads
+        return output, buffers
 
     params = dict(module.named_parameters())
     buffers = dict(module.named_buffers())
@@ -631,16 +618,20 @@ class CompileInterpreter(torch.fx.Interpreter):
             args[2] = [self.value_remap.get(v, v) for v in args[2]]
             kwargs = {}
             # TODO: @botbw
-            compiled_forward = self.compiled[submod.forward_name][1]
-            ret = trace_backward(self.tracing_mode, compiled_forward, submod, args, kwargs)
+            ed_forward = self.compiled[submod.forward_name][1]
+            params = self.compiled[submod.forward_name][0][1]
+            ret = trace_backward('real', ed_forward, params, submod, args, kwargs)
         else:
-            args = torch.fx.node.map_aggregate(args, detach_tensors)
-            kwargs = dict(torch.fx.node.map_aggregate(kwargs, detach_tensors))
-            ret = trace_forward(self.tracing_mode, submod, args, kwargs)
-
+            detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
+            detached_kwargs = dict(torch.fx.node.map_aggregate(kwargs, detach_tensors))
+            ret = trace_forward(self.tracing_mode, submod, detached_args, detached_kwargs)
+            faked_args = ret[0][-1]
+            for arg, faked_arg in zip(args, faked_args):
+                self.value_remap[arg] = faked_arg
+            
         self.compiled[target] = ret
 
-        return ret[0]
+        return ret[0][0]
 
 
 class DetachExecutor(torch.fx.Interpreter):
@@ -729,10 +720,6 @@ def compile_splited(gm_split, *args, tracing_mode="fake"):
             map_name(name): copy.deepcopy(buffer)
             for name, buffer in gm_split.named_buffers()
         }
-
-    for name in dict(gm_split.named_parameters()):
-        with torch.no_grad():
-            rsetattr(gm_split, name + ".grad", torch.zeros_like(rgetattr(gm_split, name).data))
 
     executor = CompileInterpreter(gm_split, tracing_mode)
     executor.run(*args)

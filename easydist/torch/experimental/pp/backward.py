@@ -91,7 +91,7 @@ def stage_backward(
 
         grad_inputs = []
         for val in input_values:
-            if isinstance(val, torch.Tensor):
+            if isinstance(val, torch.Tensor): # TODO botbw: val.grad is None
                 grad_inputs.append(val.grad)
             else:
                 grad_inputs.append(None)
