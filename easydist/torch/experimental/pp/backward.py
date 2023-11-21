@@ -14,8 +14,6 @@ class BackStage(torch.nn.Module):
         super().__init__(*args, **kwargs)
         self.forward_name = forward_name
         self.name = self.name + str(forward_name)
-        self._stage_backward = stage_backward
-        self.compiled = False
 
     def forward(
         self,
@@ -25,7 +23,7 @@ class BackStage(torch.nn.Module):
         outputs_with_grads_idxs: List[int],
         stage_info: str,
     ):
-        return self._stage_backward(stage_output, output_grads, input_values,
+        return stage_backward(stage_output, output_grads, input_values,
                                     outputs_with_grads_idxs, stage_info)
 
 
@@ -91,7 +89,7 @@ def stage_backward(
 
         grad_inputs = []
         for val in input_values:
-            if isinstance(val, torch.Tensor):  # TODO botbw: val.grad is None
+            if isinstance(val, torch.Tensor):
                 grad_inputs.append(val.grad)
             else:
                 grad_inputs.append(None)

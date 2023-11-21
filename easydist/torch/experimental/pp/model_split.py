@@ -607,68 +607,65 @@ class CompileInterpreter(torch.fx.Interpreter):
         self.value_remap = {}
         self.maybe_faked_states = {}
         self.compiled = {}
-        self.stage_cnt = 0
 
     def run(self, *args, initial_env=None):
         self.value_remap = {}
+        self.maybe_faked_states = {}
+        self.compiled = {}
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
-        try:
-
-            def detach_tensors(a):
-                if isinstance(a, torch.Tensor) and a.requires_grad:
-                    if a not in self.value_remap:
-                        new_val = a.detach().requires_grad_(True)
-                        self.value_remap[a] = new_val
-                    return self.value_remap[a]
-                else:
-                    return a
-
-            def update_detached(maybe_faked_args, maybe_faked_kwargs, args, kwargs):
-                assert len(args) == len(ret['maybe_faked_args'])
-                assert len(kwargs) == len(detached_kwargs)
-                for maybe_faked_arg, arg in zip(maybe_faked_args, args):
-                    self.value_remap[arg] = maybe_faked_arg
-
-                for maybe_faked_key, key in zip(maybe_faked_kwargs, kwargs):
-                    assert maybe_faked_key == key
-                    self.value_remap[kwargs[key]] = maybe_faked_kwargs[maybe_faked_key]
-
-            submod = self.fetch_attr(target)
-
-            if isinstance(submod, BackStage):  # TODO @botbw: simplify this
-                assert len(args) == 0
-                # tree node fetch kwargs as immutable_dict
-                kwargs = dict(kwargs)
-                kwargs["input_values"] = [
-                    self.value_remap.get(v, v) for v in kwargs["input_values"]
-                ]
-                ed_forward = self.compiled[submod.forward_name]
-                maybe_faked_params = self.maybe_faked_states[
-                    submod.forward_name]["maybe_faked_params"]
-                maybe_faked_buffers = self.maybe_faked_states[
-                    submod.forward_name]["maybe_faked_buffers"]
-                # TODO @botbw: what if using 'fake' here
-                # if maybe_faked_params is faked, no need to fake again
-                ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
-                                                  maybe_faked_buffers, submod, kwargs)
+        def detach_tensors(a):
+            if isinstance(a, torch.Tensor) and a.requires_grad:
+                if a not in self.value_remap:
+                    new_val = a.detach().requires_grad_(True)
+                    self.value_remap[a] = new_val
+                return self.value_remap[a]
             else:
-                assert 'submod' in target
-                detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
-                detached_kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
-                ret, ed_compiled = trace_forward(self.tracing_mode, submod, detached_args,
-                                                 detached_kwargs)
-                update_detached(ret['maybe_faked_args'], ret['maybe_faked_kwargs'], args, kwargs)
-                self.maybe_faked_states[target] = {
-                    "maybe_faked_params": ret['maybe_faked_params'],
-                    "maybe_faked_buffers": ret["maybe_faked_buffers"]
-                }
+                return a
 
-            self.compiled[target] = ed_compiled
-        except Exception as e:
-            logging.error(f"Error compiling module {target}")
-            raise e
+        def update_detached(maybe_faked_args, maybe_faked_kwargs, args, kwargs):
+            assert len(args) == len(ret['maybe_faked_args'])
+            assert len(kwargs) == len(detached_kwargs)
+            for maybe_faked_arg, arg in zip(maybe_faked_args, args):
+                self.value_remap[arg] = maybe_faked_arg
+
+            for maybe_faked_key, key in zip(maybe_faked_kwargs, kwargs):
+                assert maybe_faked_key == key
+                self.value_remap[kwargs[key]] = maybe_faked_kwargs[maybe_faked_key]
+
+        submod = self.fetch_attr(target)
+
+        if isinstance(submod, BackStage):  # TODO @botbw: simplify this
+            assert len(args) == 0
+            # tree node fetch kwargs as immutable_dict
+            kwargs = dict(kwargs)
+            kwargs["input_values"] = [
+                self.value_remap.get(v, v) for v in kwargs["input_values"]
+            ]
+            ed_forward = self.compiled[submod.forward_name]
+            maybe_faked_params = self.maybe_faked_states[
+                submod.forward_name]["maybe_faked_params"]
+            maybe_faked_buffers = self.maybe_faked_states[
+                submod.forward_name]["maybe_faked_buffers"]
+            # TODO @botbw: what if using 'fake' here
+            # if maybe_faked_params is faked, no need to fake again
+            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
+                                                maybe_faked_buffers, submod, kwargs)
+        else:
+            assert 'submod' in target
+            detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
+            detached_kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+            ret, ed_compiled = trace_forward(self.tracing_mode, submod, detached_args,
+                                                detached_kwargs)
+            update_detached(ret['maybe_faked_args'], ret['maybe_faked_kwargs'], args, kwargs)
+            self.maybe_faked_states[target] = {
+                "maybe_faked_params": ret['maybe_faked_params'],
+                "maybe_faked_buffers": ret["maybe_faked_buffers"]
+            }
+
+        self.compiled[target] = ed_compiled
+
         return ret['tracing_output']
 
 
@@ -683,7 +680,7 @@ def split(
     **kwargs,
 ):
     # TODO: abstract partitioning policy
-    old__pipeline_tracer = get_pipeline_tracer()
+    old_pipeline_tracer = get_pipeline_tracer()
     tracer = tracer or torch.fx.Tracer()
     set_pipeline_tracer(tracer)
     try:
@@ -694,7 +691,7 @@ def split(
         graph_torch_forward = tracer.trace(mod, **kwargs)
         gm_torch_forward = torch.fx.GraphModule(mod, graph_torch_forward)
     finally:
-        set_pipeline_tracer(old__pipeline_tracer)
+        set_pipeline_tracer(old_pipeline_tracer)
 
     if split_policy is not None:
         gm_torch_forward = split_policy(gm_torch_forward)
@@ -709,25 +706,26 @@ def compile_splited(gm_split: fx.GraphModule, *args, tracing_mode: str = "fake")
     assert tracing_mode in ["real", "fake", "symbolic"]
 
     # need to restore model states after tracing in real mode
-    params_copy = {}
-    buffers_copy = {}
-    for name, submod in gm_split.named_children():
-        if isinstance(submod, BackStage): break
-        params_copy[name] = {
-            name: copy.deepcopy(param)
-            for name, param in submod.named_parameters()
-        }
-        buffers_copy[name] = {
-            name: copy.deepcopy(buffer)
-            for name, buffer in submod.named_buffers()
-        }
+    if tracing_mode == "real":
+        params_copy = {}
+        buffers_copy = {}
+        for name, submod in gm_split.named_children():
+            if isinstance(submod, BackStage): break
+            params_copy[name] = {
+                name: copy.deepcopy(param)
+                for name, param in submod.named_parameters()
+            }
+            buffers_copy[name] = {
+                name: copy.deepcopy(buffer)
+                for name, buffer in submod.named_buffers()
+            }
 
     # run through gm_split and compile each stage
     executor = CompileInterpreter(gm_split, tracing_mode)
     executor.run(*args)
 
     for name, compiled_mod in executor.compiled.items():
-        if isinstance(compiled_mod, EDCompiledForward):
+        if tracing_mode == "real" and isinstance(compiled_mod, EDCompiledForward):
             assert len(params_copy[name]) == len(list(compiled_mod.parameters()))
             compiled_mod.update_params(params_copy[name])
             compiled_mod.update_buffers(buffers_copy[name])
@@ -753,7 +751,6 @@ class DetachExecutor(torch.fx.Interpreter):
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
-
         def detach_tensors(a):
             if isinstance(a, torch.Tensor) and a.requires_grad:
                 if a not in self.value_remap:
