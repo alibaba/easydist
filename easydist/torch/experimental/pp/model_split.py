@@ -5,29 +5,23 @@ import copy
 import logging
 import operator
 from enum import Enum
-from typing import (Any, Callable, Dict, Iterator,
-                    List, Optional, Tuple, Union, cast)
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast)
 
 import torch
-from torch import Tensor
 import torch.fx as fx
 import torch.nn as nn
+from torch import Tensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.split_module import split_module
 from torch.nn.parameter import Parameter
 from torch.nn.utils import stateless
-import torch.utils._pytree as pytree
-
 
 from easydist.torch.compiler import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp import (
-    get_pipeline_tracer, set_pipeline_tracer)
-from easydist.torch.experimental.pp.backward import (
-    BackStage, _insert_stage_symbolic_backward)
+from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
+from easydist.torch.experimental.pp.backward import (BackStage, _insert_stage_symbolic_backward)
 from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
 from easydist.torch.utils import _enable_compile
-from easydist.utils import rgetattr, rsetattr
 
 
 class MultiUseParameterConfig(Enum):
@@ -35,8 +29,7 @@ class MultiUseParameterConfig(Enum):
     REPLICATE = 2
 
 
-MultiUseParamSpec = Union[MultiUseParameterConfig,
-                          Dict[str, MultiUseParameterConfig]]
+MultiUseParamSpec = Union[MultiUseParameterConfig, Dict[str, MultiUseParameterConfig]]
 
 
 def pipe_split():
@@ -94,8 +87,7 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
         return None
     if spec_val is True:
         if not isinstance(output_val, torch.fx.Node):
-            raise RuntimeError(
-                f"Loss spec must specify a dynamic value but got {output_val}")
+            raise RuntimeError(f"Loss spec must specify a dynamic value but got {output_val}")
         return output_val
 
     if isinstance(spec_val, (tuple, list)):
@@ -110,8 +102,7 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
             loss_val = _find_loss_from_output_and_spec(out, spec)
             if loss_val is not None:
                 return loss_val
-        raise RuntimeError(
-            f"Did not find loss value in specification {spec_val}")
+        raise RuntimeError(f"Did not find loss value in specification {spec_val}")
 
     if isinstance(spec_val, dict):
         if not isinstance(output_val, dict):
@@ -121,15 +112,12 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
             raise RuntimeError(f"Output value {output_val} must match keys of loss specification "
                                f"{spec_val}")
         for k in spec_val:
-            loss_val = _find_loss_from_output_and_spec(
-                output_val[k], spec_val[k])
+            loss_val = _find_loss_from_output_and_spec(output_val[k], spec_val[k])
             if loss_val is not None:
                 return loss_val
-        raise RuntimeError(
-            f"Did not find loss value in specification {spec_val}")
+        raise RuntimeError(f"Did not find loss value in specification {spec_val}")
 
-    raise RuntimeError(
-        f"Unsupported type {type(spec_val)} in loss specification")
+    raise RuntimeError(f"Unsupported type {type(spec_val)} in loss specification")
 
 
 def _number_and_count_forward_stages(gm: torch.fx.GraphModule):
@@ -169,8 +157,7 @@ def _find_loss_output(mod: torch.nn.Module, g: torch.fx.Graph, output_loss_value
             loss_node = None
             generated_spec = None
     else:
-        loss_node = _find_loss_from_output_and_spec(
-            output_val, output_loss_value_spec)
+        loss_node = _find_loss_from_output_and_spec(output_val, output_loss_value_spec)
         generated_spec = output_loss_value_spec
 
     return loss_node, output_node, generated_spec
@@ -314,8 +301,7 @@ def _from_traced(
             param_val = getattr(mod_itr, atoms[-1])
             is_buffer = atoms[-1] in mod_itr._buffers
 
-            move_param_to_callee(split, user.target,
-                                 param_val, use_idx, is_buffer)
+            move_param_to_callee(split, user.target, param_val, use_idx, is_buffer)
 
             to_delete.append((mod_itr, atoms))
 
@@ -330,8 +316,7 @@ def _from_traced(
     # TODO: generalize this to sequential
     multi_use_param_spec = multi_use_param_spec or {}
 
-    multi_use_params_qualnames: Dict[str,
-                                     Optional[MultiUseParameterConfig]] = {}
+    multi_use_params_qualnames: Dict[str, Optional[MultiUseParameterConfig]] = {}
     for node in split.graph.nodes:
         if node.op == "get_attr" and len(node.users) > 1:
             multi_use_params_qualnames.setdefault(node.target)
@@ -343,8 +328,7 @@ def _from_traced(
             multi_use_params_qualnames[param] = multi_use_param_spec.get(
                 param, MultiUseParameterConfig.TRANSMIT)
         else:
-            raise ValueError(
-                "multi_use_param_spec must be MultiUseParamSpec enum or dict")
+            raise ValueError("multi_use_param_spec must be MultiUseParamSpec enum or dict")
 
     # TODO: do we maintain the invariant that `Node.users` is topologically ordered? I don't think so
     node_to_first_user: Dict[torch.fx.Node, torch.fx.Node] = {}
@@ -360,8 +344,7 @@ def _from_traced(
                 first_user = node_to_first_user[node]
                 assert first_user.op == "call_module"
 
-                use_idx = delete_user_reference(
-                    node, first_user, delete_node=False)
+                use_idx = delete_user_reference(node, first_user, delete_node=False)
 
                 atoms = node.target.split(".")
                 mod_itr = split
@@ -378,15 +361,13 @@ def _from_traced(
                 # Add extra output to the callee and switch references to the parameter
                 # access in the pipeline graph to use this.
                 submod = split.get_submodule(first_user.target)
-                callee_output_nodes = [
-                    n for n in submod.graph.nodes if n.op == "output"]
+                callee_output_nodes = [n for n in submod.graph.nodes if n.op == "output"]
                 assert len(callee_output_nodes) == 1
                 callee_output_node = callee_output_nodes[0]
 
                 # TODO: zero outputs?
                 if isinstance(callee_output_node.args[0], tuple):
-                    new_output_args = callee_output_node.args[0] + (
-                        callee_param_def, )
+                    new_output_args = callee_output_node.args[0] + (callee_param_def, )
                     callee_output_node.args = (new_output_args, )
                     new_output_idx = len(new_output_args) - 1
                     promoted_to_tuple = False
@@ -410,8 +391,7 @@ def _from_traced(
                         first_user.replace_all_uses_with(orig_output_getitem)
                         # HACK because the above replace_all_uses with ALSO replaced the instance
                         # of first_user within the getitem node we just added
-                        orig_output_getitem.args = (
-                            first_user, ) + orig_output_getitem.args[1:]
+                        orig_output_getitem.args = (first_user, ) + orig_output_getitem.args[1:]
 
                     transmitted_value_getitem = split.graph.call_function(
                         operator.getitem, (first_user, new_output_idx))
@@ -419,8 +399,7 @@ def _from_traced(
                     split.graph.erase_node(node)
             elif reuse_type == MultiUseParameterConfig.REPLICATE:
                 for user in copy.copy(node.users):
-                    use_idx = delete_user_reference(
-                        node, user, delete_node=False)
+                    use_idx = delete_user_reference(node, user, delete_node=False)
                     atoms = node.target.split(".")
                     mod_itr = split
                     for atom in atoms[:-1]:
@@ -428,8 +407,7 @@ def _from_traced(
                     param_val = getattr(mod_itr, atoms[-1])
                     is_buffer = atoms[-1] in mod_itr._buffers
 
-                    move_param_to_callee(
-                        split, user.target, param_val, use_idx, is_buffer)
+                    move_param_to_callee(split, user.target, param_val, use_idx, is_buffer)
 
                 atoms = node.target.split(".")
                 mod_itr = split
@@ -461,16 +439,14 @@ def _from_traced(
                                             num_stages)
             split.recompile()
             has_loss_and_backward = True
-            logging.info(
-                "Pipeline is in training mode, backward pass generated")
+            logging.info("Pipeline is in training mode, backward pass generated")
         else:
             logging.warning(
                 "Did not find any loss value from model output, your pipeline will be in inference mode. "
                 "If you want your pipeline to be in training mode, please specify a loss value via "
                 "`output_loss_value_spec`.")
     else:
-        logging.info(
-            "Pipeline is in evaluation mode, backward pass not generated")
+        logging.info("Pipeline is in evaluation mode, backward pass not generated")
 
     return split
 
@@ -524,8 +500,7 @@ class EDCompiledForward(torch.nn.Module):
         params = dict(self.named_parameters_orig())
         buffers = dict(self.named_buffers_orig())
 
-        output, buffers = self.stateless_forward[0](
-            params, buffers, args, kwargs)
+        output, buffers = self.stateless_forward[0](params, buffers, args, kwargs)
 
         self.update_buffers(buffers)
 
@@ -541,15 +516,11 @@ class EDCompiledBackward(nn.Module):
         self.ed_forward = [ed_forward]
         self.stateless_backward = [stateless_backward]
 
-    def __call__(
-        self,
-        **kwargs
-    ):
+    def __call__(self, **kwargs):
         params = dict(self.ed_forward[0].named_parameters_orig())
         buffers = dict(self.ed_forward[0].named_buffers_orig())
 
-        grad_inputs, barrier_token, grads = self.stateless_backward[0](
-            params, buffers, kwargs)
+        grad_inputs, barrier_token, grads = self.stateless_backward[0](params, buffers, kwargs)
 
         for pname in params:
             params[pname].grad = grads[pname]
@@ -559,7 +530,10 @@ class EDCompiledBackward(nn.Module):
         return grad_inputs, barrier_token
 
 
-def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward, maybe_faked_params: Dict[str, nn.Parameter], maybe_faked_buffers: Dict[str, torch.Tensor], backward_mod: BackStage, kwargs: Dict):
+def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward,
+                   maybe_faked_params: Dict[str, nn.Parameter],
+                   maybe_faked_buffers: Dict[str,
+                                             torch.Tensor], backward_mod: BackStage, kwargs: Dict):
     ret_for_interpreter = None
 
     def stateless_backward(params, buffers, kwargs):
@@ -594,8 +568,8 @@ def trace_forward(tracing_mode: str, module: nn.Module, args: Tuple, kwargs: Dic
         with stateless._reparametrize_module(cast(torch.nn.Module, module), {
                 **params,
                 **buffers
-            },
-                tie_weights=True):
+        },
+                                             tie_weights=True):
             output = module(*args, **kwargs)
 
         # need to get the faked tensors for backward
@@ -641,6 +615,7 @@ class CompileInterpreter(torch.fx.Interpreter):
 
     def call_module(self, target, args, kwargs):
         try:
+
             def detach_tensors(a):
                 if isinstance(a, torch.Tensor) and a.requires_grad:
                     if a not in self.value_remap:
@@ -658,8 +633,7 @@ class CompileInterpreter(torch.fx.Interpreter):
 
                 for maybe_faked_key, key in zip(maybe_faked_kwargs, kwargs):
                     assert maybe_faked_key == key
-                    self.value_remap[kwargs[key]
-                                     ] = maybe_faked_kwargs[maybe_faked_key]
+                    self.value_remap[kwargs[key]] = maybe_faked_kwargs[maybe_faked_key]
 
             submod = self.fetch_attr(target)
 
@@ -671,22 +645,21 @@ class CompileInterpreter(torch.fx.Interpreter):
                     self.value_remap.get(v, v) for v in kwargs["input_values"]
                 ]
                 ed_forward = self.compiled[submod.forward_name]
-                maybe_faked_params = self.maybe_faked_states[submod.forward_name]["maybe_faked_params"]
-                maybe_faked_buffers = self.maybe_faked_states[submod.forward_name]["maybe_faked_buffers"]
+                maybe_faked_params = self.maybe_faked_states[
+                    submod.forward_name]["maybe_faked_params"]
+                maybe_faked_buffers = self.maybe_faked_states[
+                    submod.forward_name]["maybe_faked_buffers"]
                 # TODO @botbw: what if using 'fake' here
                 # if maybe_faked_params is faked, no need to fake again
-                ret, ed_compiled = trace_backward(
-                    'real', ed_forward, maybe_faked_params, maybe_faked_buffers, submod, kwargs)
+                ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
+                                                  maybe_faked_buffers, submod, kwargs)
             else:
                 assert 'submod' in target
-                detached_args = torch.fx.node.map_aggregate(
-                    args, detach_tensors)
-                detached_kwargs = torch.fx.node.map_aggregate(
-                    kwargs, detach_tensors)
-                ret, ed_compiled = trace_forward(
-                    self.tracing_mode, submod, detached_args, detached_kwargs)
-                update_detached(ret['maybe_faked_args'],
-                                ret['maybe_faked_kwargs'], args, kwargs)
+                detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
+                detached_kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
+                ret, ed_compiled = trace_forward(self.tracing_mode, submod, detached_args,
+                                                 detached_kwargs)
+                update_detached(ret['maybe_faked_args'], ret['maybe_faked_kwargs'], args, kwargs)
                 self.maybe_faked_states[target] = {
                     "maybe_faked_params": ret['maybe_faked_params'],
                     "maybe_faked_buffers": ret["maybe_faked_buffers"]
@@ -705,8 +678,7 @@ def split(
     tracer=None,
     output_loss_value_spec=None,
     deep_copy_module=False,
-    split_policy: Optional[Callable[[
-        torch.fx.GraphModule], torch.fx.GraphModule]] = None,
+    split_policy: Optional[Callable[[torch.fx.GraphModule], torch.fx.GraphModule]] = None,
     return_to_0: bool = True,
     **kwargs,
 ):
@@ -794,9 +766,7 @@ class DetachExecutor(torch.fx.Interpreter):
         if BackStage.name in target:
             assert len(args) == 0
             kwargs = dict(kwargs)  # tree node fetch kwargs as immutable_dict
-            kwargs["input_values"] = [
-                self.value_remap.get(v, v) for v in kwargs["input_values"]
-            ]
+            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
         else:
             args = torch.fx.node.map_aggregate(args, detach_tensors)
             kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)

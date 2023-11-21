@@ -45,11 +45,24 @@ class OutputLossWrapper(LossWrapper):
         return {"output": output, "loss": loss}
 
 
-def test_split(model_class):
+class Foo(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.norm = torch.nn.BatchNorm1d(1024)
+        self.linear = torch.nn.Linear(1024, 10)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.linear(x)
+        return x.relu()
+
+
+def test_split(model_class, input_size=(16, 3, 224, 224)):
     model = model_class().cuda().train()
     model_copy = copy.deepcopy(model)
 
-    rand_input = torch.rand(16, 3, 224, 224).cuda()
+    rand_input = torch.rand(input_size).cuda()
 
     reproduce(42)
     out_torch = model(rand_input)
@@ -78,14 +91,15 @@ def test_split(model_class):
     assert len(buffer_split) == len(buffer_torch) and all(
         torch.allclose(b1, b2, atol=1e-5) for b1, b2 in zip(buffer_split, buffer_torch))
     assert len(grad_split) == len(grad_torch) and all(
-        torch.allclose(g1, g2, atol=1e-5)
-    for g1, g2 in zip(grad_split, grad_torch))
+        torch.allclose(g1, g2, atol=1e-5) for g1, g2 in zip(grad_split, grad_torch))
     assert len(param_split) == len(param_torch) and all(
         torch.allclose(p1, p2, atol=1e-5) for p1, p2 in zip(param_split, param_torch))
 
 
 if __name__ == "__main__":
-    test_split(resnet18)
-    test_split(vgg19)
-    test_split(alexnet)
+    imagenet_input_size = (16, 3, 224, 224)
+    test_split(Foo, (16, 1024))
+    test_split(resnet18, imagenet_input_size)
+    test_split(vgg19, imagenet_input_size)
+    test_split(alexnet, imagenet_input_size)
     print("passed")
