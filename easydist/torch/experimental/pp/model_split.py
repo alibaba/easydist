@@ -5,19 +5,26 @@ import copy
 import logging
 import operator
 from enum import Enum
-from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast)
+from typing import (Any, Callable, Dict, Iterator,
+                    List, Optional, Tuple, Union, cast)
 
 import torch
 from torch import Tensor
+import torch.fx as fx
+import torch.nn as nn
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.split_module import split_module
 from torch.nn.parameter import Parameter
 from torch.nn.utils import stateless
+import torch.utils._pytree as pytree
+
 
 from easydist.torch.compiler import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
-from easydist.torch.experimental.pp.backward import (BackStage, _insert_stage_symbolic_backward)
+from easydist.torch.experimental.pp import (
+    get_pipeline_tracer, set_pipeline_tracer)
+from easydist.torch.experimental.pp.backward import (
+    BackStage, _insert_stage_symbolic_backward)
 from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
 from easydist.torch.utils import _enable_compile
 from easydist.utils import rgetattr, rsetattr
@@ -28,7 +35,8 @@ class MultiUseParameterConfig(Enum):
     REPLICATE = 2
 
 
-MultiUseParamSpec = Union[MultiUseParameterConfig, Dict[str, MultiUseParameterConfig]]
+MultiUseParamSpec = Union[MultiUseParameterConfig,
+                          Dict[str, MultiUseParameterConfig]]
 
 
 def pipe_split():
@@ -86,7 +94,8 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
         return None
     if spec_val is True:
         if not isinstance(output_val, torch.fx.Node):
-            raise RuntimeError(f"Loss spec must specify a dynamic value but got {output_val}")
+            raise RuntimeError(
+                f"Loss spec must specify a dynamic value but got {output_val}")
         return output_val
 
     if isinstance(spec_val, (tuple, list)):
@@ -101,7 +110,8 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
             loss_val = _find_loss_from_output_and_spec(out, spec)
             if loss_val is not None:
                 return loss_val
-        raise RuntimeError(f"Did not find loss value in specification {spec_val}")
+        raise RuntimeError(
+            f"Did not find loss value in specification {spec_val}")
 
     if isinstance(spec_val, dict):
         if not isinstance(output_val, dict):
@@ -111,12 +121,15 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
             raise RuntimeError(f"Output value {output_val} must match keys of loss specification "
                                f"{spec_val}")
         for k in spec_val:
-            loss_val = _find_loss_from_output_and_spec(output_val[k], spec_val[k])
+            loss_val = _find_loss_from_output_and_spec(
+                output_val[k], spec_val[k])
             if loss_val is not None:
                 return loss_val
-        raise RuntimeError(f"Did not find loss value in specification {spec_val}")
+        raise RuntimeError(
+            f"Did not find loss value in specification {spec_val}")
 
-    raise RuntimeError(f"Unsupported type {type(spec_val)} in loss specification")
+    raise RuntimeError(
+        f"Unsupported type {type(spec_val)} in loss specification")
 
 
 def _number_and_count_forward_stages(gm: torch.fx.GraphModule):
@@ -156,7 +169,8 @@ def _find_loss_output(mod: torch.nn.Module, g: torch.fx.Graph, output_loss_value
             loss_node = None
             generated_spec = None
     else:
-        loss_node = _find_loss_from_output_and_spec(output_val, output_loss_value_spec)
+        loss_node = _find_loss_from_output_and_spec(
+            output_val, output_loss_value_spec)
         generated_spec = output_loss_value_spec
 
     return loss_node, output_node, generated_spec
@@ -300,7 +314,8 @@ def _from_traced(
             param_val = getattr(mod_itr, atoms[-1])
             is_buffer = atoms[-1] in mod_itr._buffers
 
-            move_param_to_callee(split, user.target, param_val, use_idx, is_buffer)
+            move_param_to_callee(split, user.target,
+                                 param_val, use_idx, is_buffer)
 
             to_delete.append((mod_itr, atoms))
 
@@ -315,7 +330,8 @@ def _from_traced(
     # TODO: generalize this to sequential
     multi_use_param_spec = multi_use_param_spec or {}
 
-    multi_use_params_qualnames: Dict[str, Optional[MultiUseParameterConfig]] = {}
+    multi_use_params_qualnames: Dict[str,
+                                     Optional[MultiUseParameterConfig]] = {}
     for node in split.graph.nodes:
         if node.op == "get_attr" and len(node.users) > 1:
             multi_use_params_qualnames.setdefault(node.target)
@@ -327,7 +343,8 @@ def _from_traced(
             multi_use_params_qualnames[param] = multi_use_param_spec.get(
                 param, MultiUseParameterConfig.TRANSMIT)
         else:
-            raise ValueError("multi_use_param_spec must be MultiUseParamSpec enum or dict")
+            raise ValueError(
+                "multi_use_param_spec must be MultiUseParamSpec enum or dict")
 
     # TODO: do we maintain the invariant that `Node.users` is topologically ordered? I don't think so
     node_to_first_user: Dict[torch.fx.Node, torch.fx.Node] = {}
@@ -343,7 +360,8 @@ def _from_traced(
                 first_user = node_to_first_user[node]
                 assert first_user.op == "call_module"
 
-                use_idx = delete_user_reference(node, first_user, delete_node=False)
+                use_idx = delete_user_reference(
+                    node, first_user, delete_node=False)
 
                 atoms = node.target.split(".")
                 mod_itr = split
@@ -360,13 +378,15 @@ def _from_traced(
                 # Add extra output to the callee and switch references to the parameter
                 # access in the pipeline graph to use this.
                 submod = split.get_submodule(first_user.target)
-                callee_output_nodes = [n for n in submod.graph.nodes if n.op == "output"]
+                callee_output_nodes = [
+                    n for n in submod.graph.nodes if n.op == "output"]
                 assert len(callee_output_nodes) == 1
                 callee_output_node = callee_output_nodes[0]
 
                 # TODO: zero outputs?
                 if isinstance(callee_output_node.args[0], tuple):
-                    new_output_args = callee_output_node.args[0] + (callee_param_def, )
+                    new_output_args = callee_output_node.args[0] + (
+                        callee_param_def, )
                     callee_output_node.args = (new_output_args, )
                     new_output_idx = len(new_output_args) - 1
                     promoted_to_tuple = False
@@ -390,7 +410,8 @@ def _from_traced(
                         first_user.replace_all_uses_with(orig_output_getitem)
                         # HACK because the above replace_all_uses with ALSO replaced the instance
                         # of first_user within the getitem node we just added
-                        orig_output_getitem.args = (first_user, ) + orig_output_getitem.args[1:]
+                        orig_output_getitem.args = (
+                            first_user, ) + orig_output_getitem.args[1:]
 
                     transmitted_value_getitem = split.graph.call_function(
                         operator.getitem, (first_user, new_output_idx))
@@ -398,7 +419,8 @@ def _from_traced(
                     split.graph.erase_node(node)
             elif reuse_type == MultiUseParameterConfig.REPLICATE:
                 for user in copy.copy(node.users):
-                    use_idx = delete_user_reference(node, user, delete_node=False)
+                    use_idx = delete_user_reference(
+                        node, user, delete_node=False)
                     atoms = node.target.split(".")
                     mod_itr = split
                     for atom in atoms[:-1]:
@@ -406,7 +428,8 @@ def _from_traced(
                     param_val = getattr(mod_itr, atoms[-1])
                     is_buffer = atoms[-1] in mod_itr._buffers
 
-                    move_param_to_callee(split, user.target, param_val, use_idx, is_buffer)
+                    move_param_to_callee(
+                        split, user.target, param_val, use_idx, is_buffer)
 
                 atoms = node.target.split(".")
                 mod_itr = split
@@ -438,14 +461,16 @@ def _from_traced(
                                             num_stages)
             split.recompile()
             has_loss_and_backward = True
-            logging.info("Pipeline is in training mode, backward pass generated")
+            logging.info(
+                "Pipeline is in training mode, backward pass generated")
         else:
             logging.warning(
                 "Did not find any loss value from model output, your pipeline will be in inference mode. "
                 "If you want your pipeline to be in training mode, please specify a loss value via "
                 "`output_loss_value_spec`.")
     else:
-        logging.info("Pipeline is in evaluation mode, backward pass not generated")
+        logging.info(
+            "Pipeline is in evaluation mode, backward pass not generated")
 
     return split
 
@@ -459,21 +484,27 @@ class EDCompiledForward(torch.nn.Module):
 
     def __init__(self, stateless_forward, params, buffers) -> None:
         super().__init__()
-        self.stateless_forward = stateless_forward
-        self.name_mapping = {}
+        self.stateless_forward = [stateless_forward]
+        self.orig_map = {}
         self.update_params(params)
         self.update_buffers(buffers)
 
+    def map_name(self, name):
+        return name.replace('.', '_')
+
+    def map_states(self, iter: Iterator[Tuple[str, Tensor]]) -> Iterator[Tuple[str, Tensor]]:
+        return map(lambda pair: (self.map_name(pair[0]), pair[1]), iter)
+
     def update_params(self, params):
         for pname, param in params.items():
-            mapped_name = pname.replace('.', '_')
-            self.name_mapping[mapped_name] = pname
+            mapped_name = self.map_name(pname)
+            self.orig_map[mapped_name] = pname
             self.register_parameter(mapped_name, param)
 
     def update_buffers(self, buffers):
         for bname, buffer in buffers.items():
-            mapped_name = bname.replace('.', '_')
-            self.name_mapping[mapped_name] = bname
+            mapped_name = self.map_name(bname)
+            self.orig_map[mapped_name] = bname
             self.register_buffer(mapped_name, buffer)
 
     def named_parameters_orig(self,
@@ -481,93 +512,100 @@ class EDCompiledForward(torch.nn.Module):
                               recurse: bool = True,
                               remove_duplicate: bool = True) -> Iterator[Tuple[str, Parameter]]:
         iter_unmapped = super().named_parameters(prefix, recurse, remove_duplicate)
-        return map(lambda pair: (self.name_mapping[pair[0]], pair[1]), iter_unmapped)
+        return map(lambda pair: (self.orig_map[pair[0]], pair[1]), iter_unmapped)
 
     def named_buffers_orig(self,
                            prefix: str = '',
                            recurse: bool = True) -> Iterator[Tuple[str, Tensor]]:
         iter_unmapped = super().named_buffers(prefix, recurse)
-        return map(lambda pair: (self.name_mapping[pair[0]], pair[1]), iter_unmapped)
+        return map(lambda pair: (self.orig_map[pair[0]], pair[1]), iter_unmapped)
 
     def __call__(self, *args, **kwargs):
         params = dict(self.named_parameters_orig())
         buffers = dict(self.named_buffers_orig())
 
-        output, buffers = self.stateless_forward(params, buffers, args, kwargs)
+        output, buffers = self.stateless_forward[0](
+            params, buffers, args, kwargs)
 
         self.update_buffers(buffers)
 
         return output
 
 
-class EDCompiledBackward:
+class EDCompiledBackward(nn.Module):
+    ed_forward: List[EDCompiledForward]
 
-    def __init__(self, ed_forward: EDCompiledForward, stateless_backward):
-        self.ed_forward = ed_forward
-        self.stateless_backward = stateless_backward
+    def __init__(self, ed_forward: EDCompiledForward, stateless_backward: nn.Module):
+        super().__init__()
+        # hide children modules
+        self.ed_forward = [ed_forward]
+        self.stateless_backward = [stateless_backward]
 
     def __call__(
         self,
-        stage_output,
-        output_grads,
-        input_values,
-        outputs_with_grads_idxs: List[int],
-        stage_info: str,
+        **kwargs
     ):
-        params = dict(self.ed_forward.named_parameters_orig())
-        buffers = dict(self.ed_forward.named_buffers_orig())
+        params = dict(self.ed_forward[0].named_parameters_orig())
+        buffers = dict(self.ed_forward[0].named_buffers_orig())
 
-        grad_inputs, barrier_token, grads, params = self.stateless_backward(
-            params, stage_output, output_grads, input_values,
-                           outputs_with_grads_idxs, stage_info)
+        grad_inputs, barrier_token, grads = self.stateless_backward[0](
+            params, buffers, kwargs)
 
         for pname in params:
             params[pname].grad = grads[pname]
 
-        self.ed_forward.update_params(params)
-        self.ed_forward.update_buffers(buffers)
+        self.ed_forward[0].update_params(params)
 
         return grad_inputs, barrier_token
 
 
-def trace_backward(tracing_mode, ed_forward, params, backward_mod, args, kwargs):
-    executor_ret = None
+def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward, maybe_faked_params: Dict[str, nn.Parameter], maybe_faked_buffers: Dict[str, torch.Tensor], backward_mod: BackStage, kwargs: Dict):
+    ret_for_interpreter = None
 
-    def stateless_backward(params, stage_output, output_grads, input_values,
-                           outputs_with_grads_idxs, stage_info):
-        nonlocal executor_ret
-        grad_inputs, barrier_token = backward_mod(stage_output, output_grads, input_values,
-                                                    outputs_with_grads_idxs, stage_info)
-        executor_ret = ((grad_inputs, barrier_token),)
+    def stateless_backward(params, buffers, kwargs):
+        nonlocal ret_for_interpreter
+        grad_inputs, barrier_token = backward_mod(**kwargs)
+        ret_for_interpreter = {
+            "tracing_output": (grad_inputs, barrier_token),
+        }
         grads = {k: v.grad for k, v in params.items()}
-        return grad_inputs, barrier_token, grads, params
+        return grad_inputs, barrier_token, grads
 
     with _enable_compile():
+        # args only
         gm = make_fx(stateless_backward,
                      tracing_mode=tracing_mode,
                      decomposition_table=EASYDIST_DECOMP_TABLE,
-                     _allow_non_fake_inputs=False)(params, *args, **kwargs)
+                     _allow_non_fake_inputs=False)(maybe_faked_params, maybe_faked_buffers, kwargs)
 
     gm.graph.eliminate_dead_code()
     gm = preprocess_traced_graph(gm)
     gm.recompile()
 
-    return executor_ret, EDCompiledBackward(ed_forward, gm.forward) # TODO @botbw: pass ed_forwad
+    return ret_for_interpreter, EDCompiledBackward(ed_forward, gm)
 
 
-def trace_forward(tracing_mode, module, args, kwargs):
-    executor_ret = None
+def trace_forward(tracing_mode: str, module: nn.Module, args: Tuple, kwargs: Dict):
+    # TODO @botbw: better way to do this
+    ret_for_interpreter: Dict[str, Any] = {}
 
     def stateless_forward(params, buffers, args, kwargs):
-        nonlocal executor_ret
+        nonlocal ret_for_interpreter
         with stateless._reparametrize_module(cast(torch.nn.Module, module), {
                 **params,
                 **buffers
             },
-            tie_weights=True):
+                tie_weights=True):
             output = module(*args, **kwargs)
 
-        executor_ret = (output, params, buffers, args)
+        # need to get the faked tensors for backward
+        ret_for_interpreter = {
+            "tracing_output": output,
+            "maybe_faked_params": params,
+            "maybe_faked_buffers": buffers,
+            "maybe_faked_args": args,
+            "maybe_faked_kwargs": kwargs
+        }
 
         return output, buffers
 
@@ -584,15 +622,16 @@ def trace_forward(tracing_mode, module, args, kwargs):
     gm = preprocess_traced_graph(gm)
     gm.recompile()
 
-    return executor_ret, EDCompiledForward(gm.forward, params, buffers)
+    return ret_for_interpreter, EDCompiledForward(gm, params, buffers)
 
 
 class CompileInterpreter(torch.fx.Interpreter):
 
-    def __init__(self, module, tracing_mode):
-        super().__init__(module, False)
+    def __init__(self, module, tracing_mode, garbage_collect_values: bool = True):
+        super().__init__(module, garbage_collect_values)
         self.tracing_mode = tracing_mode
         self.value_remap = {}
+        self.maybe_faked_states = {}
         self.compiled = {}
         self.stage_cnt = 0
 
@@ -601,37 +640,128 @@ class CompileInterpreter(torch.fx.Interpreter):
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
+        try:
+            def detach_tensors(a):
+                if isinstance(a, torch.Tensor) and a.requires_grad:
+                    if a not in self.value_remap:
+                        new_val = a.detach().requires_grad_(True)
+                        self.value_remap[a] = new_val
+                    return self.value_remap[a]
+                else:
+                    return a
 
-        def detach_tensors(a):
-            if isinstance(a, torch.Tensor) and a.requires_grad:
-                if a not in self.value_remap:
-                    new_val = a.detach().requires_grad_(True)
-                    self.value_remap[a] = new_val
-                return self.value_remap[a]
+            def update_detached(maybe_faked_args, maybe_faked_kwargs, args, kwargs):
+                assert len(args) == len(ret['maybe_faked_args'])
+                assert len(kwargs) == len(detached_kwargs)
+                for maybe_faked_arg, arg in zip(maybe_faked_args, args):
+                    self.value_remap[arg] = maybe_faked_arg
+
+                for maybe_faked_key, key in zip(maybe_faked_kwargs, kwargs):
+                    assert maybe_faked_key == key
+                    self.value_remap[kwargs[key]
+                                     ] = maybe_faked_kwargs[maybe_faked_key]
+
+            submod = self.fetch_attr(target)
+
+            if isinstance(submod, BackStage):  # TODO @botbw: simplify this
+                assert len(args) == 0
+                # tree node fetch kwargs as immutable_dict
+                kwargs = dict(kwargs)
+                kwargs["input_values"] = [
+                    self.value_remap.get(v, v) for v in kwargs["input_values"]
+                ]
+                ed_forward = self.compiled[submod.forward_name]
+                maybe_faked_params = self.maybe_faked_states[submod.forward_name]["maybe_faked_params"]
+                maybe_faked_buffers = self.maybe_faked_states[submod.forward_name]["maybe_faked_buffers"]
+                # TODO @botbw: what if using 'fake' here
+                # if maybe_faked_params is faked, no need to fake again
+                ret, ed_compiled = trace_backward(
+                    'real', ed_forward, maybe_faked_params, maybe_faked_buffers, submod, kwargs)
             else:
-                return a
+                assert 'submod' in target
+                detached_args = torch.fx.node.map_aggregate(
+                    args, detach_tensors)
+                detached_kwargs = torch.fx.node.map_aggregate(
+                    kwargs, detach_tensors)
+                ret, ed_compiled = trace_forward(
+                    self.tracing_mode, submod, detached_args, detached_kwargs)
+                update_detached(ret['maybe_faked_args'],
+                                ret['maybe_faked_kwargs'], args, kwargs)
+                self.maybe_faked_states[target] = {
+                    "maybe_faked_params": ret['maybe_faked_params'],
+                    "maybe_faked_buffers": ret["maybe_faked_buffers"]
+                }
 
-        submod = self.fetch_attr(target)
+            self.compiled[target] = ed_compiled
+        except Exception as e:
+            logging.error(f"Error compiling module {target}")
+            raise e
+        return ret['tracing_output']
 
-        if isinstance(submod, BackStage):  # TODO @botbw: simplify this
-            args = list(args)
-            args[2] = [self.value_remap.get(v, v) for v in args[2]]
-            kwargs = {}
-            # TODO: @botbw
-            ed_forward = self.compiled[submod.forward_name][1]
-            params = self.compiled[submod.forward_name][0][1]
-            ret = trace_backward('real', ed_forward, params, submod, args, kwargs)
-        else:
-            detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
-            detached_kwargs = dict(torch.fx.node.map_aggregate(kwargs, detach_tensors))
-            ret = trace_forward(self.tracing_mode, submod, detached_args, detached_kwargs)
-            faked_args = ret[0][-1]
-            for arg, faked_arg in zip(args, faked_args):
-                self.value_remap[arg] = faked_arg
-            
-        self.compiled[target] = ret
 
-        return ret[0][0]
+def split(
+    mod: torch.nn.Module,
+    multi_use_param_spec: Optional[MultiUseParamSpec] = None,
+    tracer=None,
+    output_loss_value_spec=None,
+    deep_copy_module=False,
+    split_policy: Optional[Callable[[
+        torch.fx.GraphModule], torch.fx.GraphModule]] = None,
+    return_to_0: bool = True,
+    **kwargs,
+):
+    # TODO: abstract partitioning policy
+    old__pipeline_tracer = get_pipeline_tracer()
+    tracer = tracer or torch.fx.Tracer()
+    set_pipeline_tracer(tracer)
+    try:
+        # TODO: tracing policy
+        if deep_copy_module:
+            # because further pipe building activities can modify mod
+            mod = copy.deepcopy(mod)
+        graph_torch_forward = tracer.trace(mod, **kwargs)
+        gm_torch_forward = torch.fx.GraphModule(mod, graph_torch_forward)
+    finally:
+        set_pipeline_tracer(old__pipeline_tracer)
+
+    if split_policy is not None:
+        gm_torch_forward = split_policy(gm_torch_forward)
+
+    gm_split = _from_traced(mod, gm_torch_forward, multi_use_param_spec, output_loss_value_spec,
+                            return_to_0)
+
+    return gm_split
+
+
+def compile_splited(gm_split: fx.GraphModule, *args, tracing_mode: str = "fake"):
+    assert tracing_mode in ["real", "fake", "symbolic"]
+
+    # need to restore model states after tracing in real mode
+    params_copy = {}
+    buffers_copy = {}
+    for name, submod in gm_split.named_children():
+        if isinstance(submod, BackStage): break
+        params_copy[name] = {
+            name: copy.deepcopy(param)
+            for name, param in submod.named_parameters()
+        }
+        buffers_copy[name] = {
+            name: copy.deepcopy(buffer)
+            for name, buffer in submod.named_buffers()
+        }
+
+    # run through gm_split and compile each stage
+    executor = CompileInterpreter(gm_split, tracing_mode)
+    executor.run(*args)
+
+    for name, compiled_mod in executor.compiled.items():
+        if isinstance(compiled_mod, EDCompiledForward):
+            assert len(params_copy[name]) == len(list(compiled_mod.parameters()))
+            compiled_mod.update_params(params_copy[name])
+            compiled_mod.update_buffers(buffers_copy[name])
+        setattr(gm_split, name, compiled_mod)
+
+    return gm_split
 
 
 class DetachExecutor(torch.fx.Interpreter):
@@ -662,73 +792,13 @@ class DetachExecutor(torch.fx.Interpreter):
                 return a
 
         if BackStage.name in target:
-            args = list(args)
-            args[2] = [self.value_remap.get(v, v) for v in args[2]]
-            kwargs = {}
+            assert len(args) == 0
+            kwargs = dict(kwargs)  # tree node fetch kwargs as immutable_dict
+            kwargs["input_values"] = [
+                self.value_remap.get(v, v) for v in kwargs["input_values"]
+            ]
         else:
             args = torch.fx.node.map_aggregate(args, detach_tensors)
             kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
 
         return super().call_module(target, args, kwargs)
-
-
-def split(
-    mod: torch.nn.Module,
-    multi_use_param_spec: Optional[MultiUseParamSpec] = None,
-    tracer=None,
-    output_loss_value_spec=None,
-    deep_copy_module=False,
-    split_policy: Optional[Callable[[torch.fx.GraphModule], torch.fx.GraphModule]] = None,
-    return_to_0: bool = True,
-    **kwargs,
-):
-    # TODO: abstract partitioning policy
-    old__pipeline_tracer = get_pipeline_tracer()
-    tracer = tracer or torch.fx.Tracer()
-    set_pipeline_tracer(tracer)
-    try:
-        # TODO: tracing policy
-        if deep_copy_module:
-            # because further pipe building activities can modify mod
-            mod = copy.deepcopy(mod)
-        graph_torch_forward = tracer.trace(mod, **kwargs)
-        gm_torch_forward = torch.fx.GraphModule(mod, graph_torch_forward)
-    finally:
-        set_pipeline_tracer(old__pipeline_tracer)
-
-    if split_policy is not None:
-        gm_torch_forward = split_policy(gm_torch_forward)
-
-    gm_split = _from_traced(mod, gm_torch_forward, multi_use_param_spec, output_loss_value_spec,
-                            return_to_0)
-
-    return gm_split
-
-
-def compile_splited(gm_split, *args, tracing_mode="fake"):
-    assert tracing_mode in ["real", "fake", "symbolic"]
-
-    def map_name(x):
-        return x[x.find('.') + 1:]
-
-    if tracing_mode == "real":
-        params_copy = {
-            map_name(name): copy.deepcopy(param)
-            for name, param in gm_split.named_parameters()
-        }
-        buffers_copy = {
-            map_name(name): copy.deepcopy(buffer)
-            for name, buffer in gm_split.named_buffers()
-        }
-
-    executor = CompileInterpreter(gm_split, tracing_mode)
-    executor.run(*args)
-
-    for name, (ret_val, compiled_mod) in executor.compiled.items():
-        delattr(gm_split, name)
-        if tracing_mode == "real" and isinstance(compiled_mod, EDCompiledForward):
-            compiled_mod.update_params(params_copy)
-            compiled_mod.update_buffers(buffers_copy)
-        setattr(gm_split, name, compiled_mod)
-
-    return gm_split

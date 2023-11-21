@@ -208,6 +208,7 @@ def _insert_stage_symbolic_backward(g: torch.fx.Graph, loss_node: torch.fx.Node,
             torch.fx.node.map_arg(node.args, add_to_live_nodes)
             torch.fx.node.map_arg(node.kwargs, add_to_live_nodes)
             if node.op == "call_module":
+                assert 'submod' in node.target # it has to be a stage
                 output_grads: Union[Tuple[Optional[torch.fx.Node], ...], Optional[torch.fx.Node]]
                 if node in tuples:
                     stage_output = tuples[node]
@@ -227,17 +228,19 @@ def _insert_stage_symbolic_backward(g: torch.fx.Graph, loss_node: torch.fx.Node,
                 setattr(g.owning_module, back_stage.name, back_stage)
                 grad_call = g.call_module(
                     back_stage.name,
-                    args=(  # TODO @botbw: better way to do this? use kwargs instead
-                        tuple(stage_output),
-                        tuple(output_grads),
-                        tuple(node.all_input_nodes),
-                        tuple(outputs_with_grads_idxs),
-                    ),
+                    kwargs={
+                        "stage_output": stage_output,
+                        "output_grads": output_grads,
+                        "input_values": list(node.all_input_nodes),
+                        "outputs_with_grads_idxs": outputs_with_grads_idxs,
+                    },
                 )
                 # Insert backward stage debug info
-                args_copy = list(grad_call.args)
-                args_copy.append(f"{grad_call} for stage {node.format_node()}")
-                grad_call.args = tuple(args_copy)
+                kwargs_copy = dict(grad_call.kwargs)
+                kwargs_copy[
+                    "stage_info"
+                ] = f"{grad_call} for stage {node.format_node()}"
+                grad_call.kwargs = kwargs_copy
 
                 grad_call_proxy = torch.fx.Proxy(grad_call)
                 grads, barrier_token = (

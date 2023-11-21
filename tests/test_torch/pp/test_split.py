@@ -62,7 +62,7 @@ def test_split(model_class):
 
     split_policy = split_into_equal_size(2)
     model_split = split(OutputLossWrapper(model_copy), split_policy=split_policy)
-    compile_splited(model_split, rand_input, tracing_mode="real")
+    compile_splited(model_split, rand_input, tracing_mode="fake")
 
     reproduce(42)
     out_dict = run_local_split_gm(model_split, rand_input)[0]
