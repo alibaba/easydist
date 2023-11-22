@@ -124,8 +124,13 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     if torch.distributed.get_rank() == 0:
         logger.info('enter rcpsp')
         logger.info(f'task cnt: {len(task_data)}')
+        if mem_constrain:
+            logger.info(f'[RCPSP]: Scheduling with Memory Constraint.')
+        else:
+            logger.info(f'[RCPSP]: Scheduling without Memory Constraint.')
         start_t = time.perf_counter()
-        raw_sche = rcpsp.rcpsp(task_data, available_resources, resource_dep_mask, 'general')
+        raw_sche = rcpsp.rcpsp(task_data, available_resources, 
+                               resource_dep_mask, mdconfig.rcpsp_method)
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
 
@@ -396,7 +401,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
         logger.info("Communication Optimization: Done!")
     return fx_module
 
-
+# TODO Utilize the logic to fill up opt_strategy generated before
 def _strategy_fill_up(opt_strategy, shape_info, fx_module):
     '''
     Rule-based filling up strategies of nodes in fx_module
