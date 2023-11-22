@@ -7,6 +7,7 @@ import operator
 from enum import Enum
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast)
 
+from torchviz import make_dot
 import torch
 import torch.fx as fx
 import torch.nn as nn
@@ -21,6 +22,7 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
 from easydist.torch.experimental.pp.backward import (BackStage, _insert_stage_symbolic_backward)
 from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
+from easydist.torch.experimental.pp.get_activations import get_activations
 from easydist.torch.utils import _enable_compile
 
 
@@ -28,6 +30,9 @@ class MultiUseParameterConfig(Enum):
     TRANSMIT = 1
     REPLICATE = 2
 
+def save_dot(dot, fname):
+    with open(fname, 'w') as f:
+        f.write(dot.source)
 
 MultiUseParamSpec = Union[MultiUseParameterConfig, Dict[str, MultiUseParameterConfig]]
 
@@ -519,8 +524,10 @@ class EDCompiledBackward(nn.Module):
     def __call__(self, **kwargs):
         params = dict(self.ed_forward[0].named_parameters_orig())
         buffers = dict(self.ed_forward[0].named_buffers_orig())
+        save_dot(make_dot(kwargs['stage_output'], params, True, True), 'runtime.dot')
+        activations = get_activations(kwargs["stage_output"], kwargs['outputs_with_grads_idxs'], params, buffers)
 
-        grad_inputs, barrier_token, grads = self.stateless_backward[0](params, buffers, kwargs)
+        grad_inputs, barrier_token, grads = self.stateless_backward[0](params, buffers, list(activations.values()), kwargs)
 
         for pname in params:
             params[pname].grad = grads[pname]
@@ -533,10 +540,10 @@ class EDCompiledBackward(nn.Module):
 def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward,
                    maybe_faked_params: Dict[str, nn.Parameter],
                    maybe_faked_buffers: Dict[str,
-                                             torch.Tensor], backward_mod: BackStage, kwargs: Dict):
+                                             torch.Tensor], activations, backward_mod: BackStage, kwargs: Dict):
     ret_for_interpreter = None
 
-    def stateless_backward(params, buffers, kwargs):
+    def stateless_backward(params, buffers, activations, kwargs):
         nonlocal ret_for_interpreter
         grad_inputs, barrier_token = backward_mod(**kwargs)
         ret_for_interpreter = {
@@ -550,11 +557,12 @@ def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward,
         gm = make_fx(stateless_backward,
                      tracing_mode=tracing_mode,
                      decomposition_table=EASYDIST_DECOMP_TABLE,
-                     _allow_non_fake_inputs=False)(maybe_faked_params, maybe_faked_buffers, kwargs)
+                     _allow_non_fake_inputs=False)(maybe_faked_params, maybe_faked_buffers, activations, kwargs)
 
-    gm.graph.eliminate_dead_code()
-    gm = preprocess_traced_graph(gm)
-    gm.recompile()
+    # TODO @botbw: get_activations depends on unoptimized graph (run once more after tracing?)
+    # gm.graph.eliminate_dead_code()
+    # gm = preprocess_traced_graph(gm)
+    # gm.recompile()
 
     return ret_for_interpreter, EDCompiledBackward(ed_forward, gm)
 
@@ -592,9 +600,10 @@ def trace_forward(tracing_mode: str, module: nn.Module, args: Tuple, kwargs: Dic
                      decomposition_table=EASYDIST_DECOMP_TABLE,
                      _allow_non_fake_inputs=False)(params, buffers, args, kwargs)
 
-    gm.graph.eliminate_dead_code()
-    gm = preprocess_traced_graph(gm)
-    gm.recompile()
+    # TODO @botbw: get_activations depends on unoptimized graph (run once more after tracing?)
+    # gm.graph.eliminate_dead_code()
+    # gm = preprocess_traced_graph(gm)
+    # gm.recompile()
 
     return ret_for_interpreter, EDCompiledForward(gm, params, buffers)
 
@@ -648,10 +657,11 @@ class CompileInterpreter(torch.fx.Interpreter):
                 submod.forward_name]["maybe_faked_params"]
             maybe_faked_buffers = self.maybe_faked_states[
                 submod.forward_name]["maybe_faked_buffers"]
+            save_dot(make_dot(kwargs['stage_output'], maybe_faked_params, True, True), 'compile.dot')
+            activations = get_activations(kwargs["stage_output"], kwargs["outputs_with_grads_idxs"], maybe_faked_params, maybe_faked_buffers)
             # TODO @botbw: what if using 'fake' here
             # if maybe_faked_params is faked, no need to fake again
-            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
-                                                maybe_faked_buffers, submod, kwargs)
+            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params, maybe_faked_buffers, list(activations.values()), submod, kwargs)
         else:
             assert 'submod' in target
             detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
