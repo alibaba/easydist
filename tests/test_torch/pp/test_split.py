@@ -53,12 +53,13 @@ class Foo(torch.nn.Module):
         self.linear = torch.nn.Linear(1024, 10)
 
     def forward(self, x):
-        x = self.norm(x)
-        x = self.linear(x)
-        return x.relu()
+        norm = self.norm(x)
+        linear = self.linear(norm)
+        relu = linear.relu()
+        return relu
 
 
-def test_split(model_class, input_size=(16, 3, 224, 224)):
+def test_split(model_class, input_size):
     model = model_class().cuda().train()
     model_copy = copy.deepcopy(model)
 
@@ -73,7 +74,7 @@ def test_split(model_class, input_size=(16, 3, 224, 224)):
     param_torch = [t for t in model.parameters()]
     grad_torch = [t.grad for t in model.parameters()]
 
-    split_policy = split_into_equal_size(2)
+    split_policy = split_into_equal_size(1)
     model_split = split(OutputLossWrapper(model_copy), split_policy=split_policy)
     compile_splited(model_split, rand_input, tracing_mode="fake")
 
