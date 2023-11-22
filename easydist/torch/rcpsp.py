@@ -254,16 +254,23 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
         num_tasks = len(_task_data)
         schedule = [i for i in range(num_tasks)]
         
-        rg = 250
-        odd_oven_points = [i * rg for i in range(int(num_tasks / rg))]
+        block_size = 125
+        odd_oven_points = [i * block_size for i in range(int(num_tasks / block_size))]
         odd_oven_points.append(num_tasks - 1)
+        # block: (start, end)
+        blocks = [(odd_oven_points[i], odd_oven_points[i + 1]) for i in range(len(odd_oven_points) - 1)]
+        block_num = len(blocks)
 
         for _ in range(mdconfig.rcpsp_iter_round):
             # odd round
-            for p in range(len(odd_oven_points) - 1):
-
+            # [block0, block1], [block2, block3] ...
+            for b in range(0, block_num, 2):
+                if b + 1 >= block_num:
+                    break
+                
+                # can be extended to support random node selection
                 select_mask = [0] * num_tasks
-                for i in range(odd_oven_points[p], min(odd_oven_points[p + 1], num_tasks)):
+                for i in range(blocks[b][0], blocks[b + 1][1]):
                     select_mask[i] = 1
 
                 data_selected = rcpsp_data_select(_task_data, select_mask)
@@ -275,11 +282,13 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
                 schedule = rcpsp_reorder(schedule, select_mask, _schedule)
 
             # even round
-            for p in range(1, len(odd_oven_points) - 1):
+            # [block1, block2], [block3, block4] ...
+            for b in range(1, block_num, 2):
+                if b + 1 >= block_num:
+                    break
 
                 select_mask = [0] * num_tasks
-                for i in range(max(0, odd_oven_points[p] - int(rg / 2)), 
-                            min(odd_oven_points[p + 1] + int(rg / 2), num_tasks)):
+                for i in range(blocks[b][0], blocks[b + 1][1]):
                     select_mask[i] = 1
 
                 data_selected = rcpsp_data_select(_task_data, select_mask)
