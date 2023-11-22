@@ -37,7 +37,7 @@ easydist_device = os.environ.get("EASYDIST_DEVICE", "cuda")
 available_mem = 40 * 1024 * 1024 # (KB)
 
 forced_compile = os.environ.get("EASYDIST_FORCED_COMPILE", "False").upper() in ["1", "TRUE"]
-use_dtensor = True
+use_dtensor = False
 enable_tile_comm = False
 
 # Profiling
@@ -71,6 +71,8 @@ master_port = int(_get_env_or_raise("MASTER_PORT"))
 # PyTorch
 
 comm_optimization = False
+rcpsp_method = 'odd_even'
+rcpsp_iter_round = 1 # odd_even rounds
 override_dtensor_rule = False
 
 # runtime
