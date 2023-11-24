@@ -74,7 +74,7 @@ def test_split(model_class, input_size):
     param_torch = [t for t in model.parameters()]
     grad_torch = [t.grad for t in model.parameters()]
 
-    split_policy = split_into_equal_size(1)
+    split_policy = split_into_equal_size(2)
     model_split = split(OutputLossWrapper(model_copy), split_policy=split_policy)
     compile_splited(model_split, rand_input, tracing_mode="fake")
 

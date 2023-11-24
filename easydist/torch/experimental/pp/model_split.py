@@ -643,6 +643,20 @@ class CompileInterpreter(torch.fx.Interpreter):
                 assert maybe_faked_key == key
                 self.value_remap[kwargs[key]] = maybe_faked_kwargs[maybe_faked_key]
 
+        def remove_duplicate(activations, stage_output, input_values):
+            ids = set()
+            for t in stage_output:
+                if isinstance(t, torch.Tensor):
+                    ids.add(id(t))
+            for t in input_values:
+                if isinstance(t, torch.Tensor):
+                    ids.add(id(t))
+            ret = []
+            for t in activations.values():
+                if id(t) not in ids:
+                    ret.append(t)
+            return ret
+
         submod = self.fetch_attr(target)
 
         if isinstance(submod, BackStage):  # TODO @botbw: simplify this
@@ -658,10 +672,11 @@ class CompileInterpreter(torch.fx.Interpreter):
             maybe_faked_buffers = self.maybe_faked_states[
                 submod.forward_name]["maybe_faked_buffers"]
             save_dot(make_dot(kwargs['stage_output'], maybe_faked_params, True, True), 'compile.dot')
-            activations = get_activations(kwargs["stage_output"], kwargs["outputs_with_grads_idxs"], maybe_faked_params, maybe_faked_buffers)
+            activations = get_activations(kwargs["stage_output"], maybe_faked_params, maybe_faked_buffers)
+            activations = remove_duplicate(activations, kwargs['stage_output'], kwargs['input_values'])
             # TODO @botbw: what if using 'fake' here
             # if maybe_faked_params is faked, no need to fake again
-            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params, maybe_faked_buffers, list(activations.values()), submod, kwargs)
+            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params, maybe_faked_buffers, activations, submod, kwargs)
         else:
             assert 'submod' in target
             detached_args = torch.fx.node.map_aggregate(args, detach_tensors)

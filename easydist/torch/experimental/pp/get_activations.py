@@ -10,7 +10,7 @@ from typing import Dict
 SAVED_PREFIX = "_saved_"
 
 
-def get_activations(stage_output, outputs_with_grads_idxs, params: Dict[str, nn.Parameter]=None, buffers: Dict[str, torch.Tensor]=None):
+def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers: Dict[str, torch.Tensor]=None):
     name_map = {}
     if params is not None:
         assert all(isinstance(p, Variable) for p in params.values())
@@ -81,10 +81,11 @@ def get_activations(stage_output, outputs_with_grads_idxs, params: Dict[str, nn.
             add_base_tensor(var._base)
 
     # handle multiple outputs
-    assert isinstance(stage_output, (tuple, list))
-    for i in outputs_with_grads_idxs:
-        v = stage_output[i]
-        name_map[id(v)] = f'stage_output_{i}'
-        add_base_tensor(v)
+    if isinstance(stage_output, (tuple, list)):
+        for i, v in enumerate(stage_output):
+            name_map[id(v)] = f'stage_output_{i}'
+            add_base_tensor(v)
+    else:
+        add_base_tensor(stage_output)
 
     return {k: v for k, v in activations.items() if k not in params and k not in buffers and "stage_output" not in k}
