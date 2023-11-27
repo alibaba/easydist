@@ -23,8 +23,8 @@ class BackStage(torch.nn.Module):
         outputs_with_grads_idxs: List[int],
         stage_info: str,
     ):
-        return stage_backward(stage_output, output_grads, input_values,
-                                    outputs_with_grads_idxs, stage_info)
+        return stage_backward(stage_output, output_grads, input_values, outputs_with_grads_idxs,
+                              stage_info)
 
 
 def stage_backward(

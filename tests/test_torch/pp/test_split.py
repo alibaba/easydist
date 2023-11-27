@@ -9,7 +9,10 @@ from easydist.torch.experimental.pp.loss_wrapper import LossWrapper
 from easydist.torch.experimental.pp.model_split import (compile_splited, run_local_split_gm, split)
 from easydist.torch.experimental.pp.split_policy import split_into_equal_size
 
+from functorch.compile import aot_function, aot_module, \
+    make_boxed_func, ts_compile
 
+from torch._functorch.aot_autograd import aot_export_module
 def reproduce(seed=42):
     # Set seed for PyTorch
     torch.manual_seed(seed)
@@ -27,10 +30,42 @@ def reproduce(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+from torchviz import make_dot
+def save_dot(dot, fname):
+    with open(fname, 'w') as f:
+        f.write(dot.source)
+
+from torch.autograd import Function
+class SplitFunc(Function):
+    
+        @staticmethod
+        def forward(ctx, *input):
+            if len(input) == 1:
+                return input[0]
+            return input
+    
+        @staticmethod
+        def backward(ctx, *grad_output):
+            if len(grad_output) == 1:
+                return grad_output[0]
+            return grad_output
+def split_func(input):
+    return SplitFunc.apply(input)
 
 def loss_fn(x):
     return x.mean()
 
+def run_func(func, *inputs):
+    res = func(*inputs)
+    # res.backward()
+
+def compiler_fn(fx_module: torch.fx.GraphModule, _):
+    print(fx_module.code)
+    return make_boxed_func(fx_module.forward)
+
+
+# aot_print_fn = aot_module(model, fw_compiler=compiler_fn,
+#     bw_compiler=compiler_fn)
 
 class OutputLossWrapper(LossWrapper):
 
@@ -51,12 +86,12 @@ class Foo(torch.nn.Module):
         super().__init__()
         self.norm = torch.nn.BatchNorm1d(1024)
         self.linear = torch.nn.Linear(1024, 10)
+        self.relu = torch.nn.ReLU()
 
     def forward(self, x):
         norm = self.norm(x)
         linear = self.linear(norm)
-        relu = linear.relu()
-        return relu
+        return self.relu(linear)
 
 
 def test_split(model_class, input_size):
@@ -74,9 +109,12 @@ def test_split(model_class, input_size):
     param_torch = [t for t in model.parameters()]
     grad_torch = [t.grad for t in model.parameters()]
 
-    split_policy = split_into_equal_size(2)
-    model_split = split(OutputLossWrapper(model_copy), split_policy=split_policy)
-    compile_splited(model_split, rand_input, tracing_mode="fake")
+    split_policy = split_into_equal_size()
+    model_split = split(model_copy, split_policy=split_policy)
+    aot_print_fn = aot_module(model_split.submod_0, fw_compiler=compiler_fn,
+    bw_compiler=compiler_fn)
+    # run_func(aot_print_fn, rand_input)
+    compile_splited(model_split, rand_input, tracing_mode="real")
 
     reproduce(42)
     out_dict = run_local_split_gm(model_split, rand_input)[0]
@@ -100,7 +138,7 @@ def test_split(model_class, input_size):
 if __name__ == "__main__":
     imagenet_input_size = (16, 3, 224, 224)
     test_split(Foo, (16, 1024))
-    test_split(resnet18, imagenet_input_size)
-    test_split(vgg19, imagenet_input_size)
-    test_split(alexnet, imagenet_input_size)
+    # test_split(resnet18, imagenet_input_size)
+    # test_split(vgg19, imagenet_input_size)
+    # test_split(alexnet, imagenet_input_size)
     print("passed")

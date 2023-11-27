@@ -1,16 +1,19 @@
 '''
 Adapted from https://github.com/szagoruyko/pytorchviz/blob/0adcd83af8aa7ab36d6afd139cabbd9df598edb7/torchviz/dot.py
 '''
+from typing import Dict
+
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-from typing import Dict
 
 # Saved attrs for grad_fn (incl. saved variables) begin with `._saved_*`
 SAVED_PREFIX = "_saved_"
 
 
-def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers: Dict[str, torch.Tensor]=None):
+def get_activations(stage_output,
+                    params: Dict[str, nn.Parameter] = None,
+                    buffers: Dict[str, torch.Tensor] = None):
     name_map = {}
     if params is not None:
         assert all(isinstance(p, Variable) for p in params.values())
@@ -23,6 +26,7 @@ def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers:
     visited = set()
 
     unspecified_cnt = 0
+
     def get_var_name(var, name=None):
         nonlocal unspecified_cnt
         if id(var) not in name_map:
@@ -39,7 +43,7 @@ def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers:
         if fn in visited:
             return
         visited.add(fn)
-        
+
         fn_name = type(fn).__name__
 
         for attr in dir(fn):
@@ -48,7 +52,7 @@ def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers:
             val = getattr(fn, attr)
             visited.add(val)
             if torch.is_tensor(val):
-                activations[get_var_name(val, fn_name+'.'+attr)] = val
+                activations[get_var_name(val, fn_name + '.' + attr)] = val
 
         if hasattr(fn, 'variable'):
             # if grad_accumulator, add the node for `.variable`
@@ -88,4 +92,8 @@ def get_activations(stage_output, params: Dict[str, nn.Parameter]=None, buffers:
     else:
         add_base_tensor(stage_output)
 
-    return {k: v for k, v in activations.items() if k not in params and k not in buffers and "stage_output" not in k}
+    return {
+        k: v
+        for k, v in activations.items()
+        if k not in params and k not in buffers and "stage_output" not in k
+    }

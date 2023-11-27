@@ -4,25 +4,33 @@ Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b26
 import copy
 import logging
 import operator
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast)
+from unittest.mock import patch
 
-from torchviz import make_dot
 import torch
 import torch.fx as fx
 import torch.nn as nn
+import torch.utils._pytree as pytree
 from torch import Tensor
+from torch._decomp.decompositions_for_rng import (PhiloxStateTracker, rng_decompositions)
+from torch._dispatch.python import enable_python_dispatcher
+from torch._dynamo.utils import (dynamo_timed, lazy_format_graph_code, preserve_rng_state)
+from torch._guards import detect_fake_mode, tracing
+from torch._subclasses import FakeTensor, FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.split_module import split_module
 from torch.nn.parameter import Parameter
 from torch.nn.utils import stateless
+from torchviz import make_dot
 
 from easydist.torch.compiler import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp import (get_pipeline_tracer, set_pipeline_tracer)
 from easydist.torch.experimental.pp.backward import (BackStage, _insert_stage_symbolic_backward)
-from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
 from easydist.torch.experimental.pp.get_activations import get_activations
+from easydist.torch.experimental.pp.loss_wrapper import TrivialLossWrapper
 from easydist.torch.utils import _enable_compile
 
 
@@ -30,9 +38,11 @@ class MultiUseParameterConfig(Enum):
     TRANSMIT = 1
     REPLICATE = 2
 
+
 def save_dot(dot, fname):
     with open(fname, 'w') as f:
         f.write(dot.source)
+
 
 MultiUseParamSpec = Union[MultiUseParameterConfig, Dict[str, MultiUseParameterConfig]]
 
@@ -431,27 +441,27 @@ def _from_traced(
     split.graph.lint()
     split.recompile()
 
-    num_stages = _number_and_count_forward_stages(split)
+    # num_stages = _number_and_count_forward_stages(split)
 
-    has_loss_and_backward = False
-    generated_loss_spec = output_loss_value_spec
+    # has_loss_and_backward = False
+    # generated_loss_spec = output_loss_value_spec
 
-    if mod.training or output_loss_value_spec is not None:
-        loss_node, output_node, generated_loss_spec = _find_loss_output(
-            mod, split.graph, output_loss_value_spec)
-        if loss_node is not None:
-            _insert_stage_symbolic_backward(split.graph, loss_node, output_node, return_to_0,
-                                            num_stages)
-            split.recompile()
-            has_loss_and_backward = True
-            logging.info("Pipeline is in training mode, backward pass generated")
-        else:
-            logging.warning(
-                "Did not find any loss value from model output, your pipeline will be in inference mode. "
-                "If you want your pipeline to be in training mode, please specify a loss value via "
-                "`output_loss_value_spec`.")
-    else:
-        logging.info("Pipeline is in evaluation mode, backward pass not generated")
+    # if mod.training or output_loss_value_spec is not None:
+    #     loss_node, output_node, generated_loss_spec = _find_loss_output(
+    #         mod, split.graph, output_loss_value_spec)
+    #     if loss_node is not None:
+    #         _insert_stage_symbolic_backward(split.graph, loss_node, output_node, return_to_0,
+    #                                         num_stages)
+    #         split.recompile()
+    #         has_loss_and_backward = True
+    #         logging.info("Pipeline is in training mode, backward pass generated")
+    #     else:
+    #         logging.warning(
+    #             "Did not find any loss value from model output, your pipeline will be in inference mode. "
+    #             "If you want your pipeline to be in training mode, please specify a loss value via "
+    #             "`output_loss_value_spec`.")
+    # else:
+    #     logging.info("Pipeline is in evaluation mode, backward pass not generated")
 
     return split
 
@@ -525,9 +535,12 @@ class EDCompiledBackward(nn.Module):
         params = dict(self.ed_forward[0].named_parameters_orig())
         buffers = dict(self.ed_forward[0].named_buffers_orig())
         save_dot(make_dot(kwargs['stage_output'], params, True, True), 'runtime.dot')
-        activations = get_activations(kwargs["stage_output"], kwargs['outputs_with_grads_idxs'], params, buffers)
+        activations = get_activations(kwargs["stage_output"], kwargs['outputs_with_grads_idxs'],
+                                      params, buffers)
 
-        grad_inputs, barrier_token, grads = self.stateless_backward[0](params, buffers, list(activations.values()), kwargs)
+        grad_inputs, barrier_token, grads = self.stateless_backward[0](params, buffers,
+                                                                       list(activations.values()),
+                                                                       kwargs)
 
         for pname in params:
             params[pname].grad = grads[pname]
@@ -538,9 +551,10 @@ class EDCompiledBackward(nn.Module):
 
 
 def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward,
-                   maybe_faked_params: Dict[str, nn.Parameter],
-                   maybe_faked_buffers: Dict[str,
-                                             torch.Tensor], activations, backward_mod: BackStage, kwargs: Dict):
+                   maybe_faked_params: Dict[str,
+                                            nn.Parameter], maybe_faked_buffers: Dict[str,
+                                                                                     torch.Tensor],
+                   activations, backward_mod: BackStage, kwargs: Dict):
     ret_for_interpreter = None
 
     def stateless_backward(params, buffers, activations, kwargs):
@@ -557,7 +571,8 @@ def trace_backward(tracing_mode: str, ed_forward: EDCompiledForward,
         gm = make_fx(stateless_backward,
                      tracing_mode=tracing_mode,
                      decomposition_table=EASYDIST_DECOMP_TABLE,
-                     _allow_non_fake_inputs=False)(maybe_faked_params, maybe_faked_buffers, activations, kwargs)
+                     _allow_non_fake_inputs=False)(maybe_faked_params, maybe_faked_buffers,
+                                                   activations, kwargs)
 
     # TODO @botbw: get_activations depends on unoptimized graph (run once more after tracing?)
     # gm.graph.eliminate_dead_code()
@@ -606,6 +621,114 @@ def trace_forward(tracing_mode: str, module: nn.Module, args: Tuple, kwargs: Dic
     # gm.recompile()
 
     return ret_for_interpreter, EDCompiledForward(gm, params, buffers)
+
+
+from torch._functorch.aot_autograd import (AOT_COUNTER, AOTConfig, create_aot_dispatcher_function,
+                                           create_tree_flattened_fn,
+                                           run_functionalized_fw_and_collect_metadata,
+                                           track_graph_compiling)
+from torch.fx.experimental.proxy_tensor import is_sym_node, py_sym_types
+from torch._functorch.partitioners import default_partition
+
+def compile_submod(tracing_mode, module, args, kwargs):
+    named_params = dict(module.named_parameters())
+    named_buffers = dict(module.named_buffers())
+    args = list(args)
+    args.insert(0, named_buffers)
+    args.insert(0, named_params)
+    num_params_buffers = len(named_params) + len(named_buffers)
+
+    aot_config = AOTConfig(
+        is_export=True, # get fx_g
+        decompositions=EASYDIST_DECOMP_TABLE,
+        partition_fn=default_partition,
+        num_params_buffers=num_params_buffers,
+        aot_id=next(AOT_COUNTER),
+        fw_compiler=None,
+        bw_compiler=None,
+        inference_compiler=None,
+        keep_inference_input_mutations=True,
+        dynamic_shapes=False,
+        aot_autograd_arg_pos_to_source=None,
+        no_tangents=False,
+        enable_log=False,
+    )
+
+    def fn(named_params, named_buffers, *args, **kwargs):
+        params_and_buffers = {**named_params, **named_buffers}
+        return torch.func.functional_call(module, params_and_buffers, args, kwargs)
+
+    flat_args, _ = pytree.tree_flatten((args, kwargs))
+    flat_fn, out_spec = create_tree_flattened_fn(fn, args, kwargs)
+
+    fx_g = create_aot_dispatcher_function(
+        flat_fn,
+        flat_args,
+        aot_config,
+    )
+
+    fake_mode = detect_fake_mode(flat_args)
+    if fake_mode is None:
+            fake_mode = FakeTensorMode()
+    assert fake_mode.shape_env is None  # TODO @botbw
+    python_dispatcher_mode = nullcontext()
+    with torch.autograd.set_multithreading_enabled(
+            False), preserve_rng_state(), fake_mode, python_dispatcher_mode, PhiloxStateTracker():
+
+        def process_inputs(flat_args):
+
+            def convert(idx, x):
+                if not isinstance(x, torch.Tensor):
+                    return x
+                if isinstance(x, FakeTensor):
+                    assert x.fake_mode is fake_mode
+                    return x
+                # TODO: Ensure that this codepath is never exercised from
+                # Dynamo
+                from torch._functorch import config
+                if (idx < aot_config.num_params_buffers and config.static_weight_shapes):
+                    return fake_mode.from_tensor(x, static_shapes=True)
+                return fake_mode.from_tensor(x, static_shapes=False)
+
+            return [convert(idx, x) for idx, x in enumerate(flat_args)]
+
+    fake_flat_args = process_inputs(flat_args)
+    needs_autograd = (any(x.requires_grad for x in fake_flat_args if isinstance(x, Tensor))
+                      and torch.is_grad_enabled())
+    with enable_python_dispatcher():
+        # Patch set_rng_state as set_rng_state with fake tensors is
+        # nonsensical. This does not affect the collection of metadata.
+        with patch("torch.cuda.set_rng_state", lambda *args: None):
+            fw_metadata = run_functionalized_fw_and_collect_metadata(
+                flat_fn,
+                keep_input_mutations=aot_config.keep_inference_input_mutations
+                and not needs_autograd,
+            )(*fake_flat_args)
+
+    # Copied from aot_dispatch_autograd_graph.
+    traced_tangents = pytree.tree_map(
+        lambda x: x.detach().contiguous() if isinstance(x, Tensor) else x,
+        fw_metadata.traced_tangents,
+    )
+    joint_inputs = (flat_args, traced_tangents)
+
+    with torch.no_grad():
+        with track_graph_compiling(aot_config, "joint"):
+            num_inner_fwd_outputs = (fw_metadata.num_mutated_inputs + fw_metadata.num_outputs +
+                                     fw_metadata.num_intermediate_bases +
+                                     fw_metadata.num_outputs_rng_offset)
+            fw_module, bw_module = aot_config.partition_fn(fx_g,
+                                                           joint_inputs,
+                                                           num_fwd_outputs=num_inner_fwd_outputs)
+            fw_outs = [n for n in fw_module.graph.nodes if n.op == "output"][0].args[0]
+            # we only need to bookkeep the symints that are saved for bw, not any symints
+            # the user forward might have returned in its own output
+            fw_outs_saved_for_bw = fw_outs[num_inner_fwd_outputs:]
+            symint_outs_saved_for_bw = [n for n in fw_outs_saved_for_bw if is_sym_node(n)]
+            fw_metadata.num_symints_saved_for_bw = len(symint_outs_saved_for_bw)
+            _num_symints_saved_for_bw = len(symint_outs_saved_for_bw)
+
+    return fw_module, bw_module
 
 
 class CompileInterpreter(torch.fx.Interpreter):
@@ -663,26 +786,27 @@ class CompileInterpreter(torch.fx.Interpreter):
             assert len(args) == 0
             # tree node fetch kwargs as immutable_dict
             kwargs = dict(kwargs)
-            kwargs["input_values"] = [
-                self.value_remap.get(v, v) for v in kwargs["input_values"]
-            ]
+            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
             ed_forward = self.compiled[submod.forward_name]
-            maybe_faked_params = self.maybe_faked_states[
-                submod.forward_name]["maybe_faked_params"]
+            maybe_faked_params = self.maybe_faked_states[submod.forward_name]["maybe_faked_params"]
             maybe_faked_buffers = self.maybe_faked_states[
                 submod.forward_name]["maybe_faked_buffers"]
-            save_dot(make_dot(kwargs['stage_output'], maybe_faked_params, True, True), 'compile.dot')
-            activations = get_activations(kwargs["stage_output"], maybe_faked_params, maybe_faked_buffers)
-            activations = remove_duplicate(activations, kwargs['stage_output'], kwargs['input_values'])
+            save_dot(make_dot(kwargs['stage_output'], maybe_faked_params, True, True),
+                     'compile.dot')
+            activations = get_activations(kwargs["stage_output"], maybe_faked_params,
+                                          maybe_faked_buffers)
+            activations = remove_duplicate(activations, kwargs['stage_output'],
+                                           kwargs['input_values'])
             # TODO @botbw: what if using 'fake' here
             # if maybe_faked_params is faked, no need to fake again
-            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params, maybe_faked_buffers, activations, submod, kwargs)
+            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
+                                              maybe_faked_buffers, activations, submod, kwargs)
         else:
             assert 'submod' in target
             detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
             detached_kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
             ret, ed_compiled = trace_forward(self.tracing_mode, submod, detached_args,
-                                                detached_kwargs)
+                                             detached_kwargs)
             update_detached(ret['maybe_faked_args'], ret['maybe_faked_kwargs'], args, kwargs)
             self.maybe_faked_states[target] = {
                 "maybe_faked_params": ret['maybe_faked_params'],
@@ -776,6 +900,7 @@ class DetachExecutor(torch.fx.Interpreter):
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
+
         def detach_tensors(a):
             if isinstance(a, torch.Tensor) and a.requires_grad:
                 if a not in self.value_remap:
