@@ -2,6 +2,7 @@
 Adapted from https://github.com/pytorch/PiPPy/blob/83a2308f4a53ae36eba2f0c1b2b262d5d697d37b/pippy/IR.py#L280
 '''
 import copy
+import itertools
 import logging
 import operator
 from contextlib import contextmanager, nullcontext
@@ -627,7 +628,7 @@ from torch._functorch.aot_autograd import (AOT_COUNTER, AOTConfig, create_aot_di
                                            create_tree_flattened_fn,
                                            run_functionalized_fw_and_collect_metadata,
                                            track_graph_compiling, PytreeThunk,
-                                           create_runtime_wrapper,
+                                           create_runtime_wrapper, OutputType,
                                            call_func_with_args, TensorAlias, functionalized_rng_runtime_epilogue)
 from torch.fx.experimental.proxy_tensor import is_sym_node, py_sym_types
 from torch._functorch.partitioners import default_partition
@@ -700,8 +701,6 @@ def compile_submod(module, args, kwargs):
         if bw_out is None:
             _indices_of_inps_to_detach.append(i)
 
-    
-    
     class CompiledForward:
         def __init__(self):
             super().__init__()
@@ -719,7 +718,7 @@ def compile_submod(module, args, kwargs):
                 )
 
         def init_before_forward(self):
-            self.saved_bw = []
+            self.saved_tensors = []
             self.symints = None
             self.non_differentiable = None
 
@@ -770,7 +769,7 @@ def compile_submod(module, args, kwargs):
                 isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
             )
             # See Note [Detaching saved tensors in AOTAutograd]
-            self.saved_bw = (x.detach() if x._is_view() else x for x in tensors_saved_for_backwards)
+            self.saved_tensors = (x.detach() if x._is_view() else x for x in tensors_saved_for_backwards)
             symint_outs = fw_outs[self.fw_metadata.symints_saved_for_backwards_slice]
             assert all(
                 isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
@@ -837,11 +836,90 @@ def compile_submod(module, args, kwargs):
     class CompiledBackward:
         def __init__(self):
             super().__init__()
-            self.bw_gm = fw_module
+            self.bw_gm = bw_module
             self.compiled_fw = compiled_fw
 
         def __call__(self, *args, **kwargs):
             return self.bw_gm(*args, **kwargs)
+        
+        def backward(self, *flat_args):
+            num_mutated_inps = self.compiled_fw.fw_metadata.num_mutated_inputs
+            num_intermediate_bases = self.compiled_fw.fw_metadata.num_intermediate_bases
+            expected_grad_outs = (
+                self.compiled_fw.fw_metadata.num_outputs + num_mutated_inps + num_intermediate_bases
+            )
+
+            assert len(flat_args) == expected_grad_outs
+            out_info = self.compiled_fw.fw_metadata.output_info
+            if (
+                self.compiled_fw.fw_metadata.num_mutated_metadata_only_inputs > 0
+                or self.compiled_fw.fw_metadata.num_outputs_aliased > 0
+            ):
+                inp_tangents, out_tangents, intermediate_base_tangents = (
+                    flat_args[0:num_mutated_inps],
+                    flat_args[num_mutated_inps:num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs],
+                    flat_args[num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs:],
+                )
+                # input_info contains info on *every* input,
+                # But in the backward(), we are only given grad outputs for every mutated input.
+                # We then need to filter out the grad outputs that correspond to metadata-only mutations.
+                mutated_inp_indices = self.compiled_fw.fw_metadata.mutated_inp_indices
+                input_info = self.compiled_fw.fw_metadata.input_info
+                assert len(inp_tangents) == len(mutated_inp_indices)
+                inp_tangents_filtered = [
+                    x
+                    for x, info_idx in zip(inp_tangents, mutated_inp_indices)
+                    if input_info[info_idx].mutates_data
+                ]
+                # We also need to filter out grad outputs that correspond to outputs aliasing inputs/intermediates
+                out_tangents_filtered = [
+                    x
+                    for x, info in zip(out_tangents, out_info)
+                    if info.output_type in [OutputType.non_alias, OutputType.unsafe_view_alias, OutputType.custom_function_view]
+                    and issubclass(info.raw_type, torch.Tensor)
+                ]
+                # intermediate bases always require gradients, and always participate in the backward graph.
+                flat_bw_args = itertools.chain(inp_tangents_filtered, out_tangents_filtered, intermediate_base_tangents)
+            else:
+                # filter out non-tensor grad_outputs (aka due to ints being returned as outputs in the forward)
+                num_mutated_inps = self.compiled_fw.fw_metadata.num_mutated_inputs
+                mutated_inp_args = flat_args[:num_mutated_inps] if num_mutated_inps > 0 else []
+                user_tangents = flat_args[num_mutated_inps:]
+                assert len(user_tangents) == len(out_info)
+                filtered_user_tangents = [x for x, info in zip(user_tangents, out_info) if issubclass(info.raw_type, torch.Tensor)]
+                flat_bw_args = tuple(mutated_inp_args) + tuple(filtered_user_tangents)
+
+            contiguous_args = [
+                t.contiguous() if torch.is_tensor(t) else t for t in flat_bw_args
+            ]
+
+            rng_args = []
+            if self.compiled_fw.fw_metadata.is_rng_op_functionalized:
+                # Add the seed and offset to args
+                rng_args = CUDARngStateHelper.get_torch_state_as_tuple()
+
+            all_args = [
+                *self.compiled_fw.symints,
+                *self.compiled_fw.saved_tensors,
+                *contiguous_args,
+                *rng_args
+            ]
+            del contiguous_args
+
+            def call_compiled_backward():
+                out = call_func_with_args(
+                    self.bw_gm.forward,
+                    all_args,
+                    steal_args=True,
+                    disable_amp=torch._C._is_any_autocast_enabled(),
+                )
+
+                out = functionalized_rng_runtime_epilogue(self.compiled_fw.fw_metadata, out)
+                return tuple(out)
+
+            out = call_compiled_backward()
+            return out
+
     compiled_bw = CompiledBackward()
 
     return compiled_fw, compiled_bw
@@ -859,18 +937,11 @@ class CompileInterpreter(torch.fx.Interpreter):
 
     def call_module(self, target, args, kwargs):
         assert 'submod' in target
-        def detach_tensors(a):
-            if isinstance(a, torch.Tensor) and a.requires_grad:
-                new_val = a.detach().requires_grad_(True)
-                return new_val
-            else:
-                return a
 
         submod = self.fetch_attr(target)
-
         compiled_fw, compiled_bw = compile_submod(submod, args, kwargs)
         self.compiled.append([compiled_fw, compiled_bw])
-        
+
         return super().call_module(target, args, kwargs)
 
 def split(

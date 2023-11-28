@@ -113,9 +113,8 @@ def test_split(model_class, input_size):
     compile_splited(model_split, rand_input)
 
     reproduce(42)
-    out_dict = run_local_split_gm(model_split, rand_input)[0]
-    out_split = out_dict['output']
-    loss_split = out_dict['loss']
+    out_split = model_split(rand_input)
+    loss_split = loss_fn(out_split)
 
     buffer_split = [t for t in model_split.buffers()]
     param_split = [t for t in model_split.parameters()]
