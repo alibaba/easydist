@@ -626,33 +626,20 @@ def trace_forward(tracing_mode: str, module: nn.Module, args: Tuple, kwargs: Dic
 from torch._functorch.aot_autograd import (AOT_COUNTER, AOTConfig, create_aot_dispatcher_function,
                                            create_tree_flattened_fn,
                                            run_functionalized_fw_and_collect_metadata,
-                                           track_graph_compiling)
+                                           track_graph_compiling, PytreeThunk,
+                                           create_runtime_wrapper,
+                                           call_func_with_args, TensorAlias, functionalized_rng_runtime_epilogue)
 from torch.fx.experimental.proxy_tensor import is_sym_node, py_sym_types
 from torch._functorch.partitioners import default_partition
+from torch._prims_common import CUDARngStateHelper
+from torch._functorch import config
 
-def compile_submod(tracing_mode, module, args, kwargs):
+def compile_submod(module, args, kwargs):
     named_params = dict(module.named_parameters())
     named_buffers = dict(module.named_buffers())
-    args = list(args)
-    args.insert(0, named_buffers)
-    args.insert(0, named_params)
     num_params_buffers = len(named_params) + len(named_buffers)
 
-    aot_config = AOTConfig(
-        is_export=True, # get fx_g
-        decompositions=EASYDIST_DECOMP_TABLE,
-        partition_fn=default_partition,
-        num_params_buffers=num_params_buffers,
-        aot_id=next(AOT_COUNTER),
-        fw_compiler=None,
-        bw_compiler=None,
-        inference_compiler=None,
-        keep_inference_input_mutations=True,
-        dynamic_shapes=False,
-        aot_autograd_arg_pos_to_source=None,
-        no_tangents=False,
-        enable_log=False,
-    )
+    args = (named_params, named_buffers, *args)
 
     def fn(named_params, named_buffers, *args, **kwargs):
         params_and_buffers = {**named_params, **named_buffers}
@@ -661,49 +648,27 @@ def compile_submod(tracing_mode, module, args, kwargs):
     flat_args, _ = pytree.tree_flatten((args, kwargs))
     flat_fn, out_spec = create_tree_flattened_fn(fn, args, kwargs)
 
-    fx_g = create_aot_dispatcher_function(
+    aot_config = AOTConfig(
+        is_export=True, # to produce fx_g
+        decompositions=EASYDIST_DECOMP_TABLE,
+        partition_fn=default_partition,
+        num_params_buffers=num_params_buffers,
+        aot_id=next(AOT_COUNTER),
+        keep_inference_input_mutations=False,
+        fw_compiler=None,
+        bw_compiler=None,
+        inference_compiler=None,
+        dynamic_shapes=False,
+        aot_autograd_arg_pos_to_source=None,
+        no_tangents=False,
+        enable_log=False,
+    )
+
+    fx_g, fw_metadata = create_aot_dispatcher_function(
         flat_fn,
         flat_args,
         aot_config,
     )
-
-    fake_mode = detect_fake_mode(flat_args)
-    if fake_mode is None:
-            fake_mode = FakeTensorMode()
-    assert fake_mode.shape_env is None  # TODO @botbw
-    python_dispatcher_mode = nullcontext()
-    with torch.autograd.set_multithreading_enabled(
-            False), preserve_rng_state(), fake_mode, python_dispatcher_mode, PhiloxStateTracker():
-
-        def process_inputs(flat_args):
-
-            def convert(idx, x):
-                if not isinstance(x, torch.Tensor):
-                    return x
-                if isinstance(x, FakeTensor):
-                    assert x.fake_mode is fake_mode
-                    return x
-                # TODO: Ensure that this codepath is never exercised from
-                # Dynamo
-                from torch._functorch import config
-                if (idx < aot_config.num_params_buffers and config.static_weight_shapes):
-                    return fake_mode.from_tensor(x, static_shapes=True)
-                return fake_mode.from_tensor(x, static_shapes=False)
-
-            return [convert(idx, x) for idx, x in enumerate(flat_args)]
-
-    fake_flat_args = process_inputs(flat_args)
-    needs_autograd = (any(x.requires_grad for x in fake_flat_args if isinstance(x, Tensor))
-                      and torch.is_grad_enabled())
-    with enable_python_dispatcher():
-        # Patch set_rng_state as set_rng_state with fake tensors is
-        # nonsensical. This does not affect the collection of metadata.
-        with patch("torch.cuda.set_rng_state", lambda *args: None):
-            fw_metadata = run_functionalized_fw_and_collect_metadata(
-                flat_fn,
-                keep_input_mutations=aot_config.keep_inference_input_mutations
-                and not needs_autograd,
-            )(*fake_flat_args)
 
     # Copied from aot_dispatch_autograd_graph.
     traced_tangents = pytree.tree_map(
@@ -728,95 +693,185 @@ def compile_submod(tracing_mode, module, args, kwargs):
             fw_metadata.num_symints_saved_for_bw = len(symint_outs_saved_for_bw)
             _num_symints_saved_for_bw = len(symint_outs_saved_for_bw)
 
-    return fw_module, bw_module
+    _indices_of_inps_to_detach = []
+    bw_outs = [n for n in bw_module.graph.nodes if n.op == "output"][0].args[0]
+    assert len(bw_outs) == len(fw_metadata.input_info) + fw_metadata.num_outputs_rng_offset
+    for i, (bw_out) in enumerate(bw_outs):
+        if bw_out is None:
+            _indices_of_inps_to_detach.append(i)
+
+    
+    
+    class CompiledForward:
+        def __init__(self):
+            super().__init__()
+            self.fw_gm = fw_module
+            self.fw_metadata = fw_metadata
+            self.named_params = named_params
+            self.named_buffers = named_buffers
+            self.runtime_fw = create_runtime_wrapper(
+                    self.forward,
+                    runtime_metadata=fw_metadata,
+                    indices_of_inps_to_detach=_indices_of_inps_to_detach,
+                    trace_joint=True,
+                    keep_input_mutations=aot_config.keep_inference_input_mutations,
+                    disable_amp=torch._C._is_any_autocast_enabled()
+                )
+
+        def init_before_forward(self):
+            self.saved_bw = []
+            self.symints = None
+            self.non_differentiable = None
+
+        def __call__(self, *args, **kwargs):
+            self.init_before_forward()
+            args = (named_params, named_buffers, *args)
+            in_flat, in_spec = pytree.tree_flatten((args, kwargs))
+            out_flat = self.runtime_fw(*in_flat)
+            return out_spec.unflatten(out_flat)
+        
+        def forward(self, *deduped_flat_tensor_args):
+            args = deduped_flat_tensor_args
+            if self.fw_metadata.is_rng_op_functionalized:
+                # Add the seed and offset to args
+                seed, offset = CUDARngStateHelper.get_torch_state_as_tuple()
+                args = (*args, seed, offset)
+            # There is a pretty complicated calling convention around what the compiled fw returns.
+            # The full list of outputs and their relative order is:
+            # (*mutated_inputs, *fw_outs, *fw_intermediate_bases, *saved_tensors, *saved_symints)
+            # - Note that in the synthetic bases case, mutated_inputs will correspond to an updated version
+            #   of the original view, and not the synthetic base
+            fw_outs = call_func_with_args(
+                self.fw_gm.forward,
+                args,
+                disable_amp=torch._C._is_any_autocast_enabled(),
+            )
+
+            num_outputs = self.fw_metadata.num_outputs
+            num_outputs_aliased = self.fw_metadata.num_outputs_aliased
+            num_intermediate_bases = self.fw_metadata.num_intermediate_bases
+            num_symints_saved_for_bw = _num_symints_saved_for_bw
+            num_mutated_inputs = self.fw_metadata.num_mutated_inputs
+            num_mutated_metadata_only_inputs = (
+                self.fw_metadata.num_mutated_metadata_only_inputs
+            )
+            num_forward_returns = self.fw_metadata.num_forward_returns
+            num_forward = self.fw_metadata.num_forward
+
+            assert num_forward_returns == len(
+                self.fw_metadata.requires_grad_info
+            ) + num_intermediate_bases
+
+            # Partitioners must put symint arguments at the end separate from tensor arguments
+            tensors_saved_for_backwards = fw_outs[
+                self.fw_metadata.tensors_saved_for_backwards_slice
+            ]
+            assert all(
+                isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
+            )
+            # See Note [Detaching saved tensors in AOTAutograd]
+            self.saved_bw = (x.detach() if x._is_view() else x for x in tensors_saved_for_backwards)
+            symint_outs = fw_outs[self.fw_metadata.symints_saved_for_backwards_slice]
+            assert all(
+                isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
+                for x in symint_outs
+            ), str([type(x) for x in symint_outs])
+            self.symints = symint_outs
+
+            raw_returns = fw_outs[0:num_forward_returns]
+
+            # Wrap all autograd.Function.forward() outputs that are aliases
+            # so that autograd.Function doesn't treat them as tensors
+            if num_mutated_metadata_only_inputs > 0:
+                for i, idx in enumerate(
+                    self.fw_metadata.mutated_inp_indices
+                ):
+                    # We could make this faster by only looping over inputs with metadata-only mutations
+                    # (instead of looping over inputs with either data or metadata mutations), but there shouldn't be many.
+                    info = self.fw_metadata.input_info[idx]
+                    if info.mutates_metadata and not info.mutates_data:
+                        raw_returns[i] = TensorAlias(raw_returns[i])
+
+                if config.debug_assert:
+                    user_mutated_inputs_raw = raw_returns[0:num_mutated_inputs]
+                    mut_inp_infos = [
+                        x for x in self.fw_metadata.input_info if x.mutates_data or x.mutates_metadata
+                    ]
+                    assert len(user_mutated_inputs_raw) == len(mut_inp_infos)
+
+            if self.fw_metadata.num_unsafe_view_outputs > 0:
+                for idx in self.fw_metadata.unsafe_view_out_indices:
+                    raw_return_idx = num_mutated_inputs + idx
+                    o = raw_returns[raw_return_idx]
+                    raw_returns[raw_return_idx] = torch.ops.aten._unsafe_view(o, o.shape)
+
+            if num_outputs_aliased > 0:
+                for idx in self.fw_metadata.aliased_out_indices:
+                    raw_return_idx = num_mutated_inputs + idx
+                    raw_returns[raw_return_idx] = TensorAlias(raw_returns[raw_return_idx])
+
+                if config.debug_assert:
+                    intermediates_raw = raw_returns[num_mutated_inputs + num_outputs:]
+                    assert not any(isinstance(x, TensorAlias) for x in intermediates_raw)
+
+            # invariant: intermediate bases always require gradients, so we don't have to
+            # consider marking them as non-differentiable.
+            raw_returns_not_including_intermediate_bases = raw_returns[:num_mutated_inputs + num_outputs]
+            fw_outs_not_requiring_grad = [
+                x
+                for (i, x) in enumerate(raw_returns_not_including_intermediate_bases)
+                if isinstance(x, torch.Tensor)
+                and not self.fw_metadata.requires_grad_info[i]
+            ]
+            self.non_differentiable = fw_outs_not_requiring_grad
+
+            functionalized_rng_runtime_epilogue(
+                self.fw_metadata,
+                fw_outs[num_forward_returns:num_forward],
+                return_new_outs=False
+            )
+            return tuple(raw_returns)
+
+    compiled_fw = CompiledForward()
+
+    class CompiledBackward:
+        def __init__(self):
+            super().__init__()
+            self.bw_gm = fw_module
+            self.compiled_fw = compiled_fw
+
+        def __call__(self, *args, **kwargs):
+            return self.bw_gm(*args, **kwargs)
+    compiled_bw = CompiledBackward()
+
+    return compiled_fw, compiled_bw
 
 
 class CompileInterpreter(torch.fx.Interpreter):
 
-    def __init__(self, module, tracing_mode, garbage_collect_values: bool = True):
+    def __init__(self, module, garbage_collect_values: bool = True):
         super().__init__(module, garbage_collect_values)
-        self.tracing_mode = tracing_mode
-        self.value_remap = {}
-        self.maybe_faked_states = {}
-        self.compiled = {}
+        self.compiled = []
 
     def run(self, *args, initial_env=None):
-        self.value_remap = {}
-        self.maybe_faked_states = {}
-        self.compiled = {}
+        self.compiled.clear()
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
+        assert 'submod' in target
         def detach_tensors(a):
             if isinstance(a, torch.Tensor) and a.requires_grad:
-                if a not in self.value_remap:
-                    new_val = a.detach().requires_grad_(True)
-                    self.value_remap[a] = new_val
-                return self.value_remap[a]
+                new_val = a.detach().requires_grad_(True)
+                return new_val
             else:
                 return a
 
-        def update_detached(maybe_faked_args, maybe_faked_kwargs, args, kwargs):
-            assert len(args) == len(ret['maybe_faked_args'])
-            assert len(kwargs) == len(detached_kwargs)
-            for maybe_faked_arg, arg in zip(maybe_faked_args, args):
-                self.value_remap[arg] = maybe_faked_arg
-
-            for maybe_faked_key, key in zip(maybe_faked_kwargs, kwargs):
-                assert maybe_faked_key == key
-                self.value_remap[kwargs[key]] = maybe_faked_kwargs[maybe_faked_key]
-
-        def remove_duplicate(activations, stage_output, input_values):
-            ids = set()
-            for t in stage_output:
-                if isinstance(t, torch.Tensor):
-                    ids.add(id(t))
-            for t in input_values:
-                if isinstance(t, torch.Tensor):
-                    ids.add(id(t))
-            ret = []
-            for t in activations.values():
-                if id(t) not in ids:
-                    ret.append(t)
-            return ret
-
         submod = self.fetch_attr(target)
 
-        if isinstance(submod, BackStage):  # TODO @botbw: simplify this
-            assert len(args) == 0
-            # tree node fetch kwargs as immutable_dict
-            kwargs = dict(kwargs)
-            kwargs["input_values"] = [self.value_remap.get(v, v) for v in kwargs["input_values"]]
-            ed_forward = self.compiled[submod.forward_name]
-            maybe_faked_params = self.maybe_faked_states[submod.forward_name]["maybe_faked_params"]
-            maybe_faked_buffers = self.maybe_faked_states[
-                submod.forward_name]["maybe_faked_buffers"]
-            save_dot(make_dot(kwargs['stage_output'], maybe_faked_params, True, True),
-                     'compile.dot')
-            activations = get_activations(kwargs["stage_output"], maybe_faked_params,
-                                          maybe_faked_buffers)
-            activations = remove_duplicate(activations, kwargs['stage_output'],
-                                           kwargs['input_values'])
-            # TODO @botbw: what if using 'fake' here
-            # if maybe_faked_params is faked, no need to fake again
-            ret, ed_compiled = trace_backward('real', ed_forward, maybe_faked_params,
-                                              maybe_faked_buffers, activations, submod, kwargs)
-        else:
-            assert 'submod' in target
-            detached_args = torch.fx.node.map_aggregate(args, detach_tensors)
-            detached_kwargs = torch.fx.node.map_aggregate(kwargs, detach_tensors)
-            ret, ed_compiled = trace_forward(self.tracing_mode, submod, detached_args,
-                                             detached_kwargs)
-            update_detached(ret['maybe_faked_args'], ret['maybe_faked_kwargs'], args, kwargs)
-            self.maybe_faked_states[target] = {
-                "maybe_faked_params": ret['maybe_faked_params'],
-                "maybe_faked_buffers": ret["maybe_faked_buffers"]
-            }
-
-        self.compiled[target] = ed_compiled
-
-        return ret['tracing_output']
-
+        compiled_fw, compiled_bw = compile_submod(submod, args, kwargs)
+        self.compiled.append([compiled_fw, compiled_bw])
+        
+        return super().call_module(target, args, kwargs)
 
 def split(
     mod: torch.nn.Module,
@@ -851,35 +906,18 @@ def split(
     return gm_split
 
 
-def compile_splited(gm_split: fx.GraphModule, *args, tracing_mode: str = "fake"):
-    assert tracing_mode in ["real", "fake", "symbolic"]
-
-    # need to restore model states after tracing in real mode
-    if tracing_mode == "real":
-        params_copy = {}
-        buffers_copy = {}
-        for name, submod in gm_split.named_children():
-            if isinstance(submod, BackStage): break
-            params_copy[name] = {
-                name: copy.deepcopy(param)
-                for name, param in submod.named_parameters()
-            }
-            buffers_copy[name] = {
-                name: copy.deepcopy(buffer)
-                for name, buffer in submod.named_buffers()
-            }
+def compile_splited(gm_split: fx.GraphModule, *args):
 
     # run through gm_split and compile each stage
-    executor = CompileInterpreter(gm_split, tracing_mode)
+    executor = CompileInterpreter(gm_split)
     executor.run(*args)
 
-    for name, compiled_mod in executor.compiled.items():
-        if tracing_mode == "real" and isinstance(compiled_mod, EDCompiledForward):
-            assert len(params_copy[name]) == len(list(compiled_mod.parameters()))
-            compiled_mod.update_params(params_copy[name])
-            compiled_mod.update_buffers(buffers_copy[name])
-        setattr(gm_split, name, compiled_mod)
+    for i, (compiled_fw, _) in enumerate(executor.compiled):
+        delattr(gm_split, f"submod_{i}")
+        setattr(gm_split, f"submod_{i}", compiled_fw)
 
+    for i, (_, compiled_bw) in enumerate(reversed(executor.compiled)):
+        setattr(gm_split, f"submod_bw_{i}", compiled_bw)
     return gm_split
 
 

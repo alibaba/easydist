@@ -56,16 +56,12 @@ def loss_fn(x):
     return x.mean()
 
 def run_func(func, *inputs):
-    res = func(*inputs)
-    # res.backward()
+    res = func(*inputs).mean()
+    res.backward()
 
 def compiler_fn(fx_module: torch.fx.GraphModule, _):
     print(fx_module.code)
     return make_boxed_func(fx_module.forward)
-
-
-# aot_print_fn = aot_module(model, fw_compiler=compiler_fn,
-#     bw_compiler=compiler_fn)
 
 class OutputLossWrapper(LossWrapper):
 
@@ -109,12 +105,12 @@ def test_split(model_class, input_size):
     param_torch = [t for t in model.parameters()]
     grad_torch = [t.grad for t in model.parameters()]
 
-    split_policy = split_into_equal_size()
+    split_policy = split_into_equal_size(2)
     model_split = split(model_copy, split_policy=split_policy)
     aot_print_fn = aot_module(model_split.submod_0, fw_compiler=compiler_fn,
     bw_compiler=compiler_fn)
-    # run_func(aot_print_fn, rand_input)
-    compile_splited(model_split, rand_input, tracing_mode="real")
+    run_func(aot_print_fn, rand_input)
+    compile_splited(model_split, rand_input)
 
     reproduce(42)
     out_dict = run_local_split_gm(model_split, rand_input)[0]
