@@ -1,15 +1,17 @@
 # torchrun --nproc_per_node 2 --master_port 26543 ./benchmark/bench_torch.py
 
 import logging
+import argparse
 import os
 import sys
 from functools import partial
+from contextlib import nullcontext
 
 import torch
 import torch.optim as optim
-import torch.utils._pytree as pytree
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
@@ -20,33 +22,26 @@ from benchmark.torch.model import GPT, GATLayer, wresnet50
 from benchmark.bench_case import GPTCase, ResNetCase, GATCase
 
 
-def get_gpt_case(device="cuda"):
-
+def get_gpt_case():
     case = GPTCase()
     model = GPT(depth=case.num_layers, dim=case.hidden_dim, num_heads=case.num_heads)
     data_in = torch.ones(case.batch_size, case.seq_size, case.hidden_dim)
-
-    model.device = torch.device(device)
-    return model.to(device=device), data_in.to(device=device)
+    return model, data_in
 
 
-def get_resnet_case(device="cuda"):
+def get_resnet_case():
     case = ResNetCase()
     model = wresnet50()
     data_in = torch.ones(case.batch_size, 3, 224, 224)
-
-    model.device = torch.device(device)
-    return model.to(device=device), data_in.to(device=device)
+    return model, data_in
 
 
-def get_gat_case(device="cuda"):
+def get_gat_case():
     case = GATCase()
     model = GATLayer(case.in_feature, case.out_feature)
     data_in = torch.ones(case.num_node, case.in_feature)
     adj = torch.ones(case.num_node, case.num_node)
-
-    model.device = torch.device(device)
-    return model.to(device=device), [data_in.to(device=device), adj.to(device=device)]
+    return model, [data_in, adj]
 
 
 def bench_ddp(model, data_in):
@@ -124,9 +119,6 @@ def bench_easydist(model, data_in):
     if not isinstance(data_in, list):
         data_in = [data_in]
 
-    if model.device == torch.device("meta"):
-        data_in = pytree.tree_map(to_meta, data_in)
-
     optimizer = optim.SGD(model.parameters(), lr=0.001)
 
     @easydist_compile(cuda_graph=False)
@@ -155,6 +147,18 @@ def bench_easydist(model, data_in):
 
 
 def main():
+
+    parser = argparse.ArgumentParser(description="Simple example of parallelize model.")
+
+    parser.add_argument("--model",
+                        type=str,
+                        default=None,
+                        choices=["gpt", "resnet", "gat"],
+                        required=True)
+    parser.add_argument("--fake-init", action="store_true")
+
+    args = parser.parse_args()
+
     # setup easydist
     mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda")
@@ -164,7 +168,16 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    model, data_in = get_gpt_case(device="cuda")
+    fake_mode = FakeTensorMode()
+    # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627
+    torch.ones(1).cuda()
+    with torch.device('cuda'), fake_mode if args.fake_init else nullcontext():
+        if args.model == "gpt":
+            model, data_in = get_gpt_case()
+        elif args.model == "resnet":
+            model, data_in = get_resnet_case()
+        elif args.model == "gat":
+            model, data_in = get_gat_case()
 
     bench_easydist(model, data_in)
 
