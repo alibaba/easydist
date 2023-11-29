@@ -48,6 +48,18 @@ CREATE_ATEN_OP = [
 ]
 
 
+view_op_map = {
+    torch.ops.aten.view.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten._unsafe_view.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten.reshape.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten.expand.default:
+    lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
+}
+
+
 def all_reduce_start(self: torch.Tensor, reduceOp: str, group: List[int], tag: str = ""):
     tag, rankset, group_size = _expand_group(group, tag)
     tensor = torch.ops.c10d_functional.all_reduce(self, reduceOp, tag, rankset,
@@ -388,17 +400,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 # some of this part from torch/distributed/_tensor/ops/view_ops.py
 def override_args(node, invars_strategy):
     device_mesh = get_device_mesh()
-
-    view_op_map = {
-        torch.ops.aten.view.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten._unsafe_view.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten.reshape.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten.expand.default:
-        lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
-    }
 
     if node.target in view_op_map:
         global_in_shape = node.args[0].meta['val'].shape

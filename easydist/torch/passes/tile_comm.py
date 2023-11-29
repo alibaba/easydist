@@ -24,7 +24,8 @@ import torch.utils._pytree as pytree
 
 from easydist import mdconfig
 from easydist.metashard.combination import CombinationFunc
-from .sharding import all_gather_start, all_reduce_start
+from easydist.torch.utils import EDInfo, EDNodeType, create_meta_from_node
+from .sharding import all_gather_start, all_reduce_start, all_gather_end, all_reduce_end, view_op_map
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class TileStrategy:
     tms_comm: float = 0.0
     tms_prev_comp: float = 0.0
     tms_post_comp: float = 0.0
-    tiled_comm_node: List[TiledNode] = None
+    tiled_comm_node: List[TiledNode] = field(default_factory=list)
     tiled_prev_node: List[TiledNode] = field(default_factory=list)
     tiled_post_node: List[TiledNode] = field(default_factory=list)
 
@@ -79,8 +80,7 @@ def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
     if node.target in [all_gather_start, all_reduce_start]:
         return tile_axis
 
-    for shard_dim_id, combine_func in node.ed_info.spmd_annotation[
-            'combination_ann'].items():
+    for shard_dim_id, combine_func in node.ed_info.spmd_annotation['combination_ann'].items():
         if combine_func.func == CombinationFunc.gather and combine_func.keywords[
                 'dim'] == tile_axis:
             arg_spmd = node.ed_info.spmd_annotation['sharding_ann'][arg_index]
@@ -91,6 +91,11 @@ def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
 
 
 def backward_tiled_node(tiled_node: TiledNode, arg: torch.fx.Node) -> TiledNode:
+
+    # return None for meet communication node
+    if arg.target in [all_gather_end, all_reduce_end]:
+        return None
+
     flatten_args, _ = pytree.tree_flatten(tiled_node.node.args)
     flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
     arg_index = flatten_tensor_args.index(arg)
@@ -168,8 +173,9 @@ class TileSolver:
             cost_matrix = self.get_cost_matrix(c_node, node_prev_strategy, node_post_strategy,
                                                cnode_axis_prev_strategy, cnode_axis_post_strategy)
             # add tile cost for each communication node
-            self.tile_cost += mip.xsum(mip_matrix[i][j] * cost_matrix[i][j] for i in range(shape_1)
-                                       for j in range(shape_2))
+            self.tile_cost = self.tile_cost + mip.xsum(mip_matrix[i][j] * cost_matrix[i][j]
+                                                       for i in range(shape_1)
+                                                       for j in range(shape_2))
 
             # add tile cost between communication node who share the same tile node
             for node in self.node:
@@ -211,8 +217,8 @@ class TileSolver:
         cost_matrix = self.get_edge_cost_matrix(self.node[c_node][cnode_edge],
                                                 self.node[node][node_edge])
 
-        self.tile_cost += mip.xsum(mip_matrix[i][j] * cost_matrix[i][j] for i in range(shape_1)
-                                   for j in range(shape_2))
+        self.tile_cost = self.tile_cost + mip.xsum(mip_matrix[i][j] * cost_matrix[i][j]
+                                                   for i in range(shape_1) for j in range(shape_2))
 
     def get_cost_matrix(self, node, node_prev_strategy, node_post_strategy,
                         cnode_axis_prev_strategy, cnode_axis_post_strategy):
@@ -310,6 +316,23 @@ class TileSolver:
                     i].node.name
 
         return final_strategy
+
+
+def override_view_op_args(tiled_node, node, tile_axis, num_tiles, tile_id):
+    out_shape = node.meta['val'].shape
+
+    tiled_out_shape = [i for i in out_shape]
+    tile_size = (tiled_out_shape[tile_axis] + num_tiles - 1) // num_tiles
+    
+    if tile_id == num_tiles - 1:
+        tiled_out_shape[tile_axis] = tiled_out_shape[tile_axis] - tile_size * (num_tiles - 1)
+    else:
+        tiled_out_shape[tile_axis] = tile_size
+
+    shape_argnum = 1
+    tiled_node.update_arg(shape_argnum, tiled_out_shape)
+
+    return tiled_node
 
 
 def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -428,10 +451,10 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
                                     # backward the tile axis to the previous computation node
                                     tiled_arg = backward_tiled_node(tiled_node, arg)
-
-                                    node_tile_strategy.append_prev_node(tiled_arg)
-                                    prev_node_queue.append(tiled_arg)
-                                    logger.debug(tiled_arg, node_tile_strategy.tms_prev_comp)
+                                    if tiled_arg is not None:
+                                        node_tile_strategy.append_prev_node(tiled_arg)
+                                        prev_node_queue.append(tiled_arg)
+                                        logger.debug(tiled_arg, node_tile_strategy.tms_prev_comp)
 
                             if node_tile_strategy.tms_prev_comp >= max_comp_needed:
                                 break
@@ -502,30 +525,55 @@ def tile_transform(fx_module: torch.fx.GraphModule,
                 flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
                 flatten_tiled_args = []
                 for arg_index, arg_node in enumerate(flatten_tensor_args):
-                    if arg_node.name in tiled_node_info:
+                    if arg_node.name in tiled_node_info and tile_axis == tiled_node_info[arg_node.name]['tile_axis']:
                         tiled_arg = tiled_node_info[arg_node.name]["tiled_output_node"]
                     else:
                         tiled_arg = []
-                        arg_tile_index = get_arg_tile_axis(node, to_tiled_node_info[node.name].tile_axis, arg_index)
+                        arg_tile_index = get_arg_tile_axis(node,
+                                                           to_tiled_node_info[node.name].tile_axis,
+                                                           arg_index)
                         if arg_tile_index is None:
                             tiled_arg = [arg_node] * num_tiles
                         else:
-                            chunk_arg_node = fx_module.graph.call_function(torch.ops.aten.chunk, args=(arg_node, num_tiles, arg_tile_index))
+                            chunk_arg_node = fx_module.graph.call_function(torch.ops.aten.chunk,
+                                                                           args=(arg_node,
+                                                                                 num_tiles,
+                                                                                 arg_tile_index))
+                            chunk_arg_node.ed_info = EDInfo()
+                            chunk_arg_node.ed_info.node_type = EDNodeType.COMPUTATION
+                            chunk_arg_node.meta = create_meta_from_node(chunk_arg_node)
                             for tile_id in range(num_tiles):
-                                tiled_arg.append(fx_module.graph.call_function(operator.getitem, args=(chunk_arg_node, tile_id)))
+                                tiled_arg.append(
+                                    fx_module.graph.call_function(operator.getitem,
+                                                                  args=(chunk_arg_node, tile_id)))
+                                tiled_arg[-1].ed_info = EDInfo()
+                                tiled_arg[-1].ed_info.node_type = EDNodeType.AUXILIARY
+                                tiled_arg[-1].meta = create_meta_from_node(tiled_arg[-1])
                     flatten_tiled_args.append(tiled_arg)
 
                 # split the node
                 tiled_nodes = []
                 for tile_id in range(num_tiles):
                     flatten_args, specs = pytree.tree_flatten(node.args)
-                    for arg_index, arg_node in enumerate(flatten_tensor_args):
-                        flatten_args[arg_index] = flatten_tiled_args[arg_index][tile_id]
+                    flatten_args_idx = 0
+                    for arg_index, arg_node in enumerate(flatten_args):
+                        if isinstance(arg_node, torch.fx.Node):
+                            flatten_args[arg_index] = flatten_tiled_args[flatten_args_idx][tile_id]
+                            flatten_args_idx += 1
                     tiled_args = pytree.tree_unflatten(flatten_args, specs)
                     tiled_node = fx_module.graph.call_function(node.target, args=tiled_args)
+                    if node.target in view_op_map:
+                        tiled_node = override_view_op_args(tiled_node, node, tile_axis, num_tiles, tile_id)
+                    tiled_node.ed_info = EDInfo()
+                    tiled_node.ed_info.node_type = EDNodeType.COMPUTATION
+                    tiled_node.meta = create_meta_from_node(tiled_node)
                     tiled_nodes.append(tiled_node)
 
-                concat_node = fx_module.graph.call_function(torch.ops.aten.concat, args=(tiled_nodes, tile_axis))
+                concat_node = fx_module.graph.call_function(torch.ops.aten.concat,
+                                                            args=(tiled_nodes, tile_axis))
+                concat_node.ed_info = EDInfo()
+                concat_node.ed_info.node_type = EDNodeType.COMPUTATION
+                concat_node.meta = create_meta_from_node(concat_node)
 
             with fx_module.graph.inserting_after(node):
                 node.replace_all_uses_with(concat_node)
@@ -534,7 +582,7 @@ def tile_transform(fx_module: torch.fx.GraphModule,
 
             tiled_node_info[node.name] = {
                 "tile_axis": tile_axis,
-                "num_tiles": tile_axis,
+                "num_tiles": num_tiles,
                 "tiled_output_node": tiled_nodes,
                 "concat_output_node": concat_node,
             }

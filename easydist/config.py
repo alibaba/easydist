@@ -68,6 +68,9 @@ coarsen_level = int(os.environ.get("COARSEN_LEVEL", "0"))
 master_addr = os.environ.get("MASTER_ADDR", "localhost")
 master_port = int(_get_env_or_raise("MASTER_PORT"))
 
+# Tile communication
+nvlink_processor_usage = 0.15
+
 # PyTorch
 
 comm_optimization = False

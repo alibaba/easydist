@@ -284,6 +284,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     if not mdconfig.use_dtensor:
         if mdconfig.comm_optimization is True:
+            sharded_graph = runtime_prof(sharded_graph)
             sharded_graph = comm_optimize(sharded_graph, shape_info, 'rcpsp', grouping=True, mem_restrain=False)
 
         # override pytorch dtensor propagate rules to optimize dispater behavior
