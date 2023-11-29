@@ -48,10 +48,10 @@ def get_shard_data(input_args, shard_size, dim_idx, haloinfo, chunk):
 
 
 def check_prompt(flat_input_args, prompt_annotation):
-    tensor_args = [i for i in flat_input_args if isinstance(flat_input_args, platform.Tensor)]
+    tensor_args = [i for i in flat_input_args if isinstance(i, platform.Tensor)]
     if len(tensor_args) == len(prompt_annotation):
         for idx in range(len(tensor_args)):
-            if tensor_args.ndim != len(prompt_annotation[idx]):
+            if tensor_args[idx].ndim != len(prompt_annotation[idx]):
                 return False
         return True
     return False

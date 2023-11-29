@@ -57,9 +57,10 @@ def inference_example(fake_init=True, cpu_init_helper=False):
         model = Foo()
         randn_input = torch.randn(1024, 1024)
 
-    # broadcast the parameter and input
-    model = broadcast_module(model)
-    torch.distributed.broadcast(randn_input, src=0)
+        if not fake_init:
+            # broadcast the parameter and input
+            model = broadcast_module(model)
+            torch.distributed.broadcast(randn_input, src=0)
 
     torch_out = inference_step.original_func(model, randn_input)
 
@@ -106,9 +107,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
         model = Foo(enable_checkpoint)
         randn_input = torch.randn(1024, 1024)
 
-        # broadcast the parameter and input
-        model = broadcast_module(model)
-        torch.distributed.broadcast(randn_input, src=0)
+        if not fake_init:
+            # broadcast the parameter and input
+            model = broadcast_module(model)
+            torch.distributed.broadcast(randn_input, src=0)
 
         opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
 

@@ -154,7 +154,7 @@ def sharded_tensor(tensor, strategy, mesh, materialize_fn):
         return tensor.redistribute(mesh, strategy)
 
     # materialize FakeTensor and distribute_tensor
-    if isinstance(tensor, torch._subclasses.fake_tensor.FakeTensor):
+    if isinstance(tensor, FakeTensor):
         tensor = materialize_fn(tensor)
     if tensor.is_meta:
         tensor = materialize_fn(tensor)
@@ -204,7 +204,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
             with torch.no_grad():
                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
                 if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = FakeTensorMode()
+                    mode = rgetattr(module, name).data.fake_mode
         with mode:
             opt.step()
             opt.zero_grad(True)
@@ -453,7 +453,7 @@ def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
 
     # release all cuda memory from module here
     # the param maintain in the local of compiled function.
-    if module is not None:
+    if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
 
     return EDCompiledFunc(sharded_graph)
