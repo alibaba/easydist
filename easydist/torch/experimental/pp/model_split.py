@@ -702,8 +702,8 @@ def compile_submod(module, args, kwargs):
             _indices_of_inps_to_detach.append(i)
 
     class CompiledForward:
+
         def __init__(self):
-            super().__init__()
             self.fw_gm = fw_module
             self.fw_metadata = fw_metadata
             self.named_params = named_params
@@ -721,14 +721,15 @@ def compile_submod(module, args, kwargs):
             self.saved_tensors = []
             self.symints = None
             self.non_differentiable = None
+            self.forward_out = None
 
         def __call__(self, *args, **kwargs):
             self.init_before_forward()
-            args = (named_params, named_buffers, *args)
+            args = (self.named_params, self.named_buffers, *args)
             in_flat, in_spec = pytree.tree_flatten((args, kwargs))
             out_flat = self.runtime_fw(*in_flat)
             return out_spec.unflatten(out_flat)
-        
+
         def forward(self, *deduped_flat_tensor_args):
             args = deduped_flat_tensor_args
             if self.fw_metadata.is_rng_op_functionalized:
@@ -829,36 +830,35 @@ def compile_submod(module, args, kwargs):
                 fw_outs[num_forward_returns:num_forward],
                 return_new_outs=False
             )
-            return tuple(raw_returns)
-
+            self.forward_out = tuple(raw_returns)
+            return self.forward_out
     compiled_fw = CompiledForward()
 
     class CompiledBackward:
         def __init__(self):
-            super().__init__()
             self.bw_gm = bw_module
             self.compiled_fw = compiled_fw
 
-        def __call__(self, *args, **kwargs):
-            return self.bw_gm(*args, **kwargs)
-        
-        def backward(self, *flat_args):
+        def __call__(self, *args, **kwargs): # something like partial(grad, inputs=state_dict_of_this_stage)
+            return self.backward(*args, **kwargs)
+
+        def backward(self, *tangent_inputs): # bw_module needs saved_sym_nodes + saved_values + tangent_inputs + bwd_seed_offset_inputs
             num_mutated_inps = self.compiled_fw.fw_metadata.num_mutated_inputs
             num_intermediate_bases = self.compiled_fw.fw_metadata.num_intermediate_bases
             expected_grad_outs = (
                 self.compiled_fw.fw_metadata.num_outputs + num_mutated_inps + num_intermediate_bases
             )
 
-            assert len(flat_args) == expected_grad_outs
+            assert len(tangent_inputs) == expected_grad_outs
             out_info = self.compiled_fw.fw_metadata.output_info
             if (
                 self.compiled_fw.fw_metadata.num_mutated_metadata_only_inputs > 0
                 or self.compiled_fw.fw_metadata.num_outputs_aliased > 0
             ):
                 inp_tangents, out_tangents, intermediate_base_tangents = (
-                    flat_args[0:num_mutated_inps],
-                    flat_args[num_mutated_inps:num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs],
-                    flat_args[num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs:],
+                    tangent_inputs[0:num_mutated_inps],
+                    tangent_inputs[num_mutated_inps:num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs],
+                    tangent_inputs[num_mutated_inps + self.compiled_fw.fw_metadata.num_outputs:],
                 )
                 # input_info contains info on *every* input,
                 # But in the backward(), we are only given grad outputs for every mutated input.
@@ -883,8 +883,8 @@ def compile_submod(module, args, kwargs):
             else:
                 # filter out non-tensor grad_outputs (aka due to ints being returned as outputs in the forward)
                 num_mutated_inps = self.compiled_fw.fw_metadata.num_mutated_inputs
-                mutated_inp_args = flat_args[:num_mutated_inps] if num_mutated_inps > 0 else []
-                user_tangents = flat_args[num_mutated_inps:]
+                mutated_inp_args = tangent_inputs[:num_mutated_inps] if num_mutated_inps > 0 else []
+                user_tangents = tangent_inputs[num_mutated_inps:]
                 assert len(user_tangents) == len(out_info)
                 filtered_user_tangents = [x for x, info in zip(user_tangents, out_info) if issubclass(info.raw_type, torch.Tensor)]
                 flat_bw_args = tuple(mutated_inp_args) + tuple(filtered_user_tangents)
@@ -929,7 +929,7 @@ class CompileInterpreter(torch.fx.Interpreter):
 
     def __init__(self, module, garbage_collect_values: bool = True):
         super().__init__(module, garbage_collect_values)
-        self.compiled = []
+        self.compiled = {}
 
     def run(self, *args, initial_env=None):
         self.compiled.clear()
@@ -940,7 +940,7 @@ class CompileInterpreter(torch.fx.Interpreter):
 
         submod = self.fetch_attr(target)
         compiled_fw, compiled_bw = compile_submod(submod, args, kwargs)
-        self.compiled.append([compiled_fw, compiled_bw])
+        self.compiled[target] = (compiled_fw, compiled_bw)
 
         return super().call_module(target, args, kwargs)
 
@@ -978,17 +978,44 @@ def split(
 
 
 def compile_splited(gm_split: fx.GraphModule, *args):
-
     # run through gm_split and compile each stage
     executor = CompileInterpreter(gm_split)
-    executor.run(*args)
+    params_real = {}
+    buffers_real = {}
+    for name, mod in gm_split.named_modules():
+        params_real[name] = dict(mod.named_parameters())
+        buffers_real[name] = dict(mod.named_buffers())
+        
+    fake_params = dict(gm_split.named_parameters())
+    fake_buffers = dict(gm_split.named_buffers())
+    fake_mode = detect_fake_mode(args)
+    if not fake_mode: fake_mode = FakeTensorMode()
+    def wrap_fake(x):
+        if not isinstance(x, torch.Tensor):
+            return x
+        elif isinstance(x, FakeTensor):
+            return x
+        else:
+            return fake_mode.from_tensor(x)
 
-    for i, (compiled_fw, _) in enumerate(executor.compiled):
-        delattr(gm_split, f"submod_{i}")
-        setattr(gm_split, f"submod_{i}", compiled_fw)
+    fake_params, fake_buffers, fake_args = pytree.tree_map(lambda x: wrap_fake(x), (fake_params, fake_buffers, args))
 
-    for i, (_, compiled_bw) in enumerate(reversed(executor.compiled)):
-        setattr(gm_split, f"submod_bw_{i}", compiled_bw)
+    with stateless._reparametrize_module(
+                cast(torch.nn.Module, gm_split), {
+                    **fake_params,
+                    **fake_buffers
+                }, tie_weights=True):
+            executor.run(*fake_args)
+
+    for name, (compiled_fw, _) in executor.compiled.items():
+        delattr(gm_split, name)
+        compiled_fw.named_params = params_real[name]
+        compiled_fw.named_buffers = buffers_real[name]
+        setattr(gm_split, name, compiled_fw)
+
+    for name, (_, compiled_bw) in reversed(executor.compiled.items()):
+        setattr(gm_split, name + "_bw", compiled_bw)
+
     return gm_split
 
 

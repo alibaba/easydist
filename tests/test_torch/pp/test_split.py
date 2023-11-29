@@ -105,16 +105,28 @@ def test_split(model_class, input_size):
     param_torch = [t for t in model.parameters()]
     grad_torch = [t.grad for t in model.parameters()]
 
-    split_policy = split_into_equal_size(2)
+    split_policy = split_into_equal_size(1)
     model_split = split(model_copy, split_policy=split_policy)
     aot_print_fn = aot_module(model_split.submod_0, fw_compiler=compiler_fn,
     bw_compiler=compiler_fn)
-    run_func(aot_print_fn, rand_input)
+    # run_func(aot_print_fn, rand_input)
     compile_splited(model_split, rand_input)
 
     reproduce(42)
     out_split = model_split(rand_input)
     loss_split = loss_fn(out_split)
+
+    all_states = {
+        **model_split.submod_0.named_params,
+        **model_split.submod_0.named_buffers,
+    }
+    grad = torch.autograd.grad(
+                            loss_split,
+                            model_split.submod_0.forward_out,
+                            # grad_outputs=needed_tangents,
+                            allow_unused=True,
+                        )
+    tmp = model_split.submod_0_bw(grad)
 
     buffer_split = [t for t in model_split.buffers()]
     param_split = [t for t in model_split.parameters()]
