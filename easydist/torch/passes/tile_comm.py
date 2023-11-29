@@ -15,6 +15,7 @@
 import logging
 from dataclasses import dataclass, field
 from typing import List, Dict
+import operator
 
 import mip
 import rich
@@ -73,22 +74,30 @@ def forward_tiled_node(tiled_node: TiledNode, user: torch.fx.Node) -> TiledNode:
     return None
 
 
+def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
+
+    if node.target in [all_gather_start, all_reduce_start]:
+        return tile_axis
+
+    for shard_dim_id, combine_func in node.ed_info.spmd_annotation[
+            'combination_ann'].items():
+        if combine_func.func == CombinationFunc.gather and combine_func.keywords[
+                'dim'] == tile_axis:
+            arg_spmd = node.ed_info.spmd_annotation['sharding_ann'][arg_index]
+            arg_spmd_shard_dim_id = [i.shard_dim_id for i in arg_spmd]
+            if shard_dim_id in arg_spmd_shard_dim_id:
+                return arg_spmd_shard_dim_id.index(shard_dim_id)
+    return None
+
+
 def backward_tiled_node(tiled_node: TiledNode, arg: torch.fx.Node) -> TiledNode:
-
-    if tiled_node.node.target in [all_gather_start, all_reduce_start]:
-        return TiledNode(arg, tiled_node.tile_axis, tiled_node.num_tiles)
-
     flatten_args, _ = pytree.tree_flatten(tiled_node.node.args)
     flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
     arg_index = flatten_tensor_args.index(arg)
 
-    for shard_dim_id, combine_func in tiled_node.node.ed_info.spmd_annotation[
-            'combination_ann'].items():
-        if combine_func.func == CombinationFunc.gather and combine_func.keywords[
-                'dim'] == tiled_node.tile_axis:
-            arg_spmd = tiled_node.node.ed_info.spmd_annotation['sharding_ann'][arg_index]
-            arg_tile_axis = [i.shard_dim_id for i in arg_spmd].index(shard_dim_id)
-            return TiledNode(arg, arg_tile_axis, tiled_node.num_tiles)
+    tile_axis = get_arg_tile_axis(tiled_node.node, tiled_node.tile_axis, arg_index)
+    if tile_axis is not None:
+        return TiledNode(arg, tile_axis, tiled_node.num_tiles)
 
     return None
 
@@ -166,13 +175,17 @@ class TileSolver:
             for node in self.node:
                 if node == c_node:
                     continue
-                if any(i in self.node[node]['prev_tile_space'] for i in self.node[c_node]['prev_tile_space']):
+                if any(i in self.node[node]['prev_tile_space']
+                       for i in self.node[c_node]['prev_tile_space']):
                     self.add_edge(c_node, node, 'prev', 'prev')
-                if any(i in self.node[node]['prev_tile_space'] for i in self.node[c_node]['post_tile_space']):
+                if any(i in self.node[node]['prev_tile_space']
+                       for i in self.node[c_node]['post_tile_space']):
                     self.add_edge(c_node, node, 'post', 'prev')
-                if any(i in self.node[node]['post_tile_space'] for i in self.node[c_node]['prev_tile_space']):
+                if any(i in self.node[node]['post_tile_space']
+                       for i in self.node[c_node]['prev_tile_space']):
                     self.add_edge(c_node, node, 'prev', 'post')
-                if any(i in self.node[node]['post_tile_space'] for i in self.node[c_node]['post_tile_space']):
+                if any(i in self.node[node]['post_tile_space']
+                       for i in self.node[c_node]['post_tile_space']):
                     self.add_edge(c_node, node, 'post', 'post')
 
         self.m.objective = mip.minimize(self.tile_cost)
@@ -187,7 +200,7 @@ class TileSolver:
         node_mip_var = self.node[node][node_mip_var_key]
 
         mip_matrix = [[self.m.add_var(var_type=mip.BINARY) for _ in range(shape_2)]
-                       for _ in range(shape_1)]
+                      for _ in range(shape_1)]
 
         for i in range(shape_1):
             for j in range(shape_2):
@@ -195,10 +208,11 @@ class TileSolver:
                 self.m += mip_matrix[i][j] <= node_mip_var[j]
                 self.m += mip_matrix[i][j] >= c_node_mip_var[i] + node_mip_var[j] - 1
 
-        cost_matrix = self.get_edge_cost_matrix(self.node[c_node][cnode_edge], self.node[node][node_edge])
+        cost_matrix = self.get_edge_cost_matrix(self.node[c_node][cnode_edge],
+                                                self.node[node][node_edge])
 
         self.tile_cost += mip.xsum(mip_matrix[i][j] * cost_matrix[i][j] for i in range(shape_1)
-                                       for j in range(shape_2))
+                                   for j in range(shape_2))
 
     def get_cost_matrix(self, node, node_prev_strategy, node_post_strategy,
                         cnode_axis_prev_strategy, cnode_axis_post_strategy):
@@ -236,9 +250,13 @@ class TileSolver:
                         if cnode_tiled_node.node.name == node_tiled_node.node.name:
                             num_tiles = cnode_tiled_node.num_tiles
                             if cnode_tiled_node.tile_axis == node_tiled_node.tile_axis:
-                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (num_tiles - 2) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
+                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (
+                                    num_tiles -
+                                    2) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
                             else:
-                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (num_tiles - 1) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
+                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (
+                                    num_tiles -
+                                    1) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
 
         return cost_matrix
 
@@ -251,10 +269,45 @@ class TileSolver:
         final_strategy = {}
 
         for c_node in self.node:
-            final_strategy[c_node] = TileStrategy(
-                num_tiles=2,
-                tms_comm=c_node.ed_info.runtime_ms,
-                tiled_comm_node=self.node[c_node]['tiled_comm_node'])
+
+            prev_strtg_idx = [mip_var.x for mip_var in self.node[c_node]['prev_mip_var']].index(1)
+            post_strtg_idx = [mip_var.x for mip_var in self.node[c_node]['post_mip_var']].index(1)
+
+            prev_tile_node = self.node[c_node]['prev'][prev_strtg_idx]
+            post_tile_node = self.node[c_node]['post'][post_strtg_idx]
+
+            if len(prev_tile_node + post_tile_node) == 0:
+                continue
+
+            tile_axis = (prev_tile_node + post_tile_node)[0].tile_axis
+            num_tiles = (prev_tile_node + post_tile_node)[0].num_tiles
+
+            c_end_node = list(c_node.users.keys())[0]
+            tiled_comm_node = [
+                TiledNode(c_node, tile_axis, num_tiles),
+                TiledNode(c_end_node, tile_axis, num_tiles)
+            ]
+            final_strategy[c_node.name] = TileStrategy(num_tiles=2,
+                                                       tms_comm=c_node.ed_info.runtime_ms,
+                                                       tiled_comm_node=tiled_comm_node)
+
+            for tiled_node in prev_tile_node:
+                final_strategy[c_node.name].append_prev_node(tiled_node)
+
+            for tiled_node in post_tile_node:
+                final_strategy[c_node.name].append_post_node(tiled_node)
+
+        # for broadcast, cannot contain meta tensor
+        for key in final_strategy:
+            for i in range(len(final_strategy[key].tiled_comm_node)):
+                final_strategy[key].tiled_comm_node[i].node = final_strategy[key].tiled_comm_node[
+                    i].node.name
+            for i in range(len(final_strategy[key].tiled_prev_node)):
+                final_strategy[key].tiled_prev_node[i].node = final_strategy[key].tiled_prev_node[
+                    i].node.name
+            for i in range(len(final_strategy[key].tiled_post_node)):
+                final_strategy[key].tiled_post_node[i].node = final_strategy[key].tiled_post_node[
+                    i].node.name
 
         return final_strategy
 
@@ -294,6 +347,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         return post_nodes
 
     # solve tile strategy on the rank 0
+    final_strategy = None
     if torch.distributed.get_rank() == 0:
         for node in fx_module.graph.nodes:
             if node.op == 'call_function':
@@ -301,8 +355,6 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                     communication_nodes.append(node)
                 else:
                     computation_nodes.append(node)
-
-        fx_module.print_readable()
 
         # Step 2: find the communication nodes that are critical
         critical_communication = {}
@@ -379,7 +431,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
                                     node_tile_strategy.append_prev_node(tiled_arg)
                                     prev_node_queue.append(tiled_arg)
-                                    print(tiled_arg, node_tile_strategy.tms_prev_comp)
+                                    logger.debug(tiled_arg, node_tile_strategy.tms_prev_comp)
 
                             if node_tile_strategy.tms_prev_comp >= max_comp_needed:
                                 break
@@ -400,7 +452,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                                 if tiled_user is not None:
                                     node_tile_strategy.append_post_node(tiled_user)
                                     post_node_queue.append(tiled_user)
-                                    print(tiled_user, node_tile_strategy.tms_post_comp)
+                                    logger.debug(tiled_user, node_tile_strategy.tms_post_comp)
 
                             if node_tile_strategy.tms_post_comp >= max_comp_needed:
                                 break
@@ -409,16 +461,90 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                         all_tile_strategies[c_node] = []
                     all_tile_strategies[c_node].append(node_tile_strategy)
 
-        rich.print(all_tile_strategies)
         # Step 4: solve the tile strategy with mip
-        final_ = TileSolver(all_tile_strategies).solve()
-
-        import pdb
-        pdb.set_trace()
+        final_strategy = TileSolver(all_tile_strategies).solve()
 
     # broadcast the tile strategy to all the ranks
-    # Step 5: tile the critical communication nodes and the computation context
-
+    broadcast_result = [final_strategy]
+    torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
+    final_strategy = broadcast_result[0]
     torch.distributed.barrier()
+
+    if mdconfig.log_level <= logging.DEBUG:
+        rich.print(final_strategy)
+
+    # Step 5: tile the critical communication nodes and the computation context
+    fx_module = tile_transform(fx_module, final_strategy)
+
+    return fx_module
+
+
+def tile_transform(fx_module: torch.fx.GraphModule,
+                   final_strategy: Dict[str, TileStrategy]) -> torch.fx.GraphModule:
+
+    to_tiled_node_info = {}
+    tiled_node_info = {}
+
+    for node_name in final_strategy:
+        tiled_nodes = final_strategy[node_name].tiled_prev_node + final_strategy[
+            node_name].tiled_comm_node + final_strategy[node_name].tiled_post_node
+        for t_node in tiled_nodes:
+            if t_node.node not in to_tiled_node_info:
+                to_tiled_node_info[t_node.node] = t_node
+
+    for node in fx_module.graph.nodes:
+        if node.name in to_tiled_node_info:
+            num_tiles = to_tiled_node_info[node.name].num_tiles
+            tile_axis = to_tiled_node_info[node.name].tile_axis
+
+            with fx_module.graph.inserting_before(node):
+                flatten_args, _ = pytree.tree_flatten(node.args)
+                flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
+                flatten_tiled_args = []
+                for arg_index, arg_node in enumerate(flatten_tensor_args):
+                    if arg_node.name in tiled_node_info:
+                        tiled_arg = tiled_node_info[arg_node.name]["tiled_output_node"]
+                    else:
+                        tiled_arg = []
+                        arg_tile_index = get_arg_tile_axis(node, to_tiled_node_info[node.name].tile_axis, arg_index)
+                        if arg_tile_index is None:
+                            tiled_arg = [arg_node] * num_tiles
+                        else:
+                            chunk_arg_node = fx_module.graph.call_function(torch.ops.aten.chunk, args=(arg_node, num_tiles, arg_tile_index))
+                            for tile_id in range(num_tiles):
+                                tiled_arg.append(fx_module.graph.call_function(operator.getitem, args=(chunk_arg_node, tile_id)))
+                    flatten_tiled_args.append(tiled_arg)
+
+                # split the node
+                tiled_nodes = []
+                for tile_id in range(num_tiles):
+                    flatten_args, specs = pytree.tree_flatten(node.args)
+                    for arg_index, arg_node in enumerate(flatten_tensor_args):
+                        flatten_args[arg_index] = flatten_tiled_args[arg_index][tile_id]
+                    tiled_args = pytree.tree_unflatten(flatten_args, specs)
+                    tiled_node = fx_module.graph.call_function(node.target, args=tiled_args)
+                    tiled_nodes.append(tiled_node)
+
+                concat_node = fx_module.graph.call_function(torch.ops.aten.concat, args=(tiled_nodes, tile_axis))
+
+            with fx_module.graph.inserting_after(node):
+                node.replace_all_uses_with(concat_node)
+
+            # get tiled_output_node and concat_output_node
+
+            tiled_node_info[node.name] = {
+                "tile_axis": tile_axis,
+                "num_tiles": tile_axis,
+                "tiled_output_node": tiled_nodes,
+                "concat_output_node": concat_node,
+            }
+
+            tiled_node_info[concat_node.name] = tiled_node_info[node.name]
+
+    fx_module.graph.eliminate_dead_code()
+    fx_module.recompile()
+
+    if mdconfig.log_level <= logging.DEBUG:
+        fx_module.print_readable()
 
     return fx_module
