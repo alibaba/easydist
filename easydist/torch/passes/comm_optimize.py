@@ -21,6 +21,7 @@ import torch
 import torch.utils._pytree as pytree
 from torch.fx.node import _get_qualified_name
 
+import easydist
 import easydist.config as mdconfig
 import easydist.torch.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
@@ -126,7 +127,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
         else:
             logger.info(f'[RCPSP]: Scheduling without Memory Constraint.')
         start_t = time.perf_counter()
-        raw_sche = rcpsp.rcpsp(task_data, available_resources, 
+        raw_sche = rcpsp.rcpsp(task_data, available_resources,
                                resource_dep_mask, mdconfig.rcpsp_method)
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
@@ -231,12 +232,12 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
     '''
     This function performs grouping on a fx graph
 
-    Scan reversely searching for small comms and grouped current selected 
+    Scan reversely searching for small comms and grouped current selected
     nodes when either dependencies or capacity limit is to be violated.
-    
+
     Args:
     fx_module: fx graph to be optimized
-    cap_limit: 
+    cap_limit:
     rg_limit: search range
     shape_info: generated shapes info of each node (holes remain)
 

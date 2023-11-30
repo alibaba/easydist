@@ -25,7 +25,8 @@ import torch.utils._pytree as pytree
 from easydist import mdconfig
 from easydist.metashard.combination import CombinationFunc
 from easydist.torch.utils import EDInfo, EDNodeType, create_meta_from_node
-from .sharding import all_gather_start, all_reduce_start, all_gather_end, all_reduce_end, view_op_map
+from .sharding import (all_gather_start, all_reduce_start, all_gather_end, all_reduce_end,
+                       view_op_map, scatter_wrapper)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,14 @@ class TileStrategy:
 
 
 def forward_tiled_node(tiled_node: TiledNode, user: torch.fx.Node) -> TiledNode:
+
+    if user.target == scatter_wrapper:
+        scatter_dim = user.args[2]
+        if tiled_node.tile_axis != scatter_dim:
+            return TiledNode(user, tiled_node.tile_axis, tiled_node.num_tiles)
+        else:
+            return None
+
     flatten_args, _ = pytree.tree_flatten(user.args)
     flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
 
@@ -69,6 +78,9 @@ def forward_tiled_node(tiled_node: TiledNode, user: torch.fx.Node) -> TiledNode:
     # is not NoShardDim
     if shard_dim.shard_dim_id != 0:
         out_spmd = user.ed_info.spmd_annotation['combination_ann'][shard_dim.shard_dim_id]
+        # (TODO) support forward through multi-output operation
+        if isinstance(out_spmd, list):
+            return None
         if out_spmd.func == CombinationFunc.gather:
             return TiledNode(user, out_spmd.keywords['dim'], tiled_node.num_tiles)
 
@@ -95,6 +107,13 @@ def backward_tiled_node(tiled_node: TiledNode, arg: torch.fx.Node) -> TiledNode:
     # return None for meet communication node
     if arg.target in [all_gather_end, all_reduce_end]:
         return None
+
+    if tiled_node.node.target == scatter_wrapper:
+        scatter_dim = tiled_node.node.args[2]
+        if tiled_node.tile_axis != scatter_dim:
+            return TiledNode(arg, tiled_node.tile_axis, tiled_node.num_tiles)
+        else:
+            return None
 
     flatten_args, _ = pytree.tree_flatten(tiled_node.node.args)
     flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
@@ -223,8 +242,12 @@ class TileSolver:
     def get_cost_matrix(self, node, node_prev_strategy, node_post_strategy,
                         cnode_axis_prev_strategy, cnode_axis_post_strategy):
         runtime_ms = node.ed_info.runtime_ms
-        cost_matrix = [[runtime_ms for _ in range(len(node_post_strategy))]
-                       for _ in range(len(node_prev_strategy))]
+        cost_matrix_1 = [[runtime_ms for _ in range(len(node_post_strategy))]
+                         for _ in range(len(node_prev_strategy))]
+        cost_matrix_2 = [[runtime_ms for _ in range(len(node_post_strategy))]
+                         for _ in range(len(node_prev_strategy))]
+        cost_matrix_3 = [[runtime_ms for _ in range(len(node_post_strategy))]
+                         for _ in range(len(node_prev_strategy))]
         for i in range(len(node_prev_strategy)):
             for j in range(len(node_post_strategy)):
                 # reduce the cost when only tile prev or post, or same tile axis for prev/post
@@ -233,18 +256,23 @@ class TileSolver:
                 ) == 0 or cnode_axis_prev_strategy[i] == cnode_axis_post_strategy[j]:
                     for tiled_node in node_prev_strategy[i]:
                         num_tiles = tiled_node.num_tiles
-                        cost_matrix[i][j] -= (1 + mdconfig.nvlink_processor_usage) * 2 * (
+                        cost_matrix_1[i][j] -= (1 + mdconfig.nvlink_processor_usage) * 2 * (
                             num_tiles - 1) / num_tiles * tiled_node.node.ed_info.runtime_ms
+                        cost_matrix_2[i][j] -= (1 + mdconfig.nvlink_processor_usage) * (
+                            num_tiles - 1) * tiled_node.node.ed_info.runtime_ms
                     for tiled_node in node_post_strategy[j]:
                         num_tiles = tiled_node.num_tiles
-                        cost_matrix[i][j] -= (1 + mdconfig.nvlink_processor_usage) * 2 * (
+                        cost_matrix_1[i][j] -= (1 + mdconfig.nvlink_processor_usage) * 2 * (
                             num_tiles - 1) / num_tiles * tiled_node.node.ed_info.runtime_ms
+                        cost_matrix_3[i][j] -= (1 + mdconfig.nvlink_processor_usage) * (
+                            num_tiles - 1) * tiled_node.node.ed_info.runtime_ms
 
         for i in range(len(node_prev_strategy)):
             for j in range(len(node_post_strategy)):
-                cost_matrix[i][j] = max(cost_matrix[i][j], 0)
+                cost_matrix_1[i][j] = max(cost_matrix_1[i][j], cost_matrix_2[i][j],
+                                          cost_matrix_3[i][j], 0)
 
-        return cost_matrix
+        return cost_matrix_1
 
     def get_edge_cost_matrix(self, cnode_edge, node_edge):
         cost_matrix = [[0 for _ in range(len(node_edge))] for _ in range(len(cnode_edge))]
@@ -256,11 +284,11 @@ class TileSolver:
                         if cnode_tiled_node.node.name == node_tiled_node.node.name:
                             num_tiles = cnode_tiled_node.num_tiles
                             if cnode_tiled_node.tile_axis == node_tiled_node.tile_axis:
-                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (
+                                cost_matrix[i][j] += (mdconfig.nvlink_processor_usage + 1) * (
                                     num_tiles -
                                     2) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
                             else:
-                                cost_matrix[i][j] -= (mdconfig.nvlink_processor_usage + 1) * (
+                                cost_matrix[i][j] += (mdconfig.nvlink_processor_usage + 1) * (
                                     num_tiles -
                                     1) / num_tiles * cnode_tiled_node.node.ed_info.runtime_ms
 
@@ -323,7 +351,7 @@ def override_view_op_args(tiled_node, node, tile_axis, num_tiles, tile_id):
 
     tiled_out_shape = [i for i in out_shape]
     tile_size = (tiled_out_shape[tile_axis] + num_tiles - 1) // num_tiles
-    
+
     if tile_id == num_tiles - 1:
         tiled_out_shape[tile_axis] = tiled_out_shape[tile_axis] - tile_size * (num_tiles - 1)
     else:
@@ -370,7 +398,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         return post_nodes
 
     # solve tile strategy on the rank 0
-    final_strategy = None
+    final_strategy = {}
     if torch.distributed.get_rank() == 0:
         for node in fx_module.graph.nodes:
             if node.op == 'call_function':
@@ -394,7 +422,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
                 node_info = f"[{node.name}] pre={len(prev_nodes)} post={len(post_nodes)} indpd={len(independent_nodes)}"
 
-                logger.info(
+                logger.debug(
                     f"{node_info} runtime={node.ed_info.runtime_ms:.4f}/{independent_nodes_runtime:.4f}"
                 )
 
@@ -485,7 +513,8 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                     all_tile_strategies[c_node].append(node_tile_strategy)
 
         # Step 4: solve the tile strategy with mip
-        final_strategy = TileSolver(all_tile_strategies).solve()
+        if len(all_tile_strategies) > 0:
+            final_strategy = TileSolver(all_tile_strategies).solve()
 
     # broadcast the tile strategy to all the ranks
     broadcast_result = [final_strategy]
@@ -525,7 +554,8 @@ def tile_transform(fx_module: torch.fx.GraphModule,
                 flatten_tensor_args = [i for i in flatten_args if isinstance(i, torch.fx.Node)]
                 flatten_tiled_args = []
                 for arg_index, arg_node in enumerate(flatten_tensor_args):
-                    if arg_node.name in tiled_node_info and tile_axis == tiled_node_info[arg_node.name]['tile_axis']:
+                    if arg_node.name in tiled_node_info and tile_axis == tiled_node_info[
+                            arg_node.name]['tile_axis']:
                         tiled_arg = tiled_node_info[arg_node.name]["tiled_output_node"]
                     else:
                         tiled_arg = []
@@ -563,7 +593,8 @@ def tile_transform(fx_module: torch.fx.GraphModule,
                     tiled_args = pytree.tree_unflatten(flatten_args, specs)
                     tiled_node = fx_module.graph.call_function(node.target, args=tiled_args)
                     if node.target in view_op_map:
-                        tiled_node = override_view_op_args(tiled_node, node, tile_axis, num_tiles, tile_id)
+                        tiled_node = override_view_op_args(tiled_node, node, tile_axis, num_tiles,
+                                                           tile_id)
                     tiled_node.ed_info = EDInfo()
                     tiled_node.ed_info.node_type = EDNodeType.COMPUTATION
                     tiled_node.meta = create_meta_from_node(tiled_node)

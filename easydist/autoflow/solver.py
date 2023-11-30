@@ -479,8 +479,8 @@ class AutoFlowSolver:
                 mip_var = edge["mip_var"][idx]
                 shape_1 = len(mip_var)
                 shape_2 = len(mip_var[0])
-                self.m += mip.xsum(mip_var[i][j] for i in range(shape_1)
-                                   for j in range(shape_2)) == 1
+                # self.m += mip.xsum(mip_var[i][j] for i in range(shape_1)
+                #                    for j in range(shape_2)) == 1
 
                 up_node_key = edge["up_node"]
                 up_node_mip_var = self.nodes[up_node_key]["mip_var"]

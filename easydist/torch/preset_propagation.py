@@ -82,6 +82,25 @@ def meta_spmd_view(args, kwargs):
     return view_ann['sharding_ann'], view_ann['combination_ann']
 
 
+@register_meta_spmd(aten.expand.default)
+def meta_spmd_expand(args, kwargs):
+    input_shape = args[0].shape
+    output_shape = list(args[1])
+    world_size = device_mesh_world_size()
+
+    sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(input_shape)])
+    shard_idx = 1
+    combine_ann = {}
+
+    for idx, shape in enumerate(input_shape):
+        if max(world_size, 2) <= shape:
+            sharding_ann[0][idx] = ShardDim(shard_idx)
+            combine_ann[shard_idx] = functools.partial(CombinationFunc.gather, dim=idx)
+            shard_idx += 1
+
+    return sharding_ann, combine_ann
+
+
 @register_meta_spmd(aten._reshape_alias.default)
 def meta_spmd_reshape(args, kwargs):
     input_shape = args[0].shape
@@ -287,6 +306,26 @@ def meta_empty_like(args, kwargs):
     for idx, shape in enumerate(tensor_shape):
         if world_size <= shape:
             sharding_ann[0][idx] = ShardDim(shard_idx)
+            combine_ann[shard_idx] = functools.partial(CombinationFunc.gather, dim=idx)
+            shard_idx += 1
+
+    return sharding_ann, combine_ann
+
+
+@register_meta_spmd(aten.add_.Tensor)
+def meta_empty_like(args, kwargs):
+    tensor_shape = args[0].shape
+
+    world_size = device_mesh_world_size()
+
+    sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim() for _ in range(len(tensor_shape))]
+                                    for _ in range(2)])
+    shard_idx = 1
+    combine_ann = {}
+    for idx, shape in enumerate(tensor_shape):
+        if world_size <= shape:
+            sharding_ann[0][idx] = ShardDim(shard_idx)
+            sharding_ann[1][idx] = ShardDim(shard_idx)
             combine_ann[shard_idx] = functools.partial(CombinationFunc.gather, dim=idx)
             shard_idx += 1
 
