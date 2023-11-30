@@ -721,7 +721,7 @@ def compile_submod(module, args, kwargs):
             self.saved_tensors = []
             self.symints = None
             self.non_differentiable = None
-            self.forward_out = None
+            self.raw_returns = None
 
         def __call__(self, *args, **kwargs):
             self.init_before_forward()
@@ -830,8 +830,8 @@ def compile_submod(module, args, kwargs):
                 fw_outs[num_forward_returns:num_forward],
                 return_new_outs=False
             )
-            self.forward_out = tuple(raw_returns)
-            return self.forward_out
+            self.raw_returns = tuple(raw_returns)
+            return self.raw_returns
     compiled_fw = CompiledForward()
 
     class CompiledBackward:
