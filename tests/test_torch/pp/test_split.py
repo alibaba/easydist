@@ -6,9 +6,8 @@ import numpy as np
 import torch
 from torchvision.models import alexnet, resnet18, vgg19
 
-from easydist.torch.experimental.pp.loss_wrapper import LossWrapper
-from easydist.torch.experimental.pp.model_split import (compile_splited, run_local_split_gm, split)
-from easydist.torch.experimental.pp.split_policy import split_into_equal_size
+from easydist.torch.experimental.pp.IR import (compile_symbolic_splited, symbolic_split)
+from easydist.torch.experimental.pp.split_policies import split_into_equal_size
 
 from functorch.compile import aot_function, aot_module, \
     make_boxed_func, ts_compile
@@ -64,18 +63,6 @@ def compiler_fn(fx_module: torch.fx.GraphModule, _):
     print(fx_module.code)
     return make_boxed_func(fx_module.forward)
 
-class OutputLossWrapper(LossWrapper):
-
-    def __init__(self, module):
-        super().__init__(module, None)
-
-    def forward(self, input):
-        output = self.module(input)
-        loss = loss_fn(output)
-        # Here we use a dict with the "loss" keyword so that PiPPy can automatically find the loss field when
-        # generating the backward pass
-        return {"output": output, "loss": loss}
-
 
 class Foo(torch.nn.Module):
 
@@ -118,8 +105,8 @@ def test_split(model_class, input_size):
     grad_torch = [t.grad for t in model.parameters()]
 
     split_policy = split_into_equal_size(1)
-    model_split = split(model_copy, split_policy=split_policy)
-    compile_splited(model_split, rand_input)
+    model_split, _ = symbolic_split(model_copy, split_policy=split_policy)
+    compile_symbolic_splited(model_split, rand_input)
 
     reproduce(42)
     out_split = model_split(rand_input)

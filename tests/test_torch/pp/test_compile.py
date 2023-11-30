@@ -10,8 +10,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
 from torch.utils.checkpoint import checkpoint
-from easydist.torch.experimental.pp.model_split import (compile_splited, run_local_split_gm, split)
-from easydist.torch.experimental.pp.split_policy import split_into_equal_size
+from easydist.torch.experimental.pp.IR import (compile_symbolic_splited, run_local_split_gm, symbolic_split)
+from easydist.torch.experimental.pp.split_policies import split_into_equal_size
 from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
 
 from easydist import easydist_setup, mdconfig
@@ -42,9 +42,9 @@ def test_compile(model_class, input_size):
     rand_input = torch.rand(input_size).cuda()
 
     split_policy = split_into_equal_size(2)
-    model_split = split(model, split_policy=split_policy)
+    model_split = symbolic_split(model, split_policy=split_policy)
 
-    compile_splited(model_split, rand_input)
+    compile_symbolic_splited(model_split, rand_input)
 
     from easydist.torch.compiler import easydist_shard
     traced_graph = model_split.submod_0.fw_gm

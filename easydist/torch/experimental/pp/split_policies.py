@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Tuple
 
 import torch
 
-from easydist.torch.experimental.pp.model_split import pipe_split
+from easydist.torch.experimental.pp.IR import pipe_split
 
 
 def split_into_equal_size(
