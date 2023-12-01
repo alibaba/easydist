@@ -492,7 +492,7 @@ def compile_submod(module, args, kwargs):
         def __call__(self, *args, **kwargs):
             self.init_before_forward()
             args = (self.named_params, self.named_buffers, *args)
-            in_flat, in_spec = pytree.tree_flatten((args, kwargs))
+            in_flat, _ = pytree.tree_flatten((args, kwargs))
             out_flat = self.runtime_fw(*in_flat)
             return out_spec.unflatten(out_flat)
 
@@ -709,34 +709,6 @@ class CompileInterpreter(torch.fx.Interpreter):
 
         return super().call_module(target, args, kwargs)
 
-def compile_symbolic_splited(gm_split: fx.GraphModule, *args):
-    assert gm_split.training # TODO @botbw: always compile forward and backward for now
-
-    params_by_submod = {}
-    buffers_by_submod = {}
-    for name, mod in gm_split.named_modules():
-        params_by_submod[name] = dict(mod.named_parameters())
-        buffers_by_submod[name] = dict(mod.named_buffers())
-
-    fake_params_flatten = dict(gm_split.named_parameters())
-    fake_buffers_flatten = dict(gm_split.named_buffers())
-    fake_mode = detect_fake_mode(args)
-    if not fake_mode: fake_mode = FakeTensorMode()
-    def wrap_fake(x):
-        if not isinstance(x, torch.Tensor):
-            return x
-        elif isinstance(x, FakeTensor):
-            return x
-        else:
-            return fake_mode.from_tensor(x)
-    fake_params_flatten, fake_buffers_flatten, fake_args = pytree.tree_map(lambda x: wrap_fake(x), (fake_params_flatten, fake_buffers_flatten, args))
-
-    compiled_submods = compile_with_fake(gm_split, fake_params_flatten, fake_buffers_flatten, fake_args)
-
-    fw_gm = build_fw_gm(gm_split, compiled_submods)
-
-    return fw_gm
-
 def compile_with_fake(gm_split, fake_params_flatten, fake_buffers_flatten, fake_args):
     executor = CompileInterpreter(gm_split)
     with stateless._reparametrize_module(
@@ -757,7 +729,7 @@ def build_fw_gm(gm_split, compiled_submods):
             forward_env[node] = forward_graph.placeholder(node.name)
         elif node.op == 'call_function':
             assert node.target == operator.getitem # all function call should be getitem
-            args, kwargs = pytree.tree_map(lambda x: forward_env[x], (node.args, node.kwargs))
+            args, kwargs = pytree.tree_map_only(fx.Node, lambda x: forward_env[x], (node.args, node.kwargs))
             forward_env[node] = forward_graph.call_function(node.target, args, kwargs)
         elif node.op == 'call_module':
             assert 'submod' in node.target
@@ -765,7 +737,8 @@ def build_fw_gm(gm_split, compiled_submods):
             forward_env[node] = forward_graph.call_function(compiled_submods[node.target][0].__call__, args, kwargs)
         elif node.op == 'output':
             result = pytree.tree_map(lambda x: forward_env[x], node.args)
-            forward_env[node] = forward_graph.output(result)
+            assert len(result) == 1
+            forward_env[node] = forward_graph.output(*result)
         else:
             raise RuntimeError(f"Not other nodes should appear, please report a bug")
 
@@ -773,3 +746,77 @@ def build_fw_gm(gm_split, compiled_submods):
     forward_graph.lint()
     
     return fx.GraphModule({}, forward_graph)
+
+
+def compile_symbolic_splited(gm_split: fx.GraphModule, *args):
+    assert gm_split.training # TODO @botbw: always compile forward and backward for now
+
+    params_by_submod = {}
+    buffers_by_submod = {}
+    for name, mod in gm_split.named_children():
+        params_by_submod[name] = dict(mod.named_parameters())
+        buffers_by_submod[name] = dict(mod.named_buffers())
+
+    fake_params_flatten = dict(gm_split.named_parameters())
+    fake_buffers_flatten = dict(gm_split.named_buffers())
+    fake_mode = detect_fake_mode(args)
+    if not fake_mode: fake_mode = FakeTensorMode()
+    def wrap_fake(x):
+        if not isinstance(x, torch.Tensor):
+            return x
+        elif isinstance(x, FakeTensor):
+            return x
+        else:
+            return fake_mode.from_tensor(x)
+    fake_params_flatten, fake_buffers_flatten, fake_args = pytree.tree_map(lambda x: wrap_fake(x), (fake_params_flatten, fake_buffers_flatten, args))
+
+    compiled_submods = compile_with_fake(gm_split, fake_params_flatten, fake_buffers_flatten, fake_args)
+
+    for name, (compiled_fw, _) in compiled_submods.items():
+        compiled_fw.named_params = params_by_submod[name]
+        compiled_fw.named_buffers = buffers_by_submod[name]
+
+    fw_gm = build_fw_gm(gm_split, compiled_submods)
+
+    class CompiledSplited:
+        def forward(self, *args, **kwargs):
+            return fw_gm(*args, **kwargs)
+        
+        def _get_args(self, out_grads, compiled_bw): # TODO @botbw: fix
+            expected_grad_outs = (
+                compiled_bw.compiled_fw.fw_metadata.num_outputs + \
+                    compiled_bw.compiled_fw.fw_metadata.num_mutated_inputs + \
+                        compiled_bw.compiled_fw.fw_metadata.num_intermediate_bases
+            )
+            args = [None] * expected_grad_outs
+            args[-len(out_grads):] = out_grads
+            return args
+
+        def backward(self, out_grads): # TODO @bowbw: backwards might not be sequential
+            for _, (_, compiled_bw) in reversed(compiled_submods.items()):
+                args = self._get_args(out_grads, compiled_bw)
+                out_all = compiled_bw(*args)
+                if not isinstance(out_all, tuple):
+                    out_all = (out_all,)
+                states = {**compiled_bw.compiled_fw.named_params, **compiled_bw.compiled_fw.named_buffers}
+                grads = out_all[:len(states)]
+                for state, grad in zip(states.values(), grads):
+                    state.grad = grad
+                out_grads = out_all[len(states):]
+            return out_grads
+        
+        def named_parameters(self):
+            params = {}
+            for _, (compiled_fw, _) in compiled_submods.items():
+                params.update(compiled_fw.named_params)
+            return params
+        
+        def named_buffers(self):
+            buffers = {}
+            for _, (compiled_fw, _) in compiled_submods.items():
+                buffers.update(compiled_fw.named_buffers)
+            return buffers
+        
+        def raw_returns(self):
+            return list(compiled_submods.values())[-1][0].raw_returns
+    return CompiledSplited()
