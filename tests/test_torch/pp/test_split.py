@@ -44,11 +44,11 @@ class Foo(torch.nn.Module):
 
 
 def test_main(model_class, input_size):
-    model = model_class().cuda().train()
+    model = model_class().cuda().train().double()
     model_copy = copy.deepcopy(model)
 
-    rand_input1 = torch.rand(input_size).cuda()
-    rand_input2 = torch.rand(input_size).cuda()
+    rand_input1 = torch.rand(input_size, dtype=torch.double).cuda()
+    rand_input2 = torch.rand(input_size, dtype=torch.double).cuda()
 
     out_torch, loss_torch, buffers_torch, params_torch, grads_torch = run_torch(
         model, rand_input1, rand_input2)
@@ -57,14 +57,14 @@ def test_main(model_class, input_size):
         model_copy, rand_input1, rand_input2)
 
     # TODO @botbw: precision loss?
-    assert torch.allclose(out_split, out_torch, atol=1e-4)
-    assert torch.allclose(loss_split, loss_torch, atol=1e-4)
+    assert torch.allclose(out_split, out_torch)
+    assert torch.allclose(loss_split, loss_torch)
     assert len(buffers_split) == len(buffers_torch) and all(
-        torch.allclose(b1, b2, atol=1e-4) for b1, b2 in zip(buffers_split, buffers_torch))
+        torch.allclose(b1, b2) for b1, b2 in zip(buffers_split, buffers_torch))
     assert len(grads_split) == len(grads_torch) and all(
-        torch.allclose(g1, g2, atol=1e-4) for g1, g2 in zip(grads_split, grads_torch))
+        torch.allclose(g1, g2) for g1, g2 in zip(grads_split, grads_torch))
     assert len(params_split) == len(params_torch) and all(
-        torch.allclose(p1, p2, atol=1e-4) for p1, p2 in zip(params_split, params_torch))
+        torch.allclose(p1, p2) for p1, p2 in zip(params_split, params_torch))
 
 
 def run_split(model_copy, rand_input1, rand_input2):
