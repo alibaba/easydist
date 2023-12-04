@@ -377,6 +377,7 @@ def build_bw_gm(gm_split, compiled_submods):
 
     output = {}
 
+    # TODO @botbw: move this to CompiledBackward
     class RuntimeWrapper:
 
         def __init__(self, compiled_bw):
