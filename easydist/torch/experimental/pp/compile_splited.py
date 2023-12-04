@@ -1,5 +1,6 @@
 import itertools
 import operator
+from collections import defaultdict
 from typing import cast
 
 import torch
@@ -338,10 +339,13 @@ def build_fw_gm(gm_split, compiled_submods):
     forward_env = {}
 
     for node in gm_split.graph.nodes:
+        assert node.op in ['placeholder', 'call_function', 'call_module',
+                           'output'], "No other nodes should appear, please report a bug"
+
         if node.op == 'placeholder':
             forward_env[node] = forward_graph.placeholder(node.name)
         elif node.op == 'call_function':
-            assert node.target == operator.getitem  # all function call should be getitem
+            assert node.target == operator.getitem, "all function call are getitem"
             args, kwargs = pytree.tree_map_only(fx.Node, lambda x: forward_env[x],
                                                 (node.args, node.kwargs))
             forward_env[node] = forward_graph.call_function(node.target, args, kwargs)
@@ -354,13 +358,142 @@ def build_fw_gm(gm_split, compiled_submods):
             result = pytree.tree_map(lambda x: forward_env[x], node.args)
             assert len(result) == 1
             forward_env[node] = forward_graph.output(*result)
-        else:
-            raise RuntimeError(f"Not other nodes should appear, please report a bug")
 
     forward_graph.eliminate_dead_code()
     forward_graph.lint()
 
     return fx.GraphModule({}, forward_graph)
+
+
+# TODO @botbw: check and simpify this
+def build_bw_gm(gm_split, compiled_submods):
+    compiled_bwds = [(name, bw) for name, (_, bw) in compiled_submods.items()]
+    idx = len(compiled_bwds) - 1
+
+    backward_graph = fx.Graph()
+    backward_env = defaultdict(list)
+    backward_env[compiled_bwds[len(compiled_bwds) - 1][0]].append(
+        (0, backward_graph.placeholder("out_grads")))
+
+    output = {}
+
+    class RuntimeWrapper:
+
+        def __init__(self, compiled_bw):
+            self.compiled_bw = compiled_bw
+
+        def _get_args(self, out_grads):  # TODO @botbw: try to avoid doing this
+            compiled_bw = self.compiled_bw
+            expected_grad_outs = (
+                compiled_bw.compiled_fw.fw_metadata.num_outputs + \
+                    compiled_bw.compiled_fw.fw_metadata.num_mutated_inputs + \
+                        compiled_bw.compiled_fw.fw_metadata.num_intermediate_bases
+            )
+            assert len(out_grads) <= expected_grad_outs
+            args = [None] * expected_grad_outs
+            args[-len(out_grads):] = out_grads
+            return args
+
+        def run_backward(self, *out_grads):
+            compiled_bw = self.compiled_bw
+            args = self._get_args(out_grads)
+            out_all = compiled_bw(*args)
+            if not isinstance(out_all, tuple):
+                out_all = (out_all, )
+            states = {
+                **compiled_bw.compiled_fw.named_params,
+                **compiled_bw.compiled_fw.named_buffers
+            }
+            grads = out_all[:len(states)]
+            for state, grad in zip(states.values(), grads):
+                state.grad = grad
+            out_grads = out_all[len(states):]
+            if len(out_grads) == 1:
+                out_grads = out_grads[0]
+            return out_grads
+
+    def accumulate_grad_maybe_none(grad1, grad2):
+        if grad1 is None:
+            return grad2
+        elif grad2 is None:
+            return grad1
+        else:
+            return grad1 + grad2
+
+    for node in reversed(gm_split.graph.nodes):
+        assert node.op in ['placeholder', 'call_function', 'call_module',
+                           'output'], "No other nodes should appear, please report a bug"
+        if node.op == 'placeholder':
+            break
+        elif node.op == 'call_module':
+            assert 'submod' in node.target and len(node.args) > 0
+            name, compiled_bw = compiled_bwds[idx]
+            wrapper = RuntimeWrapper(compiled_bw)
+            args = [None] * len(backward_env[name])
+            for id, out in backward_env[name]:
+                if args[id] is None:
+                    args[id] = out
+                else:  # the output of this submod is used by multiple users
+                    args[id] = backward_graph.call_function(accumulate_grad_maybe_none,
+                                                            (args[id], out))
+            args = tuple(x for x in args if x is not None)  # TODO @botbw: correct to do this?
+            out = backward_graph.call_function(wrapper.run_backward, args)
+            idx -= 1
+            if len(node.args) == 1:  # no getitem call
+                arg = node.args[0]
+                assert arg.op in ['placeholder', 'call_module', 'call_function']
+                if arg.op == 'placeholder':  # input node
+                    if arg.name not in output:
+                        output[arg.name] = out
+                    else:
+                        output[arg.name] = backward_graph.call_function(
+                            accumulate_grad_maybe_none, (output[arg.name], out))
+                    continue
+
+                if arg.op == 'call_module':  # submod
+                    prev_node = arg.name
+                    id = 0
+                else:  # getitem call
+                    assert (len(arg.args) == 2
+                            and isinstance(arg.args[1], int)) and arg.args[0].op == 'call_module'
+                    prev_node = arg.args[0].name
+                    id = arg.args[1]
+                backward_env[prev_node].append((id, out))
+            else:
+                for i, arg in enumerate(node.args):
+                    assert arg.op in ['placeholder', 'call_module', 'call_function']
+                    if arg.op == 'placeholder':
+                        if arg.name not in output:
+                            output[arg.name] = backward_graph.call_function(
+                                operator.getitem, (out, i))
+                        else:
+                            output[arg.name] = backward_graph.call_function(
+                                accumulate_grad_maybe_none,
+                                (output[arg.name],
+                                 backward_graph.call_function(operator.getitem, (out, i))))
+                        continue
+
+                    if arg.op == 'call_module':
+                        prev_node = arg.name
+                        id = 0
+                        _out = backward_graph.call_function(operator.getitem, (out, i))
+                    else:
+                        assert (len(arg.args) == 2 and isinstance(
+                            arg.args[1], int)) and arg.args[0].op == 'call_module'
+                        prev_node = arg.args[0].name
+                        id = arg.args[1]
+                        _out = backward_graph.call_function(operator.getitem, (out, i))
+                    backward_env[prev_node].append((id, _out))
+
+    seq_out = []
+    for node in gm_split.graph.nodes:
+        if node.op == 'placeholder':
+            seq_out.append(output[node.name])
+    backward_graph.output(seq_out)
+    backward_graph.eliminate_dead_code()
+    backward_graph.lint()
+
+    return fx.GraphModule({}, backward_graph)
 
 
 def compile_splited(gm_split: fx.GraphModule, *args):
@@ -396,6 +529,7 @@ def compile_splited(gm_split: fx.GraphModule, *args):
         compiled_fw.named_buffers = buffers_by_submod[name]
 
     fw_gm = build_fw_gm(gm_split, compiled_submods)
+    bw_gm = build_bw_gm(gm_split, compiled_submods)
 
     class CompiledSplited:
 
@@ -412,21 +546,8 @@ def compile_splited(gm_split: fx.GraphModule, *args):
             args[-len(out_grads):] = out_grads
             return args
 
-        def backward(self, out_grads):  # TODO @bowbw: backwards might not be sequential?
-            for _, (_, compiled_bw) in reversed(compiled_submods.items()):
-                args = self._get_args(out_grads, compiled_bw)
-                out_all = compiled_bw(*args)
-                if not isinstance(out_all, tuple):
-                    out_all = (out_all, )
-                states = {
-                    **compiled_bw.compiled_fw.named_params,
-                    **compiled_bw.compiled_fw.named_buffers
-                }
-                grads = out_all[:len(states)]
-                for state, grad in zip(states.values(), grads):
-                    state.grad = grad
-                out_grads = out_all[len(states):]
-            return out_grads
+        def backward(self, *out_grads):
+            return bw_gm(*out_grads)
 
         def named_parameters(self):
             params = {}

@@ -1,5 +1,8 @@
 import copy
 import random
+import os
+# make easydist happy without torchrun
+os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
 import torch
@@ -8,6 +11,8 @@ from torchvision.models import alexnet, resnet18, vgg19
 from easydist.torch.experimental.pp.IR import symbolic_split
 from easydist.torch.experimental.pp.compile_splited import compile_splited
 from easydist.torch.experimental.pp.split_policies import split_into_equal_size
+
+split_sz = random.randint(1, 3)
 
 
 def seed(seed=42):
@@ -33,14 +38,35 @@ class Foo(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear = torch.nn.Linear(1024, 10)
-        self.relu = torch.nn.ReLU()
+        self.norm1 = torch.nn.LayerNorm([1024])
+        self.linear1_0 = torch.nn.Linear(1024, 256)
+        self.linear1_1 = torch.nn.Linear(256, 128)
+        self.linear1_2 = torch.nn.Linear(128, 10)
+
+        self.norm0 = torch.nn.BatchNorm1d(1024)
+        self.linear0_0 = torch.nn.Linear(1024, 512)
+        self.linear0_1 = torch.nn.Linear(512, 256)
+        self.linear0_2 = torch.nn.Linear(256, 128)
+        self.linear0_3 = torch.nn.Linear(128, 10)
 
     def forward(self, x):
-        norm = self.norm(x)
-        linear = self.linear(norm)
-        return self.relu(linear)
+        x0 = self.norm0(x)
+        x0 = self.linear0_0(x0)
+        x0 = self.linear0_1(x0)
+        x0 = self.linear0_2(x0)
+        x0 = self.linear0_3(x0)
+
+        x1 = self.norm1(x)
+        x1 = self.linear1_0(x1)
+        x1 = self.linear1_1(x1)
+        x1 = self.linear1_2(x1)
+
+        return (x0 + x1).relu()
+
+
+# TODO @botbw: need to fix this
+def replace_dot(x: dict):
+    return {k.replace('.', '_'): v for k, v in x.items()}
 
 
 def test_main(model_class, input_size):
@@ -56,20 +82,22 @@ def test_main(model_class, input_size):
     out_split, loss_split, buffers_split, params_split, grads_split = run_split(
         model_copy, rand_input1, rand_input2)
 
-    # TODO @botbw: precision loss?
     assert torch.allclose(out_split, out_torch)
     assert torch.allclose(loss_split, loss_torch)
     assert len(buffers_split) == len(buffers_torch) and all(
-        torch.allclose(b1, b2) for b1, b2 in zip(buffers_split, buffers_torch))
+        torch.allclose(buffers_split[name], buffers_torch[name]) and name in buffers_split
+        for name in buffers_torch)
     assert len(grads_split) == len(grads_torch) and all(
-        torch.allclose(g1, g2) for g1, g2 in zip(grads_split, grads_torch))
+        torch.allclose(grads_split[name], grads_torch[name]) and name in grads_split
+        for name in grads_torch)
     assert len(params_split) == len(params_torch) and all(
-        torch.allclose(p1, p2) for p1, p2 in zip(params_split, params_torch))
+        torch.allclose(params_split[name], params_torch[name]) and name in params_split
+        for name in params_torch)
 
 
 def run_split(model_copy, rand_input1, rand_input2):
     opt_splited = torch.optim.SGD(model_copy.parameters(), lr=0.01)
-    split_policy = split_into_equal_size(2)
+    split_policy = split_into_equal_size(split_sz)
     model_splited, _ = symbolic_split(model_copy, split_policy=split_policy)
     compiled_splited = compile_splited(model_splited, rand_input1)
 
@@ -79,7 +107,7 @@ def run_split(model_copy, rand_input1, rand_input2):
     loss_split = loss_fn(out_split)
     out_grads = torch.autograd.grad(loss_split,
                                     [t for t in compiled_splited.raw_returns() if t.requires_grad])
-    compiled_splited.backward(out_grads)
+    compiled_splited.backward(*out_grads)
     opt_splited.step()
     # step2
     opt_splited.zero_grad()
@@ -87,12 +115,12 @@ def run_split(model_copy, rand_input1, rand_input2):
     loss_split = loss_fn(out_split)
     out_grads = torch.autograd.grad(loss_split,
                                     [t for t in compiled_splited.raw_returns() if t.requires_grad])
-    compiled_splited.backward(out_grads)
+    compiled_splited.backward(*out_grads)
     opt_splited.step()
 
-    buffer_split = [t for t in compiled_splited.named_buffers().values()]
-    param_split = [t for t in compiled_splited.named_parameters().values()]
-    grad_split = [t.grad for t in compiled_splited.named_parameters().values()]
+    buffer_split = replace_dot(compiled_splited.named_buffers())
+    param_split = replace_dot(compiled_splited.named_parameters())
+    grad_split = replace_dot({k: v.grad for k, v in compiled_splited.named_parameters().items()})
     return out_split, loss_split, buffer_split, param_split, grad_split
 
 
@@ -112,14 +140,15 @@ def run_torch(model, rand_input1, rand_input2):
     loss_torch.backward()
     opt.step()
 
-    buffers_torch = [t for t in model.buffers()]
-    params_torch = [t for t in model.parameters()]
-    grads_torch = [t.grad for t in model.parameters()]
+    buffers_torch = replace_dot(dict(model.named_buffers()))
+    params_torch = replace_dot(dict(model.named_parameters()))
+    grads_torch = replace_dot({k: v.grad for k, v in model.named_parameters()})
     return out_torch, loss_torch, buffers_torch, params_torch, grads_torch
 
 
 if __name__ == "__main__":
     imgnet = (16, 3, 224, 224)
+    print(f'Split size: {split_sz}')
     test_main(Foo, (16, 1024))
     test_main(resnet18, imgnet)
     test_main(vgg19, imgnet)
