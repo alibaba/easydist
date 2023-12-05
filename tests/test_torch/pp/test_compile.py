@@ -45,6 +45,7 @@ def test_compile(model_class, input_size):
     compile_backward(compiled_splited, [torch.ones_like(t) for t in out])
 
 
+# TODO @botbw: use interpreter to support more models
 def compile_forward(compiled, rand_input):
     global signature
     args = (rand_input, )
@@ -62,6 +63,7 @@ def compile_forward(compiled, rand_input):
     return args
 
 
+# TODO @botbw: use interpreter to support more models
 def compile_backward(compiled, out_grads):
     global signature
     kwargs = {}
@@ -81,6 +83,7 @@ def compile_backward(compiled, out_grads):
 
 
 if __name__ == "__main__":
+    # easydist setup
     mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
     torch.distributed.init_process_group(backend="nccl")

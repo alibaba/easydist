@@ -303,6 +303,7 @@ def try_combination(sharded_output_, global_output_):
                     for out_ in sharded_output_:
                         if global_output_[idx_] != out_[idx_]:
                             return None
+                    return_combination_ann.append(None) # TODO @botbw: what to do if None in global_output_
 
             if len(return_combination_ann) > 0:
                 return return_combination_ann
