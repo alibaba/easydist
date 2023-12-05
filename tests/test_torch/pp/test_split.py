@@ -1,18 +1,19 @@
 import copy
 import random
 import os
+import gc
 # make easydist happy without torchrun
 os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
 import torch
-from torchvision.models import alexnet, resnet18, vgg19
+from torchvision.models import alexnet, resnet18, densenet121, densenet201, efficientnet_b0, vgg19, vit_b_16, swin_t
 
 from easydist.torch.experimental.pp.IR import symbolic_split
 from easydist.torch.experimental.pp.compile_splited import compile_splited
 from easydist.torch.experimental.pp.split_policies import split_into_equal_size
 
-split_sz = random.randint(1, 3)
+split_sz = 3
 
 
 def seed(seed=42):
@@ -66,11 +67,11 @@ class Foo(torch.nn.Module):
 
 # TODO @botbw: need to fix this
 def replace_dot(x: dict):
-    return {k.replace('.', '_'): v for k, v in x.items()}
+    return {k.replace('moved_', '').replace('.', '_'): v for k, v in x.items()}
 
 
-def test_main(model_class, input_size):
-    model = model_class().cuda().train().double()
+def test_main(model_gen, input_size):
+    model = model_gen().cuda().train().double()
     model_copy = copy.deepcopy(model)
 
     rand_input1 = torch.rand(input_size, dtype=torch.double).cuda()
@@ -93,6 +94,7 @@ def test_main(model_class, input_size):
     assert len(params_split) == len(params_torch) and all(
         torch.allclose(params_split[name], params_torch[name]) and name in params_split
         for name in params_torch)
+    gc.collect()
 
 
 def run_split(model_copy, rand_input1, rand_input2):
@@ -151,6 +153,11 @@ if __name__ == "__main__":
     print(f'Split size: {split_sz}')
     test_main(Foo, (16, 1024))
     test_main(resnet18, imgnet)
-    test_main(vgg19, imgnet)
     test_main(alexnet, imgnet)
+    test_main(densenet121, imgnet)
+    test_main(densenet201, imgnet)
+    test_main(efficientnet_b0, imgnet)
+    test_main(vgg19, imgnet)
+    test_main(vit_b_16, imgnet)
+    test_main(swin_t, imgnet)
     print("passed")

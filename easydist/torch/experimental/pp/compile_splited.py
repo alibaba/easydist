@@ -509,7 +509,10 @@ def compile_splited(gm_split: fx.GraphModule, *args):
     fake_params_flatten = dict(gm_split.named_parameters())
     fake_buffers_flatten = dict(gm_split.named_buffers())
     fake_mode = detect_fake_mode(args)
-    if not fake_mode: fake_mode = FakeTensorMode()
+    if not fake_mode: fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+    else: fake_mode.allow_non_fake_inputs = True
+
+    assert fake_mode.allow_non_fake_inputs, "Some models might have noise generator"
 
     def wrap_fake(x):
         if not isinstance(x, torch.Tensor):
