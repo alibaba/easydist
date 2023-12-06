@@ -1,16 +1,19 @@
 import copy
-import random
-import os
 import gc
+import os
+import random
+
 # make easydist happy without torchrun
 os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
 import torch
-from torchvision.models import alexnet, resnet18, densenet121, densenet201, efficientnet_b0, vgg19, vit_b_16, swin_t
+from torchvision.models import (alexnet, densenet121, densenet201,
+                                efficientnet_b0, resnet18, swin_t, vgg19,
+                                vit_b_16)
 
-from easydist.torch.experimental.pp.IR import symbolic_split
 from easydist.torch.experimental.pp.compile_splited import compile_splited
+from easydist.torch.experimental.pp.IR import symbolic_split
 from easydist.torch.experimental.pp.split_policies import split_into_equal_size
 
 split_sz = 3

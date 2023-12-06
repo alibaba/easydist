@@ -1,35 +1,35 @@
+import copy
 import functools
-import os
-# make easydist happy without torchrun
-os.environ['MASTER_PORT'] = '-1'
-import os
 import inspect
-from typing import Any
-from contextlib import nullcontext
-
-import torch
-import torch.utils._pytree as pytree
-from torch._subclasses.fake_tensor import FakeTensorMode
-
-import torch
-from torch.autograd import Function
-from torch.fx.experimental.proxy_tensor import PythonKeyTracer, enable_python_dispatcher, enable_pre_dispatch, PreDispatchTorchFunctionMode, ProxyTorchDispatchMode, disable_autocast_cache, disable_proxy_modes_tracing, dispatch_trace, wrap_key, fake_signature, decompose
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
-from easydist.torch.experimental.pp.IR import set_pipeline_tracer, get_pipeline_tracer, pipe_split, _from_traced
 import os
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, cast
-from contextlib import nullcontext
+# make easydist happy without torchrun
+os.environ['MASTER_PORT'] = '-1'
 
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.autograd import Function
+from torch.fx.experimental.proxy_tensor import (PreDispatchTorchFunctionMode,
+                                                ProxyTorchDispatchMode,
+                                                PythonKeyTracer, decompose,
+                                                disable_autocast_cache,
+                                                disable_proxy_modes_tracing,
+                                                dispatch_trace,
+                                                enable_pre_dispatch,
+                                                enable_python_dispatcher,
+                                                fake_signature, wrap_key)
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn.utils import stateless
 
-from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.compiler import preprocess_traced_graph
+from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp.IR import (_from_traced,
+                                               get_pipeline_tracer, pipe_split,
+                                               set_pipeline_tracer)
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 
 # for pickle dump opt_strategy
@@ -49,7 +49,8 @@ def my_make_fx(f,
 
     @functools.wraps(f)
     def wrapped(*args):
-        phs = pytree.tree_map(lambda _: fx.PH, args)  # type: ignore[attr-defined]
+        # type: ignore[attr-defined]
+        phs = pytree.tree_map(lambda _: fx.PH, args)
         fx_tracer = PythonKeyTracer()
         fake_tensor_mode: Any = nullcontext()
         if tracing_mode == "real":
@@ -105,7 +106,8 @@ def my_make_fx(f,
                 from torch._dynamo.source import ConstantSource
                 source = ConstantSource(f"input{arg_count}")
                 arg_count += 1
-                return fake_tensor_mode.from_tensor(x, source=source)  # type: ignore[attr-defined]
+                # type: ignore[attr-defined]
+                return fake_tensor_mode.from_tensor(x, source=source)
 
             return x
 
@@ -133,7 +135,7 @@ def my_make_fx(f,
         # purpose of `make_fx` is to produce graphmodules as a side effect; its internal execution is
         # thus irrelevant to any external functional trace.
         with decompose(decomposition_table), fake_tensor_mode, python_dispatcher_mode, pre_dispatch_mode, proxy_function_mode, \
-             sym_mode, proxy_mode, disable_autocast_cache(), disable_proxy_modes_tracing(enable_current=True):
+                sym_mode, proxy_mode, disable_autocast_cache(), disable_proxy_modes_tracing(enable_current=True):
             old_tracer = get_pipeline_tracer()
             set_pipeline_tracer(fx_tracer)
             try:
@@ -194,7 +196,7 @@ class Foo(torch.nn.Module):
         x0 = self.linear0_2(x0)
         x0 = self.linear0_3(x0)
 
-        x0 = split_func(x0)
+        x, x0 = split_func(x, x0)
 
         x1 = self.norm1(x)
         x1 = self.linear1_0(x1)
@@ -207,6 +209,8 @@ class Foo(torch.nn.Module):
 if __name__ == '__main__':
     model = Foo().cuda().train().double()
     optim = torch.optim.SGD(model.parameters(), lr=0.1)
+    model_copy = copy.deepcopy(model)
+    optim_copy = torch.optim.SGD(model_copy.parameters(), lr=0.1)
     args = (torch.rand(16, 1024, dtype=torch.double).cuda(), model, optim)
     kwargs = {}
     params = dict(model.named_parameters())
@@ -251,4 +255,21 @@ if __name__ == '__main__':
         setattr(splited, name, submod)
     print(traced_graph.code)
     print(splited.code)
-    print("pass")
+
+    model.eval()
+    params_detached = {k: v.detach() for k, v in params.items()}
+    buffers_detached = {k: v.detach() for k, v in buffers.items()}
+    flatten_args, _ = pytree.tree_flatten(
+        (params_detached, buffers_detached, named_states, args, kwargs))
+    out = splited(*flatten_args)
+    out_copy = model_copy(args[0]).mean()
+    out_copy.backward()
+    optim_copy.step()
+
+    assert torch.allclose(out[-1], out_copy)
+    assert len(params_detached) == len(dict(model_copy.named_parameters())) and all(
+        torch.allclose(params_detached[name], v) for name, v in model_copy.named_parameters())
+    assert len(buffers_detached) == len(dict(model_copy.named_buffers())) and all(
+        torch.allclose(buffers_detached[name], v) for name, v in model_copy.named_buffers())
+
+    print("passed")
