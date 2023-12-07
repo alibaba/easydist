@@ -19,7 +19,7 @@ from torch._functorch import config
 from torch.distributed._tensor.op_schema import OpSchema
 
 from .api import easydist_compile
-from .bridge import shard_module, torch2meta_graph
+from .bridge import torch2meta_graph
 from .passes.sharding import sharding_transform
 from .device_mesh import set_device_mesh, get_device_mesh
 from .sharding_interpreter import EDTorchShardingAnn
@@ -31,7 +31,7 @@ if hasattr(config, "use_fake_tensor"):
 
 __all__ = [
     'EDTorchShardingAnn', 'sharding_transform', 'set_device_mesh', 'get_device_mesh',
-    'torch2meta_graph', 'shard_module', 'easydist_compile'
+    'torch2meta_graph', 'easydist_compile'
 ]
 
 

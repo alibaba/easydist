@@ -47,6 +47,14 @@ def to_meta(node_output):
         return node_output
 
 
+def create_meta_from_node(node):
+    fake_args = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta['val'], node.args)
+    fake_val = node.target(*fake_args, **node.kwargs)
+    if isinstance(fake_val, list):
+        return {'val': fake_val}
+    return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
+
+
 def to_torch_spmd(meta_spmd: metair.SPMD):
     if meta_spmd.is_shard():
         return spmd.Shard(dim=meta_spmd.args["dim"])
@@ -72,10 +80,10 @@ class EDNodeType(Enum):
 class EDInfo:
     node_type: EDNodeType = None
     ori_meta: Dict = None
-    sharding_info: Any = None
+    spmd_annotation: Any = None
     strategy: NodeSPMDStrategy = None
     runtime_ms: float = 0.0
-    normalized_int_runtime_ms = 0
+    normalized_int_runtime_ms = 1
     comm_meta = None  # {comm_vol, comm_shape}
 
     def is_communication(self):

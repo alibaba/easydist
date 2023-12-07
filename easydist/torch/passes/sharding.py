@@ -15,7 +15,6 @@
 import operator
 import logging
 from typing import List
-from functools import reduce
 
 import torch
 import torch.utils._pytree as pytree
@@ -23,13 +22,12 @@ from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed._tensor import mesh_resources
 from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
-from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
-from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType
+from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
 from easydist.metashard.combination import ReduceOp
@@ -48,6 +46,18 @@ CREATE_ATEN_OP = [
     torch.ops.aten.scalar_tensor.default, torch.ops.aten.arange.default,
     torch.ops.aten.zeros.default, torch.ops.aten.arange.start
 ]
+
+
+view_op_map = {
+    torch.ops.aten.view.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten._unsafe_view.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten.reshape.default:
+    lambda input_shape, shape: view_groups(input_shape, shape),
+    torch.ops.aten.expand.default:
+    lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
+}
 
 
 def all_reduce_start(self: torch.Tensor, reduceOp: str, group: List[int], tag: str = ""):
@@ -391,17 +401,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 def override_args(node, invars_strategy):
     device_mesh = get_device_mesh()
 
-    view_op_map = {
-        torch.ops.aten.view.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten._unsafe_view.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten.reshape.default:
-        lambda input_shape, shape: view_groups(input_shape, shape),
-        torch.ops.aten.expand.default:
-        lambda input_shape, sizes: expand(input_shape, normalize_sizes(sizes)),
-    }
-
     if node.target in view_op_map:
         global_in_shape = node.args[0].meta['val'].shape
         shape_argnum = 1
@@ -423,14 +422,6 @@ def override_args(node, invars_strategy):
         local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
 
         node.update_arg(shape_argnum, local_out_shape)
-
-
-def create_meta_from_node(node):
-    fake_args = pytree.tree_map_only(Node, lambda n: n.meta['val'], node.args)
-    fake_val = node.target(*fake_args, **node.kwargs)
-    if isinstance(fake_val, list):
-        return {'val': fake_val}
-    return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
 
 def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_map):
@@ -499,6 +490,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
         if node.op == 'output':
             need_replicate_node = node.args[0][-1 * num_return_value:]
+            need_replicate_node = [i for i in need_replicate_node if i is not None]
             for o_node in need_replicate_node:
                 src_specs = shard_env[o_node.name]
                 tgt_specs = [SPMD(SPMD.REPLICATE)] * len(src_specs)

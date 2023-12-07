@@ -18,13 +18,13 @@ import time
 from functools import reduce
 
 import torch
+import torch.utils._pytree as pytree
 from torch.fx.node import _get_qualified_name
 
 import easydist
 import easydist.config as mdconfig
 import easydist.torch.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
-from easydist.torch.passes.runtime_prof import runtime_prof
 from easydist.torch.utils import EDInfo, EDNodeType
 from easydist.metashard.metair import (
     SPMD,
@@ -65,8 +65,6 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     Returns:
     An ordering of nodes
     '''
-
-    runtime_prof(fx_module)
 
     # prepare RCPSP input
     task_data = []
@@ -129,7 +127,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
         else:
             logger.info(f'[RCPSP]: Scheduling without Memory Constraint.')
         start_t = time.perf_counter()
-        raw_sche = rcpsp.rcpsp(task_data, available_resources, 
+        raw_sche = rcpsp.rcpsp(task_data, available_resources,
                                resource_dep_mask, mdconfig.rcpsp_method)
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
@@ -234,12 +232,12 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
     '''
     This function performs grouping on a fx graph
 
-    Scan reversely searching for small comms and grouped current selected 
+    Scan reversely searching for small comms and grouped current selected
     nodes when either dependencies or capacity limit is to be violated.
-    
+
     Args:
     fx_module: fx graph to be optimized
-    cap_limit: 
+    cap_limit:
     rg_limit: search range
     shape_info: generated shapes info of each node (holes remain)
 
@@ -441,6 +439,14 @@ def _strategy_fill_up(opt_strategy, shape_info, fx_module):
         print(f"opt_strategy: {opt_strategy}")
 
 
+def get_shape_info(node_output):
+    if isinstance(node_output, torch.Tensor) or isinstance(node_output,
+                                                        torch.nn.parameter.Parameter):
+        return {"shape": node_output.shape, "dtype": node_output.dtype}
+    else:
+        return {}
+
+
 def _shapeinfo_fill_up(shape_info, fx_module):
     '''
     Rule-based filling up shape_info of nodes in fx_module
@@ -454,8 +460,10 @@ def _shapeinfo_fill_up(shape_info, fx_module):
                 elif node.name.__contains__("_end"):
                     pre_node = node.all_input_nodes[0]
                     shape_info[node.name] = shape_info[pre_node.all_input_nodes[0].name]
+                elif hasattr(node, "meta") and node.meta.get("val") is not None:
+                    shape_info[node.name] = pytree.tree_map(get_shape_info, node.meta['val'])
                 elif torch.distributed.get_rank() == 0:
-                    raise RuntimeError("_shapeinfo_fill_up: unmet node->{node.name}!")
+                    raise RuntimeError(f"_shapeinfo_fill_up: unmet node->{node.name}!")
 
     if mdconfig.log_level <= logging.DEBUG:
         print(f"shape_info: {shape_info}")

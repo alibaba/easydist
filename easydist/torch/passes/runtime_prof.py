@@ -83,10 +83,6 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                 perf_db.record_op_perf(qualified_name, inputs_signature.__str__(),
                                        ops_elapsed_time_)
 
-    broadcast_result = [runtime_prof_result]
-    torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
-    runtime_prof_result = broadcast_result[0]
-
     min_runtime_ms = float('inf')
     for node in fx_module.graph.nodes:
         if hasattr(node, "ed_info") and node.name in runtime_prof_result:
@@ -107,5 +103,24 @@ def runtime_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
     if mdconfig.dump_prof_db and torch.distributed.get_rank() == 0:
         perf_db.persistent()
+
+    # broadcast ed_info for all nodes, note that ori_meta cannot pickle
+    # (TODO): move to other place
+    md_info_all = {}
+    ori_meta_all = {}
+    for node in fx_module.graph.nodes:
+        if hasattr(node, "ed_info"):
+            ori_meta_all[node.name] = node.ed_info.ori_meta
+            node.ed_info.ori_meta = None
+            md_info_all[node.name] = node.ed_info
+
+    broadcast_result = [md_info_all]
+    torch.distributed.broadcast_object_list(broadcast_result, src=0, device="cuda")
+    md_info_all = broadcast_result[0]
+
+    for node in fx_module.graph.nodes:
+        if hasattr(node, "ed_info"):
+            node.ed_info = md_info_all[node.name]
+            node.ed_info.ori_meta = ori_meta_all[node.name]
 
     return fx_module
