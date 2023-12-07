@@ -23,7 +23,7 @@ from torch.fx.node import _get_qualified_name
 
 import easydist
 import easydist.config as mdconfig
-import easydist.torch.rcpsp as rcpsp
+import easydist.torch.schedule.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
 from easydist.torch.utils import EDInfo, EDNodeType
 from easydist.metashard.metair import (
