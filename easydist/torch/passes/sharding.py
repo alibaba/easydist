@@ -490,6 +490,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
         if node.op == 'output':
             need_replicate_node = node.args[0][-1 * num_return_value:]
+            need_replicate_node = [i for i in need_replicate_node if i is not None]
             for o_node in need_replicate_node:
                 src_specs = shard_env[o_node.name]
                 tgt_specs = [SPMD(SPMD.REPLICATE)] * len(src_specs)

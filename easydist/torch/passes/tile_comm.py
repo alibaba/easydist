@@ -60,6 +60,12 @@ class TileStrategy:
         self.tiled_post_node.append(tiled_node)
         self.tms_post_comp += tiled_node.node.ed_info.runtime_ms
 
+    def prev_node_list(self):
+        return [i.node.name for i in self.tiled_prev_node]
+    
+    def post_node_list(self):
+        return [i.node.name for i in self.tiled_post_node]
+
 
 def forward_tiled_node(tiled_node: TiledNode, user: torch.fx.Node) -> TiledNode:
 
@@ -475,7 +481,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                             if isinstance(arg, torch.fx.Node):
                                 if arg.op == 'placeholder':
                                     continue
-                                if arg.ed_info.is_computation():
+                                if arg.ed_info.is_computation() and arg.name not in node_tile_strategy.prev_node_list():
 
                                     # backward the tile axis to the previous computation node
                                     tiled_arg = backward_tiled_node(tiled_node, arg)
@@ -495,7 +501,7 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
                         for user in tiled_node.node.users:
                             if user.op == 'output':
                                 continue
-                            if user.ed_info.is_computation():
+                            if user.ed_info.is_computation()  and user.name not in node_tile_strategy.post_node_list():
 
                                 # forward the tile axis to the post computation node
                                 tiled_user = forward_tiled_node(tiled_node, user)
