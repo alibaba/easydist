@@ -25,7 +25,8 @@ from torch.distributed._tensor import DeviceMesh
 
 import easydist.config as mdconfig
 from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
-from easydist.torch.compiler import _compile
+from easydist.torch.compile_auto import _compile_auto
+from easydist.torch.compiler_dp import _compile_dp
 from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
 from easydist.torch.utils import get_input_signature
 
@@ -36,6 +37,7 @@ class CompiledFuncWrapper:
 
     def __init__(self,
                  func,
+                 parallel_mode="auto",
                  tracing_mode="fake",
                  cuda_graph=True,
                  enable_mono_graph=False,
@@ -44,6 +46,7 @@ class CompiledFuncWrapper:
         self.original_func = func
 
         self.compiled_func = None
+        self.parallel_mode = parallel_mode
         self.tracing_mode = tracing_mode
         self.enable_cuda_graph = cuda_graph
         self.enable_mono_graph = enable_mono_graph
@@ -102,8 +105,13 @@ class CompiledFuncWrapper:
             if get_device_mesh() == None:
                 set_device_mesh(mesh)
 
-            self.compiled_func = _compile(self.original_func, self.tracing_mode, self.init_helper,
-                                          input_signature, args, kwargs)
+            if self.parallel_mode == "auto":
+                self.compiled_func = _compile_auto(self.original_func, self.tracing_mode, self.init_helper,
+                                            input_signature, args, kwargs)
+            elif self.parallel_mode in ["ddp", "zero2", "zero3"]:
+                self.compiled_func = _compile_dp(self.original_func, self.parallel_mode, self.tracing_mode, args, kwargs)
+            else:
+                raise NotImplementedError()
             self.graph_list[input_signature] = self.compiled_func.graph
             # release the cpu module when finised pre-shard in _compiler
             self.init_helper = None
@@ -186,6 +194,7 @@ class CompiledFuncWrapper:
 
 
 def easydist_compile(func=None,
+                     parallel_mode="auto",
                      tracing_mode="fake",
                      cuda_graph=True,
                      enable_mono_graph=False,
@@ -198,12 +207,15 @@ def easydist_compile(func=None,
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
+    if parallel_mode not in ["auto", "ddp", "zero2", "zero3"]:
+        raise NotImplementedError("please use [auto, ddp, zero2, zero3] for `parallel_mode`")
+
     if func:
-        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
+        return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph,
+            return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph, enable_mono_graph,
                                        compile_only)
 
         return wrapper

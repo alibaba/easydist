@@ -178,7 +178,7 @@ def fetch_strategy():
     return sharding_sol
 
 
-def _compile(func, tracing_mode, init_helper, input_signature, args, kwargs):
+def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
