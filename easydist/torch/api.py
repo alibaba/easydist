@@ -207,7 +207,7 @@ def easydist_compile(func=None,
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
-    if parallel_mode not in ["ddp", "zero2", "zero3"]:
+    if parallel_mode not in ["auto", "ddp", "zero2", "zero3"]:
         raise NotImplementedError("please use [auto, ddp, zero2, zero3] for `parallel_mode`")
 
     if func:

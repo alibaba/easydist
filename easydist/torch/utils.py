@@ -50,7 +50,7 @@ def to_meta(node_output):
 def create_meta_from_node(node):
     fake_args = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta['val'], node.args)
     fake_val = node.target(*fake_args, **node.kwargs)
-    if isinstance(fake_val, list):
+    if isinstance(fake_val, list) or isinstance(fake_val, tuple):
         return {'val': fake_val}
     return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
