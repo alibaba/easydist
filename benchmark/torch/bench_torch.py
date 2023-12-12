@@ -17,6 +17,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
 from easydist.utils.timer import EDTimer
+from easydist.utils.profiling_allocator import init_profiling_allocator
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from benchmark.torch.model import GPT, GATLayer, wresnet50
@@ -147,11 +148,6 @@ def bench_easydist(model, data_in):
     print(f"[{local_rank}] Memory: {peak_memory / 1024 / 1024 / 1024} GB")
     print(f"[{local_rank}] Time: {elaps_time}")
 
-# setting global variables
-ignore = True
-op_name = '123'
-allocator_profiling_info = []
-
 def main():
 
     parser = argparse.ArgumentParser(description="Simple example of parallelize model.")
@@ -165,13 +161,8 @@ def main():
 
     args = parser.parse_args()
 
-    # swap allocator
-    raw_allocator = ctypes.CDLL('./profiling_allocator.so')
-    init_fn = ctypes.cast(getattr(raw_allocator, 'init_allocator'), ctypes.c_void_p).value
-    new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
-        './profiling_allocator.so', 'my_malloc', 'my_free')
-    torch.cuda.memory.change_current_allocator(new_alloc)
-    new_alloc.allocator().set_init_fn(init_fn)
+    # initialize profiling allocator
+    init_profiling_allocator()
 
     # setup easydist
     mdconfig.log_level = logging.INFO

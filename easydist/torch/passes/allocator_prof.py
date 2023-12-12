@@ -14,6 +14,8 @@
 
 import logging
 import ctypes
+import __main__
+import os
 
 import torch
 import torch.utils._pytree as pytree
@@ -30,13 +32,12 @@ from easydist.torch.graph_profile_db import PerfDB
 logger = logging.getLogger(__name__)
 
 def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    logging.info("profiling fx_module's memory...")
-    import __main__, os
-    
     # only profile on rank 0
     local_rank = int(os.environ["LOCAL_RANK"])
     if local_rank != 0:
         return fx_module
+
+    logging.info("profiling fx_module's memory...")
 
     # save all profiling information in this dict
     profiling_info = dict()
