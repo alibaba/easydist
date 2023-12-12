@@ -23,10 +23,11 @@ from .rule_override import rule_override_by_graph
 from .runtime_prof import runtime_prof
 from .edinfo_utils import create_edinfo, annotation_edinfo
 from .process_tag import process_tag
+from .create_edinfo import create_edinfo
+from .allocator_prof import allocator_prof
 
 __all__ = [
     "fix_embedding", "fix_addmm_bias", "fix_convoluation_bias", "eliminate_detach",
     "sharding_transform", "sharding_transform_dtensor", "fix_meta_device", "tile_comm",
-    "comm_optimize", "rule_override_by_graph", "runtime_prof", "create_edinfo",
-    "annotation_edinfo", "process_tag"
+    "comm_optimize", "rule_override_by_graph", "runtime_prof", "create_edinfo", "allocator_prof", "annotation_edinfo", "process_tag"
 ]

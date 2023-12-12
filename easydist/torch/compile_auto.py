@@ -20,6 +20,7 @@ import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
+import ctypes
 
 import numpy
 import rich
@@ -39,7 +40,7 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
-                                   sharding_transform, sharding_transform_dtensor)
+                                   sharding_transform, sharding_transform_dtensor, allocator_prof)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
@@ -291,6 +292,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         if mdconfig.override_dtensor_rule is True:
             sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
 
+    sharded_graph = allocator_prof(sharded_graph)
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
 

@@ -6,6 +6,7 @@ import os
 import sys
 from functools import partial
 from contextlib import nullcontext
+import ctypes
 
 import torch
 import torch.optim as optim
@@ -134,17 +135,22 @@ def bench_easydist(model, data_in):
     train_step_partial()
 
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    # torch.cuda.reset_peak_memory_stats()
 
     timer = EDTimer(train_step_partial, in_ms=False)
 
     elaps_time = timer.time()
-    peak_memory = torch.cuda.max_memory_allocated()
+    # peak_memory = torch.cuda.max_memory_allocated()
+    peak_memory = 0
 
     local_rank = int(os.environ["LOCAL_RANK"])
     print(f"[{local_rank}] Memory: {peak_memory / 1024 / 1024 / 1024} GB")
     print(f"[{local_rank}] Time: {elaps_time}")
 
+# setting global variables
+ignore = True
+op_name = '123'
+allocator_profiling_info = []
 
 def main():
 
@@ -158,6 +164,14 @@ def main():
     parser.add_argument("--fake-init", action="store_true")
 
     args = parser.parse_args()
+
+    # swap allocator
+    raw_allocator = ctypes.CDLL('./profiling_allocator.so')
+    init_fn = ctypes.cast(getattr(raw_allocator, 'init_allocator'), ctypes.c_void_p).value
+    new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
+        './profiling_allocator.so', 'my_malloc', 'my_free')
+    torch.cuda.memory.change_current_allocator(new_alloc)
+    new_alloc.allocator().set_init_fn(init_fn)
 
     # setup easydist
     mdconfig.log_level = logging.INFO
