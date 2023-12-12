@@ -105,7 +105,7 @@ void* my_malloc(ssize_t size, int device, cudaStream_t stream) {
 }
 
 void my_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
-   // if (verbose) std::cout << "free " << ptr << " " << stream << std::endl;
    cudaFree(ptr);
 }
+
 }

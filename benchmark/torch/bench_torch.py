@@ -136,11 +136,19 @@ def bench_easydist(model, data_in):
     train_step_partial()
 
     torch.cuda.empty_cache()
+
+    # TODO(wuhao): temporarily banned torch.cuda.reset_peak_memory_stats(), 
+    # because CUDAPluggableAllocator didn't support this method
+
     # torch.cuda.reset_peak_memory_stats()
 
     timer = EDTimer(train_step_partial, in_ms=False)
 
     elaps_time = timer.time()
+
+    # TODO(wuhao): temporarily banned torch.cuda.max_memory_allocated(), 
+    # because CUDAPluggableAllocator didn't support this method
+ 
     # peak_memory = torch.cuda.max_memory_allocated()
     peak_memory = 0
 
