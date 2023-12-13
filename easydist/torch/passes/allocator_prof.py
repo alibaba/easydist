@@ -189,3 +189,4 @@ def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             assert False, "unexpected situation! " + profiling_info.get_node_profiling_info(node_name)
 
     return fx_module
+
