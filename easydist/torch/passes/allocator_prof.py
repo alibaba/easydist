@@ -145,23 +145,16 @@ def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         node_output = node.target(*materialized_inputs, **node.kwargs)
 
         # record output addresses
+        # flatten to handle possible tuples
+        flat_outputs, _ = pytree.tree_flatten(node_output)
 
-        # if output is a single tensor
-        if isinstance(node_output, torch.Tensor):
-            out_tensor = node_output
-            node_profiling_info.add_output_address(out_tensor.data_ptr())
-
-        # if output is a tuple of tensors
-        elif isinstance(node_output, tuple):
-            for out_item in node_output:
-                if isinstance(out_item, torch.Tensor):
-                    node_profiling_info.add_output_address(out_item.data_ptr())
-                elif out_item is None:
-                    continue
-                else:
-                    assert False, "Unexpected out_item!"
-        else:
-            assert False, "Unexpected type of out_tensors!"
+        for flat_output in flat_outputs:
+            if isinstance(flat_output, torch.Tensor):
+                node_profiling_info.add_output_address(flat_output.data_ptr())
+            elif flat_output is None:
+                continue
+            else:
+                assert False, "Unexpected output!"
         
         # tell profiling_allocator stop recording
         __main__.ignore = True
