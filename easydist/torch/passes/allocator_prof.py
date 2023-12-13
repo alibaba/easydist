@@ -31,6 +31,53 @@ from easydist.torch.graph_profile_db import PerfDB
 
 logger = logging.getLogger(__name__)
 
+class ModuleProfilingInfo:
+    def __init__(self) -> None:
+        self.node_profiling_info = dict()
+
+    @property
+    def node_names(self):
+        return self.node_profiling_info.keys()
+
+    @property
+    def local_indexes(self):
+        # calculating local indexes of each malloc
+        result = dict()
+        for node_name in self.node_names:
+            node_info = self.get_node_profiling_info(node_name)
+            indexes = []
+            for i, alloc_addr in enumerate(node_info.allocator_address):
+                if alloc_addr in node_info.output_address:
+                    indexes.append(i)
+            result[node_name] = indexes
+        return result
+
+    @property
+    def is_inplace(self):
+        # check whether this node is inplace or not
+        result = dict()
+        for node_name in self.node_names:
+            node_info = self.get_node_profiling_info(node_name)
+            flag = False
+            for out_addr in node_info.output_address:
+                if out_addr in node_info.input_address:
+                    flag = True
+                    break
+            result[node_name] = flag
+        return result
+
+    def set_node_profiling_info(self, node_name, node_info):
+        self.node_profiling_info[node_name] = node_info
+
+    def __setitem__(self, node_name, node_info):
+        self.set_node_profiling_info(node_name, node_info)
+
+    def get_node_profiling_info(self, node_name):
+        return self.node_profiling_info[node_name]
+
+    def __getitem__(self, node_name):
+        return self.get_node_profiling_info(node_name)
+
 class NodeProfilingInfo:
     def __init__(self):
         self.qualified_name = ""
@@ -59,7 +106,7 @@ def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     logging.info("profiling fx_module's memory...")
 
     # save all profiling information in this dict
-    profiling_info = dict()
+    profiling_info = ModuleProfilingInfo()
 
     for node in fx_module.graph.nodes:
         if not hasattr(node, "ed_info"):
@@ -120,41 +167,21 @@ def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         __main__.ignore = True
 
         # saving profiling info
-        profiling_info[node.name] = node_profiling_info
+        profiling_info.set_node_profiling_info(node.name, node_profiling_info)
     
     # process info from our profiling allocator
     # data format from allocator: (node_name, ptr_address)
     for allocator_info in __main__.allocator_profiling_info:
         node_name, ptr = allocator_info
-        profiling_info[node_name].add_allocator_address(ptr)
+        node_info = profiling_info.get_node_profiling_info(node_name)
+        node_info.add_allocator_address(ptr)
 
-    # calculating local indice of each malloc
-    local_indice = dict()
-    for node_name in profiling_info:
-        node_info = profiling_info[node_name]
-        local_indice[node_name] = []
-        for i, alloc_addr in enumerate(node_info.allocator_address):
-            if alloc_addr in node_info.output_address:
-                local_indice[node_name].append(i)
-    
-    # check whether this node is inplace or not
-    is_inplace = dict()
-    for node_name in profiling_info:
-        node_info = profiling_info[node_name]
-        flag = False
-        for out_addr in node_info.output_address:
-            if out_addr in node_info.input_address:
-                flag = True
-                break
-        is_inplace[node_name] = flag
-
-    for node_name in profiling_info:
-        if local_indice[node_name]:
-            pass
-            print(node_name, profiling_info[node_name].qualified_name, local_indice[node_name])
-        elif is_inplace[node_name]:
-            print(node_name, profiling_info[node_name].qualified_name, 'inplace')
+    for node_name in profiling_info.node_names:
+        if profiling_info.local_indexes[node_name]:
+            print(node_name, profiling_info.get_node_profiling_info(node_name).qualified_name, profiling_info.local_indexes[node_name])
+        elif profiling_info.is_inplace[node_name]:
+            print(node_name, profiling_info.get_node_profiling_info(node_name).qualified_name, 'inplace')
         else:
-            assert False, "unexpected situation! " + profiling_info[node_name]
+            assert False, "unexpected situation! " + profiling_info.get_node_profiling_info(node_name)
 
     return fx_module
