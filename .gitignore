@@ -137,3 +137,6 @@ dmypy.json
 # setup
 dist/
 build/
+
+# graphviz output
+*.dot
