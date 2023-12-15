@@ -14,7 +14,6 @@
 
 import copy
 import logging
-import os
 from typing import Any, Dict, Iterator, Tuple
 
 import torch
@@ -205,7 +204,7 @@ class EDTorchShardingAnn(Interpreter):
             Any: The value of the attribute that was retrieved
         """
         assert isinstance(target, str)
-        output = self.fetch_attr(target)
+        output = to_meta(self.fetch_attr(target))
 
         if "get_attr" not in self.sharding_info:
             self.sharding_info["get_attr"] = {}

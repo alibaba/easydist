@@ -199,6 +199,9 @@ def combination_to_sharding_strategy(comm_anns, all_replicate=False):
     if not (isinstance(comm_anns, list) or isinstance(comm_anns, tuple)):
         comm_anns = [comm_anns]
     for comm_ann in comm_anns:
+        if comm_ann is None:  # TODO @bowbw: what to do if None in outvar
+            spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
+            continue
         func_name = comm_ann.func.__name__
         if all_replicate or func_name == "identity":
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
@@ -288,8 +291,13 @@ class MetaNode:
     def clear_id_counter():
         MetaVar.id_counter = 0
 
-    def __init__(self, name, op_name, invars: List[MetaVar], outvars: List[MetaVar],
-                 sharding_info, is_placeholder=False) -> None:
+    def __init__(self,
+                 name,
+                 op_name,
+                 invars: List[MetaVar],
+                 outvars: List[MetaVar],
+                 sharding_info,
+                 is_placeholder=False) -> None:
         self.unique_id = self.generate_unique_id()
         self.cluster_id = -1
         self.name = name
@@ -584,7 +592,6 @@ class ClusterStrategyPool:
                     invar_strtg = nd_strtg.get_invar_strtg(invar_idx)
                     nd_io_strtg.add_in_strategy(invar_idx, invar_strtg)
 
-                
             for outvar_idx in range(len(nd.outvars)):
                 outvar_strtg = nd_strtg.get_outvar_strtg(outvar_idx)
                 nd_io_strtg.add_out_strategy(outvar_idx, outvar_strtg)
@@ -908,7 +915,8 @@ class MetaGraph:
                     strategy = opt_strategy[op.unique_key()]['strategy'].out_strtg_group[0]
                     partial_strategy[op.outvars[0].name] = strategy
                 else:
-                    logger.warning(f"{op.unique_key()} not found in opt_strategy. (maybe scalar tensor)")
+                    logger.warning(
+                        f"{op.unique_key()} not found in opt_strategy. (maybe scalar tensor)")
 
         partial_strategy_list = []
 
@@ -916,7 +924,7 @@ class MetaGraph:
             if var.name in partial_strategy:
                 partial_strategy_list.append(partial_strategy[var.name])
             else:
-                partial_strategy_list.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE)))
+                partial_strategy_list.append(
+                    VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE)))
 
         return partial_strategy_list
-

@@ -91,8 +91,10 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
         with _sharding_ann_env():
             start_t = time.perf_counter()
             sharding_interpreter = EDTorchShardingAnn(fx_module)
-            flatten_args = tree_flatten_spec(
-                list(args) + list(kwargs.values()), fx_module._in_spec)
+            flatten_args, spec = pytree.tree_flatten(
+                list(args) + list(kwargs.values()))
+            if not hasattr(fx_module, '_in_spec'): # TODO @botbw: trace pytree
+                fx_module._in_spec = spec
             sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
             logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
             if mdconfig.log_level <= logging.DEBUG:
