@@ -39,18 +39,19 @@ class ModuleProfilingInfo:
     def node_names(self):
         return self.node_profiling_info.keys()
 
-    @property
     def local_indexes(self):
+        return self.local_indexes
+
+    def build_local_indexes(self):
         # calculating local indexes of each malloc
-        result = dict()
+        self.local_indexes = dict()
         for node_name in self.node_names:
             node_info = self.get_node_profiling_info(node_name)
             indexes = []
             for i, alloc_addr in enumerate(node_info.allocator_address):
                 if alloc_addr in node_info.output_address:
                     indexes.append(i)
-            result[node_name] = indexes
-        return result
+            self.local_indexes[node_name] = indexes
 
     @property
     def is_inplace(self):
@@ -96,6 +97,14 @@ class NodeProfilingInfo:
 
     def add_allocator_address(self, allocator_address):
         self.allocator_address.append(allocator_address)
+
+    def __str__(self) -> str:
+        return_str = self.qualified_name + "\n"
+        return_str += "input_address: " + ",".join([str(addr) for addr in self.input_address]) + "\n"
+        return_str += "output_address: " + ",".join([str(addr) for addr in self.output_address]) + "\n"
+        return_str += "allocator_address: " + ",".join([str(addr) for addr in self.allocator_address]) + "\n"
+
+        return return_str
 
 def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # only profile on rank 0
@@ -168,6 +177,8 @@ def allocator_prof(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         node_name, ptr = allocator_info
         node_info = profiling_info.get_node_profiling_info(node_name)
         node_info.add_allocator_address(ptr)
+
+    profiling_info.build_local_indexes()
 
     for node_name in profiling_info.node_names:
         if profiling_info.local_indexes[node_name]:
