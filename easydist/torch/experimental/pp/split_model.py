@@ -28,7 +28,7 @@ def set_tracer_global(tracer):
     global __tracer_global
     __tracer_global = tracer
 
-
+@fx.has_side_effect
 def fw_bw_split_point():
     tracer_current = get_tracer_global()
     if tracer_current is not None and hasattr(tracer_current, "graph"):
@@ -39,11 +39,11 @@ def fw_bw_split_point():
 class _FWBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, *args):  # TODO @botbw: how to support kwargs?
+    def forward(ctx, *args):  # TODO @botbw: support kwargs: https://github.com/pytorch/pytorch/issues/96337
         fw_bw_split_point()
         need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
         args = tuple(arg.clone() if need_clone(arg) else arg
-                     for arg in args)  # TODO @botbw: have to clone?
+                     for arg in args)  # TODO @botbw: have to clone? (in case the following op is in-place)
         return args
 
     @staticmethod
@@ -53,9 +53,12 @@ class _FWBWSplitFunc(torch.autograd.Function):
 
 
 def fw_bw_split_func(*args, **kwargs):
-    return _FWBWSplitFunc.apply(*args, **kwargs)
+    if len(kwargs):
+        raise TypeError(
+            "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet" % list(kwargs.keys()))
+    return _FWBWSplitFunc.apply(*args)
 
-
+@fx.has_side_effect
 def optim_split_point():
     global __optim_split_point_cnt  # TODO @botbw: currently only one optim stage
     if __optim_split_point_cnt > 0:
@@ -95,6 +98,23 @@ class PipeSplitWrapper(torch.nn.Module):
                 if len(ret) == 1:
                     ret = ret[0]
         return ret
+
+    def __getattr__(self, name: str):
+        if '_parameters' in self.__dict__:
+            _parameters = self.__dict__['_parameters']
+            if name in _parameters:
+                return _parameters[name]
+        if '_buffers' in self.__dict__:
+            _buffers = self.__dict__['_buffers']
+            if name in _buffers:
+                return _buffers[name]
+        if '_modules' in self.__dict__:
+            modules = self.__dict__['_modules']
+            if name in modules:
+                return modules[name]
+        if hasattr(self.mod, name):
+            return getattr(self.mod, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 def annotate_split_points(mod: torch.nn.Module, spec: Dict[str, PipeSplitWrapper.SplitPoint]):
@@ -235,7 +255,9 @@ def compile_stateful_stages(fw_bw_gm, flat_model_states):
                     phs_inject[arg.name].append(node.name)
         elif node.op == 'output':
             for i, arg in enumerate(node.args[0]):
+                if arg is None: continue
                 out2idx[arg.name] = i
+
     for name, users in phs_inject.items():
         phs_inject[name] = users[0]  # inject to forward stage
 
@@ -574,26 +596,24 @@ def _split_on_size_threshold_with_max_stages(
 
     def gen_func_wrapper(target_func):
 
-        def wrapped_func(*args):
-            args = fw_bw_split_func(*args)
-            return target_func(*args)
+        def wrapped_func(*args, **kwargs):
+            return fw_bw_split_func(target_func(*args))
 
         return wrapped_func
 
     def gen_module_wrapper(target_module):
-        return PipeSplitWrapper(target_module, PipeSplitWrapper.SplitPoint.BEGINNING)
+        return PipeSplitWrapper(target_module, PipeSplitWrapper.SplitPoint.END)
 
     nstages = 1
     for node in insert_before_nodes:
+        prev = node.prev
         if nstages == max_stages:
             break
-        with gm.graph.inserting_before(node):
-            assert len(node.kwargs) == 0, "do not suppport kwargs"
-            if node.op == "call_function":
-                node.target = gen_func_wrapper(node.target)
-            else:
-                assert node.op == "call_module"
-                rsetattr(gm, node.target, gen_module_wrapper(rgetattr(gm, node.target)))
+        if prev.op == "call_function":
+            prev.target = gen_func_wrapper(prev.target)
+        else:
+            assert prev.op == "call_module"
+            rsetattr(gm, prev.target, gen_module_wrapper(rgetattr(gm, prev.target)))
 
         nstages += 1
 

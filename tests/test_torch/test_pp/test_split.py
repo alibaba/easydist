@@ -91,9 +91,6 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     buffers = dict(model.named_buffers())
     named_states = {}
 
-    model_copy = copy.deepcopy(model)
-    optim_copy = None
-
     def stateless_func(func, params, buffers, named_states, args, kwargs):
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, model), {
@@ -112,21 +109,14 @@ def test_main(model_cls, input_size, split_ann_or_policy):
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args, kwargs)
-
+    traced_graph = preprocess_traced_graph(traced_graph)
     split = split_by(model, traced_graph, fw_bw_split_point)
 
-    traced_graph.graph.eliminate_dead_code()
-    traced_graph = preprocess_traced_graph(traced_graph)
-    traced_graph.recompile()
     print("traced_graph:\n", traced_graph.code)
 
     for name, submod in split.named_children():
-        submod.graph.eliminate_dead_code()
-        submod = preprocess_traced_graph(submod)
-        submod.recompile()
         print(name, ':\n', submod.code)
         save_graphviz_dot(submod, name)
-        setattr(split, name, submod)
 
     print("split:\n", split.code)
     save_graphviz_dot(split, 'split')
@@ -154,15 +144,8 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         out_flatten[out2idx[name]] = outputs[name]
 
     seed()
-    out = model_copy(rand_input).mean()
-    out.backward()
-
-    params_copy = dict(model_copy.named_parameters())
-    buffers_copy = dict(model_copy.named_buffers())
-    grads_copy = {k: v.grad for k, v in params_copy.items()}
-    named_states_copy = {}
-    out_flatten_copy, _ = pytree.tree_flatten(
-        (params_copy, buffers_copy, named_states_copy, grads_copy, out))
+    out_copy = traced_graph(params, buffers, named_states, args, kwargs)
+    out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
     for val, val_copy in zip(out_flatten, out_flatten_copy):
         if isinstance(val, torch.Tensor):
@@ -202,12 +185,12 @@ if __name__ == '__main__':
             'layer3': PipeSplitWrapper.SplitPoint.END,
             'layer4': PipeSplitWrapper.SplitPoint.END,
         })
-    # test_main(swin_t, (16, 3, 224, 224), {
-    #     'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
-    #     'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
-    #     'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
-    #     'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
-    # })
+    test_main(swin_t, (16, 3, 224, 224), {
+        'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
+        'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
+        'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
+        'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
+    })
     test_main(
         vgg19, (16, 3, 224, 224), {
             'features.10': PipeSplitWrapper.SplitPoint.END,
@@ -226,6 +209,6 @@ if __name__ == '__main__':
     test_main(densenet121, (16, 3, 224, 224), split_into_equal_size(5))
     test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(7))
     test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(3))
-    # test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(6))
+    test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(3))
     test_main(vgg19, (16, 3, 224, 224), split_into_equal_size(3))
     test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(4))
