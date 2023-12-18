@@ -88,7 +88,9 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
 
         resource = []
 
+        priority = 0
         if node.ed_info.is_communication():
+            priority = 1
             resource.append(('comm', 1))
             if mem_constrain:
                 mem_req = int(node.ed_info.comm_meta['comm_vol'] / 1024)
@@ -114,7 +116,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
                 precedence.append(pre)
         precedence_relations.append(precedence)
 
-        task_data.append((node, duration, precedence, resource))
+        task_data.append((node, duration, precedence, resource, priority))
 
     assert (len(task_data) == len(fx_module.graph.nodes) - arg_num)
 
@@ -396,6 +398,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     fx_module.recompile()
 
     if torch.distributed.get_rank() == 0:
+        fx_module.print_readable()
         logger.info("Communication Optimization: Done!")
     return fx_module
 

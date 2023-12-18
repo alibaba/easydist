@@ -602,7 +602,7 @@ def tile_transform(fx_module: torch.fx.GraphModule,
                         tiled_node = override_view_op_args(tiled_node, node, tile_axis, num_tiles,
                                                            tile_id)
                     tiled_node.ed_info = EDInfo()
-                    tiled_node.ed_info.node_type = EDNodeType.COMPUTATION
+                    tiled_node.ed_info.node_type = node.ed_info.node_type
                     tiled_node.meta = create_meta_from_node(tiled_node)
                     tiled_nodes.append(tiled_node)
 

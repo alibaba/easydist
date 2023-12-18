@@ -93,7 +93,7 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
 
     Args:
     task_data: [(task_id(unique), duration, predecessor, 
-                 independent_resource_usage, dependent_resource_usage)]
+                 independent_resource_usage, dependent_resource_usage, priority)]
     available_resources (list): The resources available.
 
     Returns:
@@ -112,7 +112,7 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
         for i in range(num_tasks)
     ]
 
-    for task, _, predecessors, _ in task_data:
+    for task, _, predecessors, _, _ in task_data:
         for predecessor in predecessors:
             model.Add(task_ends[predecessor] <= task_starts[task])
 
@@ -128,7 +128,7 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
         ]
 
         successors = [[i] for i in range(num_tasks)]
-        for i, (_, _, predecessors, _) in enumerate(task_data):
+        for i, (_, _, predecessors, _, _) in enumerate(task_data):
             for predecessor in predecessors:
                 successors[predecessor].append(i)
 
@@ -155,10 +155,34 @@ def rcpsp_general(task_data, resource_capacities, dep_rec_mask=None):
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL:
-        res = []
+        priorities = [pri for (_, _, _ ,_ , pri) in task_data]
+        res_starts = []
+        res_ends = []
         for i in range(len(task_data)):
-            res.append(solver.Value(task_starts[i]))
-        return np.argsort(res)
+            res_starts.append(solver.Value(task_starts[i]))
+            res_ends.append(solver.Value(task_ends[i]))
+        ori_order = np.argsort(res_starts)
+        
+        selected = [False] * num_tasks
+        res = []
+        idx = 0
+
+        while len(res) < num_tasks:
+            if selected[ori_order[idx]]:
+                idx += 1
+                continue
+            cur_end = res_ends[ori_order[idx]]
+            target_idx = idx
+            for next_idx in range(idx + 1, num_tasks):
+                if res_starts[ori_order[next_idx]] >= cur_end:
+                    break
+                if not selected[ori_order[next_idx]] and priorities[ori_order[next_idx]] \
+                                            > priorities[ori_order[target_idx]]:
+                    target_idx = next_idx
+            selected[ori_order[target_idx]] = True
+            res.append(ori_order[target_idx])
+
+        return res
     else:
         raise RuntimeError("RCPSP: No solution found!")
 
@@ -191,14 +215,14 @@ def rcpsp_reorder(task_data, select_mask, schedule):
 def rcpsp_data_transform(task_data, resource_to_id, resource_num):
     transformed_task_data = []
     key_to_id = {}
-    for i, (task_key, duration, dependencies, resource_uses) in enumerate(task_data):
+    for i, (task_key, duration, dependencies, resource_uses, priority) in enumerate(task_data):
         key_to_id[task_key] = i
         resource_in_use = [0] * resource_num
         for r, amount in resource_uses:
             resource_in_use[resource_to_id[r]] = amount
         transformed_task_data.append((i, duration, 
                                       [key_to_id[dp] for dp in dependencies], 
-                                      resource_in_use))
+                                      resource_in_use, priority))
     return transformed_task_data
 
 
