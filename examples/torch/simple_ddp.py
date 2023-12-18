@@ -2,13 +2,16 @@ import copy
 import logging
 import os
 
+import numpy
 import torch
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed._tensor import DeviceMesh
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
+from easydist.torch.device_mesh import set_device_mesh
 
 
 def broadcast_module(model):
@@ -43,6 +46,11 @@ def main():
     torch.distributed.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+
+    world_size = torch.distributed.get_world_size()
+    mesh_shape = numpy.array(range(world_size)).reshape(-1, 1).tolist()
+    mesh = DeviceMesh("cuda", mesh_shape, mesh_dim_names=["dp", "placeholder"])
+    set_device_mesh(mesh)
 
     # when using cuda_graph, because of the warm-up and cuda graph capture,
     # the result of the first step is equivalent to the original result of the third step
