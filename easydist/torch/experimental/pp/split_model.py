@@ -34,6 +34,10 @@ def fw_bw_split_point():
     if tracer_current is not None and hasattr(tracer_current, "graph"):
         tracer_current.graph.call_function(fw_bw_split_point, (), {})
 
+def _to_tuple(x):
+    if isinstance(x, tuple):
+        return x
+    return (x, )
 
 # https://pytorch.org/docs/stable/notes/extending.html#how-to-use
 class _FWBWSplitFunc(torch.autograd.Function):
@@ -55,7 +59,7 @@ class _FWBWSplitFunc(torch.autograd.Function):
 def fw_bw_split_func(*args, **kwargs):
     if len(kwargs):
         raise TypeError(
-            "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet" % list(kwargs.keys()))
+            "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet, try SplitPoint.END to solve this" % list(kwargs.keys()))
     return _FWBWSplitFunc.apply(*args)
 
 @fx.has_side_effect
@@ -84,17 +88,17 @@ class PipeSplitWrapper(torch.nn.Module):
         self.mod = mod
         self.split_point = split_point
 
-    def forward(self, *args):
+    def forward(self, *args, **kwargs):
         ret = None
         try:
             if self.split_point == self.SplitPoint.BEGINNING:
-                args = fw_bw_split_func(*args)
+                args = fw_bw_split_func(*args, **kwargs)
 
-            ret = self.mod(*args)
+            ret = self.mod(*args, **kwargs)
         finally:
             if self.split_point == self.SplitPoint.END:
-                ret = fw_bw_split_func(ret)
-                assert isinstance(ret, tuple)
+                ret = _to_tuple(ret)
+                ret = fw_bw_split_func(*ret)
                 if len(ret) == 1:
                     ret = ret[0]
         return ret
@@ -597,7 +601,10 @@ def _split_on_size_threshold_with_max_stages(
     def gen_func_wrapper(target_func):
 
         def wrapped_func(*args, **kwargs):
-            return fw_bw_split_func(target_func(*args))
+            ret = target_func(*args, **kwargs)
+            ret = _to_tuple(ret)
+            ret = fw_bw_split_func(*ret)
+            return ret[0] if len(ret) == 1 else ret
 
         return wrapped_func
 

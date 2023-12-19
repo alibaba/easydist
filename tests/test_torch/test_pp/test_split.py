@@ -71,10 +71,11 @@ class Foo1(torch.nn.Module):
         return y.relu()
 
 
-def train_step(input, model, opt):
-    out = model(input).mean()
-    out.backward()
-    return out
+def train_step(input, label, model, opt):
+    out = model(input)
+    loss = (out - torch.ones_like(out) * label).pow(2).sum()
+    loss.backward()
+    return loss
 
 
 def test_main(model_cls, input_size, split_ann_or_policy):
@@ -85,7 +86,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     else:
         model = split_ann_or_policy(model)
     rand_input = torch.rand(input_size).cuda().double()
-    args = (rand_input, model, optim)
+    args = (rand_input, 0.0012345, model, optim)
     kwargs = {}
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -133,7 +134,8 @@ def test_main(model_cls, input_size, split_ann_or_policy):
             break
 
     seed()
-    gm(**{ph2name[id_rand_input]: rand_input})
+    with torch.no_grad():
+        gm(**{ph2name[id_rand_input]: rand_input})
 
     outputs = {}
     for stage in compiled_stages:
@@ -144,7 +146,8 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         out_flatten[out2idx[name]] = outputs[name]
 
     seed()
-    out_copy = traced_graph(params, buffers, named_states, args, kwargs)
+    with torch.no_grad():
+        out_copy = traced_graph(params, buffers, named_states, args, kwargs)
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
     for val, val_copy in zip(out_flatten, out_flatten_copy):
@@ -198,9 +201,9 @@ if __name__ == '__main__':
             'classifier.3': PipeSplitWrapper.SplitPoint.END
         })
     test_main(vit_b_16, (16, 3, 224, 224), {
-        'encoder.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
-        'encoder.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
-        'encoder.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
+        'encoder.layers.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
+        'encoder.layers.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
+        'encoder.layers.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
     })
 
     test_main(Foo, (16, 1024), split_into_equal_size(2))
