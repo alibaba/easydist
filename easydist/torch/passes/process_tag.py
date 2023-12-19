@@ -13,9 +13,24 @@
 # ==============================================================================
 
 import torch
+import torch._custom_ops
 
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.passes.sharding import all_reduce_start, all_reduce_end
+
+
+@torch._custom_ops.custom_op("easydist::tag")
+def tag(input: torch.Tensor, tag: str) -> torch.Tensor:
+    ...
+
+@torch._custom_ops.impl_abstract("easydist::tag")
+def tag_impl_abstract(input: torch.Tensor, tag: str) -> torch.Tensor:
+    return torch.empty_like(input)
+
+
+@torch._custom_ops.impl("easydist::tag")
+def tag_impl(input: torch.Tensor, tag: str) -> torch.Tensor:
+    return input
 
 
 def process_tag(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:

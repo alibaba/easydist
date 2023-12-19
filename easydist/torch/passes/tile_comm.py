@@ -26,6 +26,7 @@ from easydist import mdconfig
 from easydist.metashard.combination import CombinationFunc
 from easydist.torch.utils import EDInfo, EDNodeType, create_meta_from_node
 from .sharding import (all_gather_start, all_reduce_start, all_gather_end, all_reduce_end,
+                       all_to_all_start, all_to_all_end,
                        view_op_map, scatter_wrapper)
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ class TileStrategy:
 
     def prev_node_list(self):
         return [i.node.name for i in self.tiled_prev_node]
-    
+
     def post_node_list(self):
         return [i.node.name for i in self.tiled_post_node]
 
@@ -95,7 +96,7 @@ def forward_tiled_node(tiled_node: TiledNode, user: torch.fx.Node) -> TiledNode:
 
 def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
 
-    if node.target in [all_gather_start, all_reduce_start]:
+    if node.target in [all_gather_start, all_reduce_start, all_to_all_start]:
         return tile_axis
 
     for shard_dim_id, combine_func in node.ed_info.spmd_annotation['combination_ann'].items():
@@ -111,7 +112,7 @@ def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
 def backward_tiled_node(tiled_node: TiledNode, arg: torch.fx.Node) -> TiledNode:
 
     # return None for meet communication node
-    if arg.target in [all_gather_end, all_reduce_end]:
+    if arg.target in [all_gather_end, all_reduce_end, all_to_all_end]:
         return None
 
     if tiled_node.node.target == scatter_wrapper:

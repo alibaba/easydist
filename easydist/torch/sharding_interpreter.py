@@ -94,7 +94,8 @@ class EDTorchShardingAnn(Interpreter):
         self.shape_info = {}
         self.sharding_info = {}
 
-        self.pass_by_ops = ["_operator.getitem"]
+        # NOTE: do not use sharding_discovery for optimizer ops, preset_meta_spmd or pass-by
+        self.pass_by_ops = ["_operator.getitem", "torch.ops.aten._fused_adam.default"]
 
     def run(self, *args) -> Any:
         """
