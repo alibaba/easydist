@@ -17,11 +17,11 @@ from torch.fx.experimental.proxy_tensor import (PreDispatchTorchFunctionMode,
                                                 fake_signature, wrap_key)
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from easydist.torch.experimental.pp.split_model import (get_tracer_global, set_tracer_global)
+from easydist.torch.experimental.pp.compile_pipeline import (get_tracer_global, set_tracer_global)
 
 
 # copied from torch.fx.experimental.proxy_tensor
-def my_make_fx(f,
+def ed_make_fx(f,
                decomposition_table=None,
                tracing_mode="real",
                _allow_non_fake_inputs=False,
