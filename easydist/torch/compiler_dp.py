@@ -12,27 +12,31 @@
 # limitations under the License.
 # ==============================================================================
 
+import time
 import logging
-import operator
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
 
+import rich
 import torch
 import torch._custom_ops
 import torch.utils._pytree as pytree
+from torch.fx._pytree import tree_flatten_spec
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.nn.utils import stateless
 
 import easydist.config as mdconfig
+from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.passes import tile_comm, runtime_prof, comm_optimize, eliminate_detach, annotation_edinfo
+from easydist.torch.passes import (tile_comm, runtime_prof, comm_optimize, eliminate_detach,
+                                   annotation_edinfo, create_edinfo)
 from easydist.torch.passes.sharding import (all_reduce_start, all_reduce_end, scatter_wrapper,
                                             all_gather_start, all_gather_end, reduce_scatter_start,
                                             reduce_scatter_end)
-from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
+from easydist.torch.utils import _enable_compile, _rematerialize_optimizer, _sharding_ann_env
 from easydist.torch.passes.process_tag import process_tag
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.device_mesh import get_device_mesh
@@ -280,6 +284,20 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
     dp_rank = device_mesh.get_coordinate()[0]
     dp_size = device_mesh.size(0)
 
+    if mdconfig.enable_tile_comm:
+        with _sharding_ann_env():
+            start_t = time.perf_counter()
+            sharding_interpreter = EDTorchShardingAnn(traced_graph)
+            flatten_args = tree_flatten_spec(
+                [params, buffers, named_states, args, kwargs], traced_graph._in_spec)
+            sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
+            logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+            if mdconfig.log_level <= logging.DEBUG:
+                rich.print("sharding_info:\n", sharding_info)
+                rich.print("shape_info:\n", shape_info)
+
+        traced_graph = create_edinfo(traced_graph, sharding_info, shape_info)
+
     if dp_size > 1:
         if parallel_mode == "ddp":
             logger.info(f"parallel_mode: {parallel_mode}")
@@ -289,6 +307,8 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
             shard_param = (parallel_mode == "zero3")
             logger.info(f"parallel_mode: {parallel_mode}")
             sharded_graph = transform_fsdp(traced_graph, shard_param=shard_param)
+    else:
+        sharded_graph = traced_graph
 
     sharded_graph = annotation_edinfo(sharded_graph)
 
@@ -309,7 +329,6 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
     if mdconfig.comm_optimization is True:
         sharded_graph = runtime_prof(sharded_graph)
         sharded_graph = comm_optimize(sharded_graph,
-                                      shape_info,
                                       'rcpsp',
                                       grouping=True,
                                       mem_restrain=False)
