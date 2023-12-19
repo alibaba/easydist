@@ -114,6 +114,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     split = split_by(model, traced_graph, fw_bw_split_point)
 
     print("traced_graph:\n", traced_graph.code)
+    save_graphviz_dot(traced_graph, 'traced_graph')
 
     for name, submod in split.named_children():
         print(name, ':\n', submod.code)
@@ -208,10 +209,10 @@ if __name__ == '__main__':
 
     test_main(Foo, (16, 1024), split_into_equal_size(2))
     test_main(Foo1, (16, 1024), split_into_equal_size(2))
-    test_main(alexnet, (16, 3, 224, 224), split_into_equal_size(2))
+    test_main(alexnet, (16, 3, 224, 224), split_into_equal_size(3))
     test_main(densenet121, (16, 3, 224, 224), split_into_equal_size(5))
-    test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(7))
-    test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(3))
-    test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(3))
+    test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(10))
+    test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(4))
+    test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(10))
     test_main(vgg19, (16, 3, 224, 224), split_into_equal_size(3))
-    test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(4))
+    test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(10))

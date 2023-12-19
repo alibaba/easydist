@@ -612,15 +612,14 @@ def _split_on_size_threshold_with_max_stages(
         return PipeSplitWrapper(target_module, PipeSplitWrapper.SplitPoint.END)
 
     nstages = 1
-    for node in insert_before_nodes:
-        prev = node.prev
+    for node in insert_before_nodes: # TODO @botbw: should insert after the node
         if nstages == max_stages:
             break
-        if prev.op == "call_function":
-            prev.target = gen_func_wrapper(prev.target)
+        if node.op == "call_function":
+            node.target = gen_func_wrapper(node.target)
         else:
-            assert prev.op == "call_module"
-            rsetattr(gm, prev.target, gen_module_wrapper(rgetattr(gm, prev.target)))
+            assert node.op == "call_module"
+            rsetattr(gm, node.target, gen_module_wrapper(rgetattr(gm, node.target)))
 
         nstages += 1
 
