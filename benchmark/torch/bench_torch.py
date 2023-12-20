@@ -17,7 +17,6 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
 from easydist.utils.timer import EDTimer
-from easydist.utils.profiling_allocator import init_profiling_allocator
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from benchmark.torch.model import GPT, GATLayer, wresnet50
@@ -168,9 +167,6 @@ def main():
     parser.add_argument("--fake-init", action="store_true")
 
     args = parser.parse_args()
-
-    # initialize profiling allocator
-    init_profiling_allocator()
 
     # setup easydist
     mdconfig.log_level = logging.INFO

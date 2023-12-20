@@ -24,6 +24,7 @@ from .passes.sharding import sharding_transform
 from .device_mesh import set_device_mesh, get_device_mesh
 from .sharding_interpreter import EDTorchShardingAnn
 from .spmd_prop_rule import *
+from easydist.utils.profiling_allocator import init_profiling_allocator
 
 # disable with torch <= 2.0.1
 if hasattr(config, "use_fake_tensor"):
@@ -44,6 +45,8 @@ def easydist_setup_torch(device, allow_tf32):
 
     # this env var enforces the order of kernel execution on GPU as the kernel queuing order from host.
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    # initialize profiling allocator
+    init_profiling_allocator()
 
 
 # hotfix for PyTorch 2.1.0
