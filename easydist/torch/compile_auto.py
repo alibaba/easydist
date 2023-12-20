@@ -40,7 +40,7 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
-                                   sharding_transform, sharding_transform_dtensor, allocator_prof,
+                                   sharding_transform, sharding_transform_dtensor,
                                    AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
@@ -391,7 +391,6 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         _ = alloc_profiler.run([])
         alloc_profiler.finalize_allocator_info()
 
-        #allocator_prof(sharded_graph)
         logging.info("finish profiling fx_module's memory")
 
     class EDCompiledFunc:
