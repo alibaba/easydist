@@ -13,7 +13,6 @@ PyObject *global_dict = nullptr;
 PyObject *main_module = nullptr;
 PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
-bool verbose = false;
 std::unordered_set<void*> profiling_ptrs;
 
 void init_allocator(int device_count) {
@@ -78,9 +77,11 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    }
 
    auto ptr_int_value = reinterpret_cast<uintptr_t>(ptr);
-   PyObject* py_int = Py_BuildValue("k", ptr_int_value);
-   PyObject* profiling_info_tuple = PyTuple_Pack(2, op_name, py_int);
-   Py_DECREF(py_int);
+   PyObject* py_ptr_int = Py_BuildValue("k", ptr_int_value);
+   PyObject* py_size_int = Py_BuildValue("k", size);
+   PyObject* profiling_info_tuple = PyTuple_Pack(3, op_name, py_ptr_int, py_size_int);
+   Py_DECREF(py_ptr_int);
+   Py_DECREF(py_size_int);
    if (profiling_info_tuple == nullptr) {
       std::cerr << "Runtime Error: Can't create Python tuple" << std::endl;
       exit(-1);
@@ -93,11 +94,11 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    }
    Py_DECREF(profiling_info_tuple);
 
-   if (verbose) {
-      auto op_name_string = PyBytes_AsString(PyUnicode_AsUTF8String(op_name));
-      std::cout << "alloc "<< ptr << " " << "size: " << size << std::endl;
+   auto op_name_string = std::string(PyBytes_AsString(PyUnicode_AsUTF8String(op_name)));
+   if (op_name_string == "native_layer_norm") {
       std::cout << "op_name: " << op_name_string << std::endl;
       std::cout << "int of ptr: " << ptr_int_value << std::endl;
+      std::cout << "size: " << size << std::endl;
    }
 
    return ptr;

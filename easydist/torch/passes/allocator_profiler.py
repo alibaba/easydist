@@ -33,8 +33,11 @@ class NodeProfilingInfo:
     def __init__(self) -> None:
         self.qualified_name: str = ""
         self.input_address: List[int] = []
+        self.input_size: List[int] = []
         self.output_address: List[int] = []
+        self.output_size: List[int] = []
         self.allocator_address: List[int] = []
+        self.allocator_size: List[int] = []
 
     def set_qualified_name(self, qualified_name: str) -> None:
         self.qualified_name = qualified_name
@@ -42,17 +45,42 @@ class NodeProfilingInfo:
     def add_input_address(self, input_address: int) -> None:
         self.input_address.append(input_address)
 
+    def add_input_size(self, input_size: int) -> None:
+        self.input_size.append(input_size)
+
+    def add_input_info(self, input_tensor: torch.Tensor) -> None:
+        self.add_input_address(input_tensor.data_ptr())
+        self.add_input_size(input_tensor.element_size() * input_tensor.numel())
+
     def add_output_address(self, output_address: int) -> None:
         self.output_address.append(output_address)
+
+    def add_output_size(self, output_size: int) -> None:
+        self.output_size.append(output_size)
+
+    def add_output_info(self, output_tensor: torch.Tensor) -> None:
+        self.add_output_address(output_tensor.data_ptr())
+        self.add_output_size(output_tensor.element_size() * output_tensor.numel())
 
     def add_allocator_address(self, allocator_address: int) -> None:
         self.allocator_address.append(allocator_address)
 
+    def add_allocator_size(self, allocator_size: int) -> None:
+        self.allocator_size.append(allocator_size)
+
+    def add_allocator_info(self, allocator_info: List[Any]) -> None:
+        address, size, *_ = allocator_info
+        self.add_allocator_address(address)
+        self.add_allocator_size(size)
+
     def __str__(self) -> str:
         return_str = self.qualified_name + "\n"
         return_str += "input_address: " + ",".join([str(addr) for addr in self.input_address]) + "\n"
+        return_str += "input_size: " + ','.join([str(size) for size in self.input_size]) + "\n"
         return_str += "output_address: " + ",".join([str(addr) for addr in self.output_address]) + "\n"
+        return_str += "output_size: " + ','.join([str(size) for size in self.output_size]) + "\n"
         return_str += "allocator_address: " + ",".join([str(addr) for addr in self.allocator_address]) + "\n"
+        return_str += "allocator_size: " + ','.join([str(size) for size in self.allocator_size]) + "\n"
 
         return return_str
 
@@ -65,38 +93,44 @@ class NodeProfilingInfo:
 class ModuleProfilingInfo:
     def __init__(self) -> None:
         self.node_profiling_info = dict()
+        self._is_inplace: Dict[bool] = None
+        self._local_indexes: Dict[int] = None
 
     @property
     def node_names(self):
         return self.node_profiling_info.keys()
 
+    @property
     def local_indexes(self):
-        return self.local_indexes
+        if not self._local_indexes:
+            self.build_local_indexes()
+        return self._local_indexes
 
     def build_local_indexes(self):
         # calculating local indexes of each malloc
-        self.local_indexes = dict()
+        self._local_indexes = dict()
         for node_name in self.node_names:
             node_info = self.get_node_profiling_info(node_name)
             indexes = []
             for i, alloc_addr in enumerate(node_info.allocator_address):
                 if alloc_addr in node_info.output_address:
                     indexes.append(i)
-            self.local_indexes[node_name] = indexes
+            self._local_indexes[node_name] = indexes
 
     @property
     def is_inplace(self):
-        # check whether this node is inplace or not
-        result = dict()
-        for node_name in self.node_names:
-            node_info = self.get_node_profiling_info(node_name)
-            flag = False
-            for out_addr in node_info.output_address:
-                if out_addr in node_info.input_address:
-                    flag = True
-                    break
-            result[node_name] = flag
-        return result
+        if not self._is_inplace:
+            self._is_inplace = dict()
+            for node_name in self.node_names:
+                node_info = self.get_node_profiling_info(node_name)
+                flag = False
+                for out_addr in node_info.output_address:
+                    if out_addr in node_info.input_address:
+                        flag = True
+                        break
+                self._is_inplace[node_name] = flag
+
+        return self._is_inplace
 
     def set_node_profiling_info(self, node_name, node_info):
         self.node_profiling_info[node_name] = node_info
@@ -158,9 +192,17 @@ class AllocatorProfiler(Interpreter):
             materialized_inputs = pytree.tree_map_only(torch.Tensor, materialize_random, inputs_signature)
 
             # record input addresses
-            for materialized_input in materialized_inputs:
-                if isinstance(materialized_input, torch.Tensor):
-                    node_profiling_info.add_input_address(materialized_input.data_ptr())
+            flat_inputs, _ = pytree.tree_flatten(materialized_inputs)
+            constant_types = [bool, int, float, torch.dtype]
+            for flat_input in flat_inputs:
+                if isinstance(flat_input, torch.Tensor):
+                    node_profiling_info.add_input_info(flat_input)
+                elif flat_input is None:
+                    continue
+                elif type(flat_input) in constant_types:
+                    continue
+                else:
+                    print("Unexpected input!", type(flat_input), flat_input)
 
             # set op_name for profiling_allocator.so
             __main__.op_name = n.name
@@ -176,11 +218,11 @@ class AllocatorProfiler(Interpreter):
             # record output addresses
             for flat_output in flat_outputs:
                 if isinstance(flat_output, torch.Tensor):
-                    node_profiling_info.add_output_address(flat_output.data_ptr())
+                    node_profiling_info.add_output_info(flat_output)
                 elif flat_output is None:
                     continue
                 else:
-                    assert False, "Unexpected output!"
+                    print("Unexpected output!", type(flat_input), flat_input)
 
             # saving profiling info
             self.profiling_info.set_node_profiling_info(n.name, node_profiling_info)
@@ -191,12 +233,9 @@ class AllocatorProfiler(Interpreter):
         # process info from our profiling allocator
         # data format from allocator: (node_name, ptr_address)
         for allocator_info in __main__.allocator_profiling_info:
-            node_name, ptr = allocator_info
+            node_name, *info = allocator_info
             node_info = self.profiling_info.get_node_profiling_info(node_name)
-            node_info.add_allocator_address(ptr)
-
-        self.profiling_info.build_local_indexes()
-        print(self.profiling_info)
+            node_info.add_allocator_info(info)
 
         for node_name in self.profiling_info.node_names:
             print("node name in prof info: ", node_name)
@@ -208,3 +247,4 @@ class AllocatorProfiler(Interpreter):
             else:
                 print("warning: unexpected situation!", node_name, ':', self.profiling_info.get_node_profiling_info(node_name).qualified_name)
 
+        print(self.profiling_info['native_layer_norm'])
