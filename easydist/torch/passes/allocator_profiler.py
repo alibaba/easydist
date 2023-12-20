@@ -90,13 +90,10 @@ class AllocatorProfiler(Interpreter):
 
             output = getattr(self, n.op)(n.target, materialized_inputs, {})
 
-            # record output addresses
             # flatten to handle possible tuples
-            print("current node name: ", n.name)
             flat_outputs, _ = pytree.tree_flatten(output)
-            print(("output: {}").format(output))
-            print(("flat output: {}").format(flat_outputs))
 
+            # record output addresses
             for flat_output in flat_outputs:
                 if isinstance(flat_output, torch.Tensor):
                     node_profiling_info.add_output_address(flat_output.data_ptr())
@@ -129,5 +126,5 @@ class AllocatorProfiler(Interpreter):
             elif self.profiling_info.is_inplace[node_name]:
                 print(node_name, self.profiling_info.get_node_profiling_info(node_name).qualified_name, 'inplace')
             else:
-                assert False, "unexpected situation! " + node_name + ": " + self.profiling_info.get_node_profiling_info(node_name).qualified_name
+                print("warning: unexpected situation!", node_name, ':', self.profiling_info.get_node_profiling_info(node_name).qualified_name)
 

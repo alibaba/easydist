@@ -23,7 +23,6 @@ from .rule_override import rule_override_by_graph
 from .runtime_prof import runtime_prof
 from .edinfo_utils import create_edinfo, annotation_edinfo
 from .process_tag import process_tag
-from .create_edinfo import create_edinfo
 from .allocator_prof import allocator_prof, ModuleProfilingInfo
 from .allocator_profiler import AllocatorProfiler
 
