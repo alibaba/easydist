@@ -385,11 +385,18 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     if local_rank == 0:
         logging.info("profiling fx_module's memory...")
 
+        import __main__
+        # setting allocator to profiling mode
+        __main__.allocator_mode = 'profile'
+
         # save all profiling information in this dict
         profiling_info = ModuleProfilingInfo()
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
         _ = alloc_profiler.run([])
         alloc_profiler.finalize_allocator_info()
+
+        # setting allocator back to runtime mode
+        __main__.allocator_mode = 'runtime'
 
         logging.info("finish profiling fx_module's memory")
 

@@ -27,6 +27,7 @@ def register_global_variables():
     __main__.ignore = True
     __main__.op_name = '123'
     __main__.allocator_profiling_info = []
+    __main__.allocator_mode = 'runtime'
 
 def swap_to_profiling_allocator():
     # swap from caching allocator to profiling allocator
@@ -38,6 +39,6 @@ def swap_to_profiling_allocator():
     raw_allocator = ctypes.CDLL(path_to_profiling_allocator)
     init_fn = ctypes.cast(getattr(raw_allocator, 'init_allocator'), ctypes.c_void_p).value
     new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
-        path_to_profiling_allocator, 'my_malloc', 'my_free')
+        path_to_profiling_allocator, 'meta_malloc', 'meta_free')
     torch.cuda.memory.change_current_allocator(new_alloc)
     new_alloc.allocator().set_init_fn(init_fn)

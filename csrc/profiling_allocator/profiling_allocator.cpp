@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <Python.h>
+#include <unordered_set>
 
 
 extern "C" {
@@ -11,7 +12,9 @@ PyObject *ignore = nullptr;
 PyObject *global_dict = nullptr;
 PyObject *main_module = nullptr;
 PyObject *allocator_profiling_info_queue = nullptr;
+PyObject *allocator_mode = nullptr;
 bool verbose = false;
+std::unordered_set<void*> profiling_ptrs;
 
 void init_allocator(int device_count) {
    // initialize Python interpreter
@@ -46,7 +49,7 @@ void init_allocator(int device_count) {
    }
 }
 
-void* my_malloc(ssize_t size, int device, cudaStream_t stream) {
+void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    void *ptr;
    cudaMalloc(&ptr, size);
 
@@ -57,9 +60,7 @@ void* my_malloc(ssize_t size, int device, cudaStream_t stream) {
    // ignore is a Borrowed reference.
    ignore = PyDict_GetItemString(global_dict, "ignore");
    if (ignore == nullptr) {
-      // if (verbose) std::cout << "ignore is null!" << std::endl;
       std::cerr << "ignore is null!" << std::endl;
-      // return ptr;
       exit(-1);
    }
 
@@ -82,13 +83,11 @@ void* my_malloc(ssize_t size, int device, cudaStream_t stream) {
    Py_DECREF(py_int);
    if (profiling_info_tuple == nullptr) {
       std::cerr << "Runtime Error: Can't create Python tuple" << std::endl;
-      // PyErr_SetString(PyExc_RuntimeError, "Can't create Python tuple");
       exit(-1);
    }
 
    int succ = PyList_Append(allocator_profiling_info_queue, profiling_info_tuple);
    if (succ == -1) {
-      // PyErr_SetString(PyExc_RuntimeError, "Failed to append to allocator_profiling_info_queue!");
       std::cerr << "Runtime Error: Failed to append to allocator_profiling_info_queue!" << std::endl;
       exit(-1);
    }
@@ -104,8 +103,49 @@ void* my_malloc(ssize_t size, int device, cudaStream_t stream) {
    return ptr;
 }
 
-void my_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
    cudaFree(ptr);
 }
 
+void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
+   void *ptr;
+   cudaMalloc(&ptr, size);
+   return ptr;
+}
+
+void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+   cudaFree(ptr);
+}
+
+void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
+   allocator_mode = PyDict_GetItemString(global_dict, "allocator_mode");
+   if (allocator_mode == nullptr) {
+      std::cerr << "allocator mode is null!" << std::endl;
+      exit(-1);
+   }
+   if (!PyUnicode_Check(allocator_mode)) {
+      std::cerr << "Not a unicode: allocator_mode!" << std::endl;
+      exit(-1);
+   }
+   std::string allocator_mode_string = PyBytes_AsString(PyUnicode_AsUTF8String(allocator_mode));
+   if (allocator_mode_string == "profile") {
+      void* ptr = profiling_malloc(size, device, stream);
+      profiling_ptrs.insert(ptr);
+      return ptr;
+   } else if (allocator_mode_string == "runtime") {
+      return runtime_malloc(size, device, stream);
+   } else {
+      std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;
+      exit(-1);
+   }
+}
+
+void meta_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+   if (profiling_ptrs.find(ptr) != profiling_ptrs.end()) {
+      profiling_free(ptr, size, device, stream);
+      profiling_ptrs.erase(ptr);
+   } else {
+      runtime_free(ptr, size, device, stream);
+   }
+}
 }
