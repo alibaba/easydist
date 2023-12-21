@@ -26,7 +26,7 @@ from torch.distributed._tensor import DeviceMesh
 import easydist.config as mdconfig
 from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
 from easydist.torch.compile_auto import _compile_auto
-from easydist.torch.compiler_dp import _compile_dp
+from easydist.torch.compile_dp import _compile_dp
 from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
 from easydist.torch.utils import get_input_signature
 

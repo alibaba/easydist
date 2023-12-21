@@ -12,8 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import time
+
+import numpy as np
 
 from easydist.platform import get_backend
 import easydist.config as mdconfig
@@ -21,10 +22,17 @@ import easydist.config as mdconfig
 
 class EDTimer:
 
-    def __init__(self, func, trials=3, warmup_trials=3, in_ms=True, device=None) -> None:
+    def __init__(self,
+                 func,
+                 trials=3,
+                 warmup_trials=3,
+                 times_per_trials=1,
+                 in_ms=True,
+                 device=None) -> None:
         self.func = func
         self.warmup_trials = warmup_trials
         self.trials = trials
+        self.times_per_trials = times_per_trials
         self.in_ms = in_ms
 
         self.device = device
@@ -33,26 +41,33 @@ class EDTimer:
 
         self.backend = get_backend()
 
-    def time(self):
+    def time(self, return_all=False):
+        all_elapsed_time = None
         if self.backend == "jax":
-            return self.time_jax()
+            all_elapsed_time = self.time_jax()
         elif self.backend == "torch":
             if self.device == "cuda":
-                return self.time_torch_cuda()
+                all_elapsed_time = self.time_torch_cuda()
             elif self.device == "cpu":
-                return self.time_cpu()
+                all_elapsed_time = self.time_cpu()
+        if all_elapsed_time is not None:
+            if return_all is True:
+                return all_elapsed_time
+            return np.mean(all_elapsed_time)
         return None
 
     def time_cpu(self):
         for _ in range(self.warmup_trials):
             self.func()
 
-        start_t = time.perf_counter()
+        elapsed_time = []
         for _ in range(self.trials):
-            self.func()
+            start_t = time.perf_counter()
+            for _ in range(self.times_per_trials):
+                self.func()
+            elapsed_time.append(time.perf_counter() - start_t)
 
-        elapsed_time = time.perf_counter() - start_t
-        elapsed_time = elapsed_time / self.trials
+        elapsed_time = np.array(elapsed_time) / self.times_per_trials
 
         # time elapsed in **milliseconds**
         if self.in_ms:
@@ -74,21 +89,22 @@ class EDTimer:
             if evt_idx >= 0:
                 start_evt[evt_idx].record()
 
-            self.func()
+            for _ in range(self.times_per_trials):
+                self.func()
 
             if evt_idx >= 0:
                 end_evt[evt_idx].record()
 
         torch.cuda.synchronize()
-        ops_elapsed_time = 0
+        elapsed_time = []
         for evt_idx in range(0, self.trials):
             # time elapsed in **milliseconds**
-            ops_elapsed_time += start_evt[evt_idx].elapsed_time(end_evt[evt_idx])
-        ops_elapsed_time = ops_elapsed_time / self.trials
+            elapsed_time.append(start_evt[evt_idx].elapsed_time(end_evt[evt_idx]))
+        elapsed_time = np.array(elapsed_time) / self.times_per_trials
 
         if self.in_ms:
-            return ops_elapsed_time
-        return ops_elapsed_time / 1000
+            return elapsed_time
+        return elapsed_time / 1000
 
     def time_jax(self):
         import jax
@@ -96,13 +112,18 @@ class EDTimer:
             self.func()
             (jax.device_put(0.) + 0).block_until_ready()
 
-        start_t = time.perf_counter()
+        elapsed_time = []
         for _ in range(self.trials):
-            self.func()
+
+            start_t = time.perf_counter()
+
+            for _ in range(self.times_per_trials):
+                self.func()
+
             (jax.device_put(0.) + 0).block_until_ready()
 
-        elapsed_time = time.perf_counter() - start_t
-        elapsed_time = elapsed_time / self.trials
+            elapsed_time.append(time.perf_counter() - start_t)
+        elapsed_time = np.array(elapsed_time) / self.times_per_trials
 
         # time elapsed in **milliseconds**
         if self.in_ms:
