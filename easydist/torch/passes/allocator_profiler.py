@@ -186,7 +186,7 @@ class AllocatorProfiler(Interpreter):
 
         with self._set_current_node(n):
             # tell profiling_allocator stop recording
-            __main__.ignore = True
+            __main__.start_recording = False
 
             inputs_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'], n.args)
             materialized_inputs = pytree.tree_map_only(torch.Tensor, materialize_random, inputs_signature)
@@ -208,7 +208,7 @@ class AllocatorProfiler(Interpreter):
             __main__.op_name = n.name
 
             # tell profiling_allocator to start profiling
-            __main__.ignore = False
+            __main__.start_recording = True
 
             output = getattr(self, n.op)(n.target, materialized_inputs, {})
 

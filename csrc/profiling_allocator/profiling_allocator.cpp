@@ -8,12 +8,14 @@
 extern "C" {
 
 PyObject *op_name = nullptr;
-PyObject *ignore = nullptr;
+PyObject *start_recording = nullptr;
 PyObject *global_dict = nullptr;
 PyObject *main_module = nullptr;
 PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
+
 std::unordered_set<void*> profiling_ptrs;
+bool runtime_shortcut = false;
 
 void init_allocator(int device_count) {
    // initialize Python interpreter
@@ -55,16 +57,16 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    // only profile on device 0
    if (device != 0) return ptr;
 
-   // read ignore flag from global variables
-   // ignore is a Borrowed reference.
-   ignore = PyDict_GetItemString(global_dict, "ignore");
-   if (ignore == nullptr) {
-      std::cerr << "ignore is null!" << std::endl;
+   // read start_recording flag from global variables
+   // start_recording is a Borrowed reference.
+   start_recording = PyDict_GetItemString(global_dict, "start_recording");
+   if (start_recording == nullptr) {
+      std::cerr << "start_recording is null!" << std::endl;
       exit(-1);
    }
 
-   // ignore: skip profiling
-   if (PyObject_IsTrue(ignore)) {
+   // if recording not started, skip profiling
+   if (PyObject_IsFalse(start_recording)) {
       return ptr;
    }
 
@@ -119,6 +121,10 @@ void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 }
 
 void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
+   // after switching mode to runtime, skip mode routing
+   if (runtime_shortcut) return runtime_malloc(size, device, stream);
+
+   // mode routing
    allocator_mode = PyDict_GetItemString(global_dict, "allocator_mode");
    if (allocator_mode == nullptr) {
       std::cerr << "allocator mode is null!" << std::endl;
@@ -134,6 +140,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
       profiling_ptrs.insert(ptr);
       return ptr;
    } else if (allocator_mode_string == "runtime") {
+      runtime_shortcut = true;
       return runtime_malloc(size, device, stream);
    } else {
       std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;

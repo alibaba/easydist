@@ -24,10 +24,11 @@ def init_profiling_allocator():
 
 def register_global_variables():
     # setting global variables
-    __main__.ignore = True
-    __main__.op_name = '123'
+    __main__.start_recording = False
+    __main__.op_name = 'N/A'
     __main__.allocator_profiling_info = []
-    __main__.allocator_mode = 'runtime'
+    __main__.allocator_mode = 'profile'
+    __main__.memory_plan = []
 
 def swap_to_profiling_allocator():
     # swap from caching allocator to profiling allocator
