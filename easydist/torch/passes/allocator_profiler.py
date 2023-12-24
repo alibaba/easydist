@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple
 
 import __main__
 import torch.utils._pytree as pytree
@@ -92,9 +92,10 @@ class NodeProfilingInfo:
 
 class ModuleProfilingInfo:
     def __init__(self) -> None:
-        self.node_profiling_info = dict()
-        self._is_inplace: Dict[bool] = None
-        self._local_indexes: Dict[int] = None
+        self.node_profiling_info: Dict[str, NodeProfilingInfo] = dict()
+        self._is_inplace: Dict[str, bool] = None
+        self._local_indexes: Dict[str, int] = None
+        self._inplace_mapping: Dict[str, Tuple[int, int]] = None
 
     @property
     def node_names(self):
@@ -132,16 +133,30 @@ class ModuleProfilingInfo:
 
         return self._is_inplace
 
-    def set_node_profiling_info(self, node_name, node_info):
+    @property
+    def inplace_mapping(self):
+        if not self._inplace_mapping:
+            self._inplace_mapping = dict()
+            for node_name in self.node_names:
+                node_info = self.get_node_profiling_info(node_name)
+                for out_index, out_addr in enumerate(node_info.output_address):
+                    for in_index, in_addr in enumerate(node_info.input_address):
+                        if out_addr == in_addr:
+                            self._inplace_mapping[node_name] = (in_index, out_index)
+
+        return self._inplace_mapping
+
+
+    def set_node_profiling_info(self, node_name: str, node_info: NodeProfilingInfo):
         self.node_profiling_info[node_name] = node_info
 
-    def __setitem__(self, node_name, node_info):
+    def __setitem__(self, node_name: str, node_info: NodeProfilingInfo):
         self.set_node_profiling_info(node_name, node_info)
 
-    def get_node_profiling_info(self, node_name):
+    def get_node_profiling_info(self, node_name: str):
         return self.node_profiling_info[node_name]
 
-    def __getitem__(self, node_name):
+    def __getitem__(self, node_name: str):
         return self.get_node_profiling_info(node_name)
 
 @compatibility(is_backward_compatible=True)
@@ -238,13 +253,8 @@ class AllocatorProfiler(Interpreter):
             node_info.add_allocator_info(info)
 
         for node_name in self.profiling_info.node_names:
+            if 'getitem' not in node_name:
+                continue
             print("node name in prof info: ", node_name)
-            print(("node info:\n{}").format(self.profiling_info.get_node_profiling_info(node_name)))
-            if self.profiling_info.local_indexes[node_name]:
-                print(node_name, self.profiling_info.get_node_profiling_info(node_name).qualified_name, self.profiling_info.local_indexes[node_name])
-            elif self.profiling_info.is_inplace[node_name]:
-                print(node_name, self.profiling_info.get_node_profiling_info(node_name).qualified_name, 'inplace')
-            else:
-                print("warning: unexpected situation!", node_name, ':', self.profiling_info.get_node_profiling_info(node_name).qualified_name)
-
-        print(self.profiling_info['native_layer_norm'])
+            print(self.profiling_info.inplace_mapping[node_name])
+            print(self.profiling_info[node_name])

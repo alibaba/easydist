@@ -66,7 +66,7 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    }
 
    // if recording not started, skip profiling
-   if (PyObject_IsFalse(start_recording)) {
+   if (!PyObject_IsTrue(start_recording)) {
       return ptr;
    }
 
@@ -95,13 +95,6 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
       exit(-1);
    }
    Py_DECREF(profiling_info_tuple);
-
-   auto op_name_string = std::string(PyBytes_AsString(PyUnicode_AsUTF8String(op_name)));
-   if (op_name_string == "native_layer_norm") {
-      std::cout << "op_name: " << op_name_string << std::endl;
-      std::cout << "int of ptr: " << ptr_int_value << std::endl;
-      std::cout << "size: " << size << std::endl;
-   }
 
    return ptr;
 }
