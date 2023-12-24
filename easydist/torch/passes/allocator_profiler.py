@@ -138,11 +138,12 @@ class ModuleProfilingInfo:
         if not self._inplace_mapping:
             self._inplace_mapping = dict()
             for node_name in self.node_names:
+                self._inplace_mapping[node_name] = []
                 node_info = self.get_node_profiling_info(node_name)
                 for out_index, out_addr in enumerate(node_info.output_address):
                     for in_index, in_addr in enumerate(node_info.input_address):
                         if out_addr == in_addr:
-                            self._inplace_mapping[node_name] = (in_index, out_index)
+                            self._inplace_mapping[node_name].append((in_index, out_index))
 
         return self._inplace_mapping
 
