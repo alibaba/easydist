@@ -13,6 +13,7 @@
 # ==============================================================================
 
 from typing import Any, List, Dict, Tuple
+from collections import defaultdict
 
 import __main__
 import torch.utils._pytree as pytree
@@ -25,6 +26,7 @@ from torch.fx._compatibility import compatibility
 from easydist.torch.utils import EDNodeType
 from easydist.torch.init_helper import materialize_random
 from easydist.torch.utils import to_meta
+from easydist.torch.mem_allocation_info import GraphMemInfo
 
 __all__ = ['AllocatorProfiler']
 
@@ -93,7 +95,6 @@ class NodeProfilingInfo:
 class ModuleProfilingInfo:
     def __init__(self) -> None:
         self.node_profiling_info: Dict[str, NodeProfilingInfo] = dict()
-        self._is_inplace: Dict[str, bool] = None
         self._local_indexes: Dict[str, int] = None
         self._inplace_mapping: Dict[str, Tuple[int, int]] = None
 
@@ -101,52 +102,32 @@ class ModuleProfilingInfo:
     def node_names(self):
         return self.node_profiling_info.keys()
 
-    @property
-    def local_indexes(self):
-        if not self._local_indexes:
-            self.build_local_indexes()
-        return self._local_indexes
+    def create_graph_mem_info(self) -> GraphMemInfo:
+        graph_mem_info = GraphMemInfo()
 
-    def build_local_indexes(self):
-        # calculating local indexes of each malloc
-        self._local_indexes = dict()
         for node_name in self.node_names:
-            node_info = self.get_node_profiling_info(node_name)
-            indexes = []
-            for i, alloc_addr in enumerate(node_info.allocator_address):
-                if alloc_addr in node_info.output_address:
-                    indexes.append(i)
-            self._local_indexes[node_name] = indexes
+            node_mem_info = graph_mem_info.get_node_mem_info(node_name)
+            node_profiling_info = self.get_node_profiling_info(node_name)
 
-    @property
-    def is_inplace(self):
-        if not self._is_inplace:
-            self._is_inplace = dict()
-            for node_name in self.node_names:
-                node_info = self.get_node_profiling_info(node_name)
-                flag = False
-                for out_addr in node_info.output_address:
-                    if out_addr in node_info.input_address:
-                        flag = True
-                        break
-                self._is_inplace[node_name] = flag
+            for out_idx, out_addr in enumerate(node_profiling_info.output_address):
+                is_allocated = False
+                for alloc_idx, alloc_addr in enumerate(node_profiling_info.allocator_address):
+                    if out_addr == alloc_addr:
+                        alloc_size = node_profiling_info.allocator_size[alloc_idx]
+                        node_mem_info.add_out_tensor_mem_info(
+                                          out_idx, alloc_size, alloc_idx, False)
+                        is_allocated = True
+                        break;
 
-        return self._is_inplace
-
-    @property
-    def inplace_mapping(self):
-        if not self._inplace_mapping:
-            self._inplace_mapping = dict()
-            for node_name in self.node_names:
-                self._inplace_mapping[node_name] = []
-                node_info = self.get_node_profiling_info(node_name)
-                for out_index, out_addr in enumerate(node_info.output_address):
-                    for in_index, in_addr in enumerate(node_info.input_address):
+                if not is_allocated:
+                    for in_idx, in_addr in enumerate(node_profiling_info.input_address):
                         if out_addr == in_addr:
-                            self._inplace_mapping[node_name].append((in_index, out_index))
+                            input_size = node_profiling_info.input_size[in_idx]
+                            node_mem_info.add_out_tensor_mem_info(
+                                              out_idx, input_size, in_idx, True)
+                            break;
 
-        return self._inplace_mapping
-
+        return graph_mem_info
 
     def set_node_profiling_info(self, node_name: str, node_info: NodeProfilingInfo):
         self.node_profiling_info[node_name] = node_info
@@ -245,7 +226,7 @@ class AllocatorProfiler(Interpreter):
             meta_out = pytree.tree_map(to_meta, output)
             return meta_out
 
-    def finalize_allocator_info(self):
+    def create_graph_mem_info(self) -> GraphMemInfo:
         # process info from our profiling allocator
         # data format from allocator: (node_name, ptr_address)
         for allocator_info in __main__.allocator_profiling_info:
@@ -253,9 +234,7 @@ class AllocatorProfiler(Interpreter):
             node_info = self.profiling_info.get_node_profiling_info(node_name)
             node_info.add_allocator_info(info)
 
-        for node_name in self.profiling_info.node_names:
-            if 'getitem' not in node_name:
-                continue
-            print("node name in prof info: ", node_name)
-            print(self.profiling_info.inplace_mapping[node_name])
-            print(self.profiling_info[node_name])
+        graph_mem_info = self.profiling_info.create_graph_mem_info()
+
+        return graph_mem_info
+

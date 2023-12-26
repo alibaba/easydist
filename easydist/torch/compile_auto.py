@@ -393,7 +393,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         profiling_info = ModuleProfilingInfo()
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
         _ = alloc_profiler.run([])
-        alloc_profiler.finalize_allocator_info()
+        graph_mem_info = alloc_profiler.create_graph_mem_info()
+        print(str(graph_mem_info))
 
         # setting allocator back to runtime mode
         __main__.allocator_mode = 'runtime'
