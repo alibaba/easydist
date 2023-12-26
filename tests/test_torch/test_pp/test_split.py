@@ -1,5 +1,4 @@
 import os
-import copy
 import random
 from contextlib import nullcontext
 from functools import partial
@@ -12,16 +11,15 @@ import numpy as np
 import torch
 import torch.utils._pytree as pytree
 from torch.nn.utils import stateless
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
-                                swin_t, vgg19, vit_b_16)
+from torch._subclasses.fake_tensor import FakeTensor
+from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18, swin_t, vgg19,
+                                vit_b_16)
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (split_by, fw_bw_split_point, SplitPatcher,
-                                                        annotate_split_points, PipeSplitWrapper,
-                                                        compile_stateful_stages,
-                                                        split_into_equal_size,
-                                                        step_split_point)
+from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
+                                                             PipeSplitWrapper,
+                                                             compile_stateful_stages,
+                                                             split_into_equal_size)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -85,8 +83,8 @@ def train_step(input, label, model, opt):
 
 def test_main(model_cls, input_size, split_ann_or_policy):
     module = model_cls().cuda().train().double()
-    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True) #, capturable=True)
-    
+    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True)  #, capturable=True)
+
     if isinstance(split_ann_or_policy, dict):
         annotate_split_points(module, split_ann_or_policy)
     else:
@@ -130,6 +128,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
 
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
+
     # named_states = {}
     with _enable_compile(), SplitPatcher(module, opt):
         traced_graph = ed_make_fx(partial(stateless_func, train_step),
@@ -143,16 +142,18 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     save_graphviz_dot(traced_graph, 'traced_graph')
 
     args_unflatten = (params, buffers, named_states, args, kwargs)
+
     def arg_copy_func(x):
         if isinstance(x, torch.Tensor):
             return x.clone().detach()
         else:
             return x
+
     args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
     args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
 
-    ph2name, out2idx, compiled_stages, gm = compile_stateful_stages(
-        module, traced_graph, args_flatten, args_spec)
+    ph2name, out2idx, compiled_stages, gm = compile_stateful_stages(module, traced_graph,
+                                                                    args_flatten, args_spec)
 
     id_rand_input = -1
     for i, arg in enumerate(args_flatten):
@@ -193,22 +194,25 @@ if __name__ == '__main__':
         'norm': PipeSplitWrapper.SplitPoint.END,
         'linear0_1': PipeSplitWrapper.SplitPoint.END
     })
-    test_main(alexnet, (16, 3, 224, 224), {
-        'features.10': PipeSplitWrapper.SplitPoint.END,
-        'classifier.3': PipeSplitWrapper.SplitPoint.END
-    })
-    test_main(densenet121, (16, 3, 224, 224), {
-        'features.denseblock1.denselayer4.norm2': PipeSplitWrapper.SplitPoint.END,
-        'features.transition2.conv': PipeSplitWrapper.SplitPoint.END,
-        'features.denseblock4.denselayer1.relu1': PipeSplitWrapper.SplitPoint.END,
-        'classifier': PipeSplitWrapper.SplitPoint.BEGINNING
-    })
-    test_main(efficientnet_b0, (16, 3, 224, 224), {
-        'features.2.0.block.1': PipeSplitWrapper.SplitPoint.END,
-        'features.4.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
-        'features.6.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
-        'features.8': PipeSplitWrapper.SplitPoint.BEGINNING
-    })
+    test_main(
+        alexnet, (16, 3, 224, 224), {
+            'features.10': PipeSplitWrapper.SplitPoint.END,
+            'classifier.3': PipeSplitWrapper.SplitPoint.END
+        })
+    test_main(
+        densenet121, (16, 3, 224, 224), {
+            'features.denseblock1.denselayer4.norm2': PipeSplitWrapper.SplitPoint.END,
+            'features.transition2.conv': PipeSplitWrapper.SplitPoint.END,
+            'features.denseblock4.denselayer1.relu1': PipeSplitWrapper.SplitPoint.END,
+            'classifier': PipeSplitWrapper.SplitPoint.BEGINNING
+        })
+    test_main(
+        efficientnet_b0, (16, 3, 224, 224), {
+            'features.2.0.block.1': PipeSplitWrapper.SplitPoint.END,
+            'features.4.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
+            'features.6.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
+            'features.8': PipeSplitWrapper.SplitPoint.BEGINNING
+        })
     test_main(
         resnet18, (16, 3, 224, 224), {
             'layer1': PipeSplitWrapper.SplitPoint.END,
@@ -216,30 +220,32 @@ if __name__ == '__main__':
             'layer3': PipeSplitWrapper.SplitPoint.END,
             'layer4': PipeSplitWrapper.SplitPoint.END,
         })
-    test_main(swin_t, (16, 3, 224, 224), {
-        'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
-        'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
-        'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
-        'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
-    })
+    test_main(
+        swin_t, (16, 3, 224, 224), {
+            'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
+            'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
+            'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
+            'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
+        })
     test_main(
         vgg19, (16, 3, 224, 224), {
             'features.10': PipeSplitWrapper.SplitPoint.END,
             'features.20': PipeSplitWrapper.SplitPoint.END,
             'classifier.3': PipeSplitWrapper.SplitPoint.END
         })
-    test_main(vit_b_16, (16, 3, 224, 224), {
-        'encoder.layers.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
-        'encoder.layers.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
-        'encoder.layers.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
-    })
+    test_main(
+        vit_b_16, (16, 3, 224, 224), {
+            'encoder.layers.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
+            'encoder.layers.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
+            'encoder.layers.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
+        })
 
-    # test_main(Foo, (16, 1024), split_into_equal_size(2))
-    # test_main(Foo1, (16, 1024), split_into_equal_size(2))
-    # test_main(alexnet, (16, 3, 224, 224), split_into_equal_size(3))
-    # test_main(densenet121, (16, 3, 224, 224), split_into_equal_size(5))
-    # test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(10))
-    # test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(4))
-    # test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(10))
-    # test_main(vgg19, (16, 3, 224, 224), split_into_equal_size(3))
-    # test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(10))
+    test_main(Foo, (16, 1024), split_into_equal_size(2))
+    test_main(Foo1, (16, 1024), split_into_equal_size(2))
+    test_main(alexnet, (16, 3, 224, 224), split_into_equal_size(3))
+    test_main(densenet121, (16, 3, 224, 224), split_into_equal_size(5))
+    test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(10))
+    test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(4))
+    test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(10))
+    test_main(vgg19, (16, 3, 224, 224), split_into_equal_size(3))
+    test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(10))

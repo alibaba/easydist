@@ -1,6 +1,5 @@
 import logging
 import operator
-from collections import defaultdict
 from enum import Enum
 from typing import (Callable, Dict, List, Tuple)
 
@@ -8,7 +7,6 @@ import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
 import torch.utils._pytree as pytree
-from torch._functorch.partitioners import _extract_graph_with_inputs_outputs, InvalidNode, InvalidNodeBase
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 
 from easydist.utils import rgetattr, rsetattr
@@ -235,7 +233,10 @@ def split_by(mod: torch.nn.Module, traced: torch.fx.GraphModule, split_point: Ca
 
     return split
 
+
 debug_cnt = 0
+
+
 def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]):
     new_graph = fx.Graph()
     env = {}
@@ -310,7 +311,7 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
     new_graph.eliminate_dead_code()
     new_graph.lint()
 
-    new_gm = fx.GraphModule(gm, new_graph) # TODO @botbw: move this to meta
+    new_gm = fx.GraphModule(gm, new_graph)  # TODO @botbw: move this to meta
 
     injected_states = {}
     to_pop = []
@@ -322,7 +323,7 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
         gm.injected_states.pop(name)
     new_gm.injected_states = injected_states
     new_gm.outputs_spec = outputs
-    
+
     global debug_cnt
     save_graphviz_dot(new_gm, f'step_gm_{debug_cnt}')
     debug_cnt += 1
@@ -335,7 +336,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     global_outputs_spec = [node.name for node in list(traced_gm.graph.nodes)[-1].args[0]]
 
     phs_spec_unflatten = pytree.tree_unflatten(global_phs_spec, args_spec)
-    states_spec_flatten, states_spec = pytree.tree_flatten(phs_spec_unflatten[:3]) # flatten (params, buffers, named_states)
+    states_spec_flatten, states_spec = pytree.tree_flatten(
+        phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
     states_outputs_spec_unflatten = pytree.tree_unflatten(
         global_outputs_spec[:len(states_spec_flatten)], states_spec)
     inv_params = {arg: param_name for param_name, arg in phs_spec_unflatten[0].items()}
@@ -401,15 +403,13 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             self.outputs = {}
 
             if full_step_gm is not None:
-                params = list(
-                    set(self.fw_gm.injected_states) & set(full_step_gm.inputs_spec))
+                params = list(set(self.fw_gm.injected_states) & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
                 grad_inputs = list(set(self.stage_outputs_spec) & set(full_step_gm.inputs_spec))
                 input_optim_states, _ = pytree.tree_flatten(
                     [phs_spec_unflatten[2][param_name] for param_name in param_names])
                 self.step_gm_args = params + grad_inputs + input_optim_states
-                self.step_gm = _extract_step_subgraph_from_args(
-                    full_step_gm, self.step_gm_args)
+                self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
 
         def forward(self, **kwargs):
             assert set(kwargs.keys()) == self.fw_func_args, "forward args should be saved for bw"
@@ -479,7 +479,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 else:
                     raise RuntimeError(f"arg {arg_name} not found")
             rets = self.step_gm(**kwargs)
-            
+
             for node, ret in zip(self.step_gm.outputs_spec, rets):
                 if node.name in global_outputs_spec:
                     self.outputs[node.name] = ret
@@ -567,7 +567,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
                 current_stateful_fw_bw = stateful_fw_bw
 
-    if current_stateful_fw_bw is not None: # forward and backward followed by no step
+    if current_stateful_fw_bw is not None:  # forward and backward followed by no step
         assert len(current_stateful_fw_bw) % 2 == 0
         num_stage = len(current_stateful_fw_bw) // 2
         for fw_gm, bw_gm in zip(current_stateful_fw_bw[:num_stage],
@@ -577,7 +577,6 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     for name, submod in splited_fw_bw_gm.named_children():
         save_graphviz_dot(submod, name)
-
 
     g = fx.Graph()
     env = {}
@@ -615,13 +614,12 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     setattr(g, 'eliminate_dead_node', eliminate_dead_node)
     gm = fx.GraphModule({}, g)
-    
+
     out2idx = {name: i for i, name in enumerate(global_outputs_spec)}
     return global_phs_spec, out2idx, compiled_stages, gm
 
 
 def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], torch.fx.GraphModule]:
-    
 
     def _split_into_nstages_equal_size(mod: torch.nn.Module) -> torch.fx.GraphModule:
         tracer = torch.fx.Tracer()
@@ -688,15 +686,15 @@ def _split_on_size_threshold_with_max_stages(
     node_param_sizes = _analyze_node_size(gm)
 
     # Record split positions
-    insert_before_nodes: List[torch.fx.Node] = []
+    insert_after_nodes: List[torch.fx.Node] = []
 
-    def new_stage_before(node):
-        insert_before_nodes.append(node)
+    def new_stage_after(node):
+        insert_after_nodes.append(node)
 
     # Track the parameters we have seen in the current bucket and their total size
     accumulate_size = 0
     accumulate_params: Dict = {}
-
+    checked_nodes = []
     for node in gm.graph.nodes:
         if node not in node_param_sizes:
             # The callsite of this node does not involve parameters or buffers
@@ -709,6 +707,7 @@ def _split_on_size_threshold_with_max_stages(
         repeated_params: Dict = {}
         param_sizes = node_param_sizes[node]
         if node.op == "call_function":
+            checked_nodes.append(node)
             # For function, the parameter it uses can be shared with other functions seen previously
             for param_name, size in param_sizes.items():
                 if param_name not in accumulate_params:  # new parameter
@@ -718,6 +717,7 @@ def _split_on_size_threshold_with_max_stages(
                     repeated_params.setdefault(param_name)
                     repeated_size += size
         elif node.op == "call_module":
+            checked_nodes.append(node)
             # For module, we count its paramters as a single whole
             for param_name, size in param_sizes.items():
                 new_size += size
@@ -727,9 +727,14 @@ def _split_on_size_threshold_with_max_stages(
             accumulate_size += new_size
             accumulate_params.update(new_params)
         elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage
-            new_stage_before(node.next)
+            new_stage_after(node)
         else:  # cannot accommodate this node
-            new_stage_before(node)
+            try:
+                new_stage_after(checked_nodes[-2])
+            except IndexError:
+                raise RuntimeError(
+                    f"Cannot split graph into stages with size threshold {threshold} and max stages {max_stages}"
+                )
             accumulate_size = repeated_size + new_size
             accumulate_params.clear()
             accumulate_params.update(repeated_params)
@@ -749,7 +754,7 @@ def _split_on_size_threshold_with_max_stages(
         return PipeSplitWrapper(target_module, PipeSplitWrapper.SplitPoint.END)
 
     nstages = 1
-    for node in insert_before_nodes:  # TODO @botbw: should insert after the node
+    for node in insert_after_nodes:
         if nstages == max_stages:
             break
         if node.op == "call_function":
