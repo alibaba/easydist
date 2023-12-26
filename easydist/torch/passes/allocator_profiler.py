@@ -35,10 +35,18 @@ class NodeProfilingInfo:
     def __init__(self, name) -> None:
         self.name = name
         self.qualified_name: str = ""
+
+        # input info
         self.input_address: List[int] = []
         self.input_size: List[int] = []
+        self.input_arg_index: List[int] = []
+        self.input_tensor_index: List[int] = []
+
+        # output info
         self.output_address: List[int] = []
         self.output_size: List[int] = []
+
+        # allocator info
         self.allocator_address: List[int] = []
         self.allocator_size: List[int] = []
 
@@ -51,9 +59,17 @@ class NodeProfilingInfo:
     def add_input_size(self, input_size: int) -> None:
         self.input_size.append(input_size)
 
-    def add_input_info(self, input_tensor: torch.Tensor) -> None:
+    def add_input_arg_index(self, arg_index: int) -> None:
+        self.input_arg_index.append(arg_index)
+
+    def add_input_tensor_index(self, tensor_index: int) -> None:
+        self.input_tensor_index.append(tensor_index)
+
+    def add_input_info(self, input_tensor: torch.Tensor, arg_index: int, tensor_index: int) -> None:
         self.add_input_address(input_tensor.data_ptr())
         self.add_input_size(input_tensor.element_size() * input_tensor.numel())
+        self.add_input_arg_index(arg_index)
+        self.add_input_tensor_index(tensor_index)
 
     def add_output_address(self, output_address: int) -> None:
         self.output_address.append(output_address)
@@ -126,8 +142,11 @@ class ModuleProfilingInfo:
                     for in_idx, in_addr in enumerate(node_profiling_info.input_address):
                         if out_addr == in_addr:
                             input_size = node_profiling_info.input_size[in_idx]
+                            arg_index = node_profiling_info.input_arg_index[in_idx]
+                            tensor_index = node_profiling_info.input_tensor_index[in_idx]
                             node_mem_info.add_out_tensor_mem_info(
-                                              out_idx, input_size, in_idx, True)
+                                              out_idx, input_size, in_idx, \
+                                                True, arg_index, tensor_index)
                             break;
 
         return graph_mem_info
@@ -192,17 +211,16 @@ class AllocatorProfiler(Interpreter):
             materialized_inputs = pytree.tree_map_only(torch.Tensor, materialize_random, inputs_signature)
 
             # record input addresses
-            flat_inputs, _ = pytree.tree_flatten(materialized_inputs)
-            constant_types = [bool, int, float, torch.dtype]
-            for flat_input in flat_inputs:
-                if isinstance(flat_input, torch.Tensor):
-                    node_profiling_info.add_input_info(flat_input)
-                elif flat_input is None:
-                    continue
-                elif type(flat_input) in constant_types:
-                    continue
-                else:
-                    print("Unexpected input!", type(flat_input), flat_input)
+            # TODO(wuhao): use customized tree_flatten, avoid flatten of non-tensors
+            constant_types = [type(None), bool, int, float, torch.dtype]
+            for arg_index, materialized_input in enumerate(materialized_inputs):
+                for tensor_index, flat_input in enumerate(pytree.tree_flatten(materialized_input)[0]):
+                    if isinstance(flat_input, torch.Tensor):
+                        node_profiling_info.add_input_info(flat_input, arg_index, tensor_index)
+                    elif type(flat_input) in constant_types:
+                        continue
+                    else:
+                        print('Unexpected input!', type(flat_input), flat_input)
 
             # set op_name for profiling_allocator.so
             __main__.op_name = n.name

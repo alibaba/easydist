@@ -20,7 +20,9 @@ class OutTensorMemInfo:
         out_index,
         mem_size,
         mem_index,
-        is_reference
+        is_reference,
+        arg_index,
+        tensor_index
     ):
         self.out_index = out_index
         self.mem_size = mem_size
@@ -33,6 +35,9 @@ class OutTensorMemInfo:
         # True: it is a reference of an input tensor
         # False: it is new allocated memory
         self.is_reference = is_reference
+
+        self.arg_index = arg_index
+        self.tensor_index = tensor_index
 
     def __str__(self) -> str:
         mem_info_str = ""
@@ -51,9 +56,9 @@ class NodeMemInfo:
         self.out_tensor_infos = []
 
     def add_out_tensor_mem_info(self, out_index, mem_size, mem_index,
-                                is_reference):
+                                is_reference, arg_index=-1, tensor_index=-1):
         out_tensor_mem_info = OutTensorMemInfo(
-                                  out_index, mem_size, mem_index, is_reference)
+                                  out_index, mem_size, mem_index, is_reference, arg_index, tensor_index)
         self.out_tensor_infos.append(out_tensor_mem_info)
 
     def __str__(self) -> str:
