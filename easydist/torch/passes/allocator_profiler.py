@@ -32,7 +32,8 @@ __all__ = ['AllocatorProfiler']
 
 
 class NodeProfilingInfo:
-    def __init__(self) -> None:
+    def __init__(self, name) -> None:
+        self.name = name
         self.qualified_name: str = ""
         self.input_address: List[int] = []
         self.input_size: List[int] = []
@@ -76,7 +77,8 @@ class NodeProfilingInfo:
         self.add_allocator_size(size)
 
     def __str__(self) -> str:
-        return_str = self.qualified_name + "\n"
+        return_str = self.name + "\n"
+        return_str += "qualified_name: " + self.qualified_name + "\n"
         return_str += "input_address: " + ",".join([str(addr) for addr in self.input_address]) + "\n"
         return_str += "input_size: " + ','.join([str(size) for size in self.input_size]) + "\n"
         return_str += "output_address: " + ",".join([str(addr) for addr in self.output_address]) + "\n"
@@ -87,7 +89,8 @@ class NodeProfilingInfo:
         return return_str
 
     def __repr__(self) -> str:
-        return f'NodeProfilingInfo(qualified_name={repr(self.qualified_name)}, ' + \
+        return f'NodeProfilingInfo(name={repr(self.name)}, ' + \
+            f'qualified_name={repr(self.qualified_name)}, ' \
             f'input_address={repr(self.input_address)}, ' + \
             f'output_address={repr(self.output_address)}, ' + \
             f'allocator_address={repr(self.allocator_address)})'
@@ -178,7 +181,7 @@ class AllocatorProfiler(Interpreter):
                 return None
 
         # create dict to store addresses for this node
-        node_profiling_info = NodeProfilingInfo()
+        node_profiling_info = NodeProfilingInfo(n.name)
         node_profiling_info.set_qualified_name(qualified_name)
 
         with self._set_current_node(n):
