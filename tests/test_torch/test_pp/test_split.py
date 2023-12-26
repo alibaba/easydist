@@ -130,7 +130,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
 
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
-
+    # named_states = {}
     with _enable_compile(), SplitPatcher(module, opt):
         traced_graph = ed_make_fx(partial(stateless_func, train_step),
                                   tracing_mode='fake',
@@ -188,51 +188,51 @@ def test_main(model_cls, input_size, split_ann_or_policy):
 
 
 if __name__ == '__main__':
-    # test_main(Foo, (16, 1024), {'norm': PipeSplitWrapper.SplitPoint.END})
-    # test_main(Foo1, (16, 1024), {
-    #     'norm': PipeSplitWrapper.SplitPoint.END,
-    #     'linear0_1': PipeSplitWrapper.SplitPoint.END
-    # })
-    # test_main(alexnet, (16, 3, 224, 224), {
-    #     'features.10': PipeSplitWrapper.SplitPoint.END,
-    #     'classifier.3': PipeSplitWrapper.SplitPoint.END
-    # })
-    # test_main(densenet121, (16, 3, 224, 224), {
-    #     'features.denseblock1.denselayer4.norm2': PipeSplitWrapper.SplitPoint.END,
-    #     'features.transition2.conv': PipeSplitWrapper.SplitPoint.END,
-    #     'features.denseblock4.denselayer1.relu1': PipeSplitWrapper.SplitPoint.END,
-    #     'classifier': PipeSplitWrapper.SplitPoint.BEGINNING
-    # })
-    # test_main(efficientnet_b0, (16, 3, 224, 224), {
-    #     'features.2.0.block.1': PipeSplitWrapper.SplitPoint.END,
-    #     'features.4.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
-    #     'features.6.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
-    #     'features.8': PipeSplitWrapper.SplitPoint.BEGINNING
-    # })
-    # test_main(
-    #     resnet18, (16, 3, 224, 224), {
-    #         'layer1': PipeSplitWrapper.SplitPoint.END,
-    #         'layer2': PipeSplitWrapper.SplitPoint.END,
-    #         'layer3': PipeSplitWrapper.SplitPoint.END,
-    #         'layer4': PipeSplitWrapper.SplitPoint.END,
-    #     })
-    # test_main(swin_t, (16, 3, 224, 224), {
-    #     'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
-    #     'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
-    #     'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
-    #     'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
-    # })
-    # test_main(
-    #     vgg19, (16, 3, 224, 224), {
-    #         'features.10': PipeSplitWrapper.SplitPoint.END,
-    #         'features.20': PipeSplitWrapper.SplitPoint.END,
-    #         'classifier.3': PipeSplitWrapper.SplitPoint.END
-    #     })
-    # test_main(vit_b_16, (16, 3, 224, 224), {
-    #     'encoder.layers.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
-    #     'encoder.layers.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
-    #     'encoder.layers.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
-    # })
+    test_main(Foo, (16, 1024), {'norm': PipeSplitWrapper.SplitPoint.END})
+    test_main(Foo1, (16, 1024), {
+        'norm': PipeSplitWrapper.SplitPoint.END,
+        'linear0_1': PipeSplitWrapper.SplitPoint.END
+    })
+    test_main(alexnet, (16, 3, 224, 224), {
+        'features.10': PipeSplitWrapper.SplitPoint.END,
+        'classifier.3': PipeSplitWrapper.SplitPoint.END
+    })
+    test_main(densenet121, (16, 3, 224, 224), {
+        'features.denseblock1.denselayer4.norm2': PipeSplitWrapper.SplitPoint.END,
+        'features.transition2.conv': PipeSplitWrapper.SplitPoint.END,
+        'features.denseblock4.denselayer1.relu1': PipeSplitWrapper.SplitPoint.END,
+        'classifier': PipeSplitWrapper.SplitPoint.BEGINNING
+    })
+    test_main(efficientnet_b0, (16, 3, 224, 224), {
+        'features.2.0.block.1': PipeSplitWrapper.SplitPoint.END,
+        'features.4.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
+        'features.6.1.block.3': PipeSplitWrapper.SplitPoint.BEGINNING,
+        'features.8': PipeSplitWrapper.SplitPoint.BEGINNING
+    })
+    test_main(
+        resnet18, (16, 3, 224, 224), {
+            'layer1': PipeSplitWrapper.SplitPoint.END,
+            'layer2': PipeSplitWrapper.SplitPoint.END,
+            'layer3': PipeSplitWrapper.SplitPoint.END,
+            'layer4': PipeSplitWrapper.SplitPoint.END,
+        })
+    test_main(swin_t, (16, 3, 224, 224), {
+        'features.2.reduction': PipeSplitWrapper.SplitPoint.END,
+        'features.3.0.mlp.1': PipeSplitWrapper.SplitPoint.END,
+        'features.5.1.attn.qkv': PipeSplitWrapper.SplitPoint.END,
+        'features.7.0.stochastic_depth': PipeSplitWrapper.SplitPoint.END
+    })
+    test_main(
+        vgg19, (16, 3, 224, 224), {
+            'features.10': PipeSplitWrapper.SplitPoint.END,
+            'features.20': PipeSplitWrapper.SplitPoint.END,
+            'classifier.3': PipeSplitWrapper.SplitPoint.END
+        })
+    test_main(vit_b_16, (16, 3, 224, 224), {
+        'encoder.layers.encoder_layer_1.self_attention': PipeSplitWrapper.SplitPoint.END,
+        'encoder.layers.encoder_layer_5.mlp.3': PipeSplitWrapper.SplitPoint.END,
+        'encoder.layers.encoder_layer_9.ln_2': PipeSplitWrapper.SplitPoint.END
+    })
 
     # test_main(Foo, (16, 1024), split_into_equal_size(2))
     # test_main(Foo1, (16, 1024), split_into_equal_size(2))
