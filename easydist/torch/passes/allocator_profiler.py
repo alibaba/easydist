@@ -163,6 +163,22 @@ class ModuleProfilingInfo:
     def __getitem__(self, node_name: str):
         return self.get_node_profiling_info(node_name)
 
+class NodeMemoryPlan:
+    def __init__(self, output_indexes: List[int], assigned_addresses: List[int], total_mallocs: int):
+        self.output_indexes = output_indexes
+        self.assigned_addresses = assigned_addresses
+        self.total_mallocs = total_mallocs
+
+        # output_indexes should associate with assigned_addresses
+        assert len(output_indexes) == len(assigned_addresses), \
+            f'len of output_indexes({len(output_indexes)}) should equal to len of assigned_addresses({len(assigned_addresses)})!'
+
+        # output_indexes must be in range [0, total_mallocs)
+        assert min(output_indexes) >= 0, \
+            f'min of output_indexes {min(output_indexes)} should be greater than zero!'
+        assert total_mallocs > max(output_indexes), \
+            f'total_mallocs {total_mallocs} should be greater than max of output_indexes {max(output_indexes)}!'
+
 @compatibility(is_backward_compatible=True)
 class AllocatorProfiler(Interpreter):
     @compatibility(is_backward_compatible=True)
@@ -259,3 +275,8 @@ class AllocatorProfiler(Interpreter):
 
         return graph_mem_info
 
+    def load_memory_plan(self):
+        memory_plan: Dict[str, NodeMemoryPlan] = dict()
+        memory_plan['foo'] = NodeMemoryPlan([0, 2], [140231118422016, 140233702113280], 3)
+        memory_plan['bar'] = NodeMemoryPlan([1, 3], [140245869126656, 140245869175808], 4)
+        __main__.memory_plan = memory_plan

@@ -397,6 +397,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         print(str(graph_mem_info))
 
         # setting allocator back to runtime mode
+        alloc_profiler.load_memory_plan()
         __main__.allocator_mode = 'runtime'
 
         logging.info("finish profiling fx_module's memory")

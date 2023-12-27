@@ -3,6 +3,8 @@
 #include <iostream>
 #include <Python.h>
 #include <unordered_set>
+#include <unordered_map>
+#include <vector>
 
 
 extern "C" {
@@ -15,7 +17,82 @@ PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
 
 std::unordered_set<void*> profiling_ptrs;
+bool memory_plan_initialized = false;
 bool runtime_shortcut = false;
+
+class NodeMemoryPlan {
+public:
+   std::vector<int> output_indexes;
+   std::vector<uintptr_t> assigned_addresses;
+   int total_mallocs;
+
+   NodeMemoryPlan() : total_mallocs(0) {}
+
+   NodeMemoryPlan(
+      std::vector<int>&& output_indexes,
+      std::vector<uintptr_t>&& assigned_addresses,
+      int total_mallocs) noexcept
+      :  output_indexes(std::move(output_indexes)),
+         assigned_addresses(std::move(assigned_addresses)),
+         total_mallocs(total_mallocs) {}
+};
+
+std::unordered_map<std::string, NodeMemoryPlan> graph_memory_plan;
+
+void init_memory_plan() {
+   if (memory_plan_initialized) {
+      std::cerr << "Error: Memory plan already initialized!" << std::endl;
+      exit(-1);
+   }
+   // read memory plan starts
+   PyObject *memory_plan = PyDict_GetItemString(global_dict, "memory_plan");
+   PyObject *keys = PyDict_Keys(memory_plan);
+
+   // read node memory plan from each node
+   for (Py_ssize_t i = 0; i < PyList_Size(keys); i++) {
+      // get dict keys
+      PyObject *key = PyList_GetItem(keys, i);
+
+      // get values according to the key
+      PyObject *node_memory_plan = PyDict_GetItem(memory_plan, key);
+      std::cout << "wuhao key: " << PyUnicode_AsUTF8(key) << std::endl;
+
+      // read attributes from node_memory_plan
+      //
+      // 1. read output indexes
+      PyObject *output_indexes = PyObject_GetAttrString(node_memory_plan, "output_indexes");
+      std::vector<int> new_output_indexes;
+      Py_ssize_t len_output_indexes = PyList_Size(output_indexes);
+      for (Py_ssize_t i = 0; i < len_output_indexes; i++) {
+         PyObject *index = PyList_GetItem(output_indexes, i);
+         int index_value = PyLong_AsLong(index);
+         new_output_indexes.push_back(index_value);
+      }
+
+      // 2. read assigned addresses
+      PyObject *assigned_addresses = PyObject_GetAttrString(node_memory_plan, "assigned_addresses");
+      std::vector<uintptr_t> new_assigned_addresses;
+      Py_ssize_t len_assigned_addresses = PyList_Size(assigned_addresses);
+      for (Py_ssize_t i = 0; i < len_assigned_addresses; i++) {
+         PyObject *address = PyList_GetItem(assigned_addresses, i);
+         uintptr_t address_value = PyLong_AsUnsignedLong(address);
+         new_assigned_addresses.push_back(address_value);
+      }
+
+      // 3. read total mallocs
+      PyObject *total_mallocs = PyObject_GetAttrString(node_memory_plan, "total_mallocs");
+      int new_total_mallocs = PyLong_AsLong(total_mallocs);
+
+      // insert node memory plan into graph memory plan
+      graph_memory_plan[PyUnicode_AsUTF8(key)] = NodeMemoryPlan(
+         std::move(new_output_indexes),
+         std::move(new_assigned_addresses),
+         new_total_mallocs);
+   }
+
+   // initialization finished
+   memory_plan_initialized = true;
+}
 
 void init_allocator(int device_count) {
    // initialize Python interpreter
@@ -104,6 +181,10 @@ void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 }
 
 void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
+   if (!memory_plan_initialized) {
+      std::cerr << "Error: Memory plan is not initialized!" << std::endl;
+      exit(-1);
+   }
    void *ptr;
    cudaMalloc(&ptr, size);
    return ptr;
@@ -134,6 +215,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
       return ptr;
    } else if (allocator_mode_string == "runtime") {
       runtime_shortcut = true;
+      init_memory_plan();
       return runtime_malloc(size, device, stream);
    } else {
       std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;
