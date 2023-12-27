@@ -85,7 +85,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     module = model_cls().cuda().train().double()
     # opt = None
     opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True) #, momentum=0.9)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     if isinstance(split_ann_or_policy, dict):
         annotate_split_points(module, split_ann_or_policy)
     else:
@@ -146,9 +146,10 @@ def test_main(model_cls, input_size, split_ann_or_policy):
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args, kwargs)
 
-
-##################################################################################################
+    traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
+    traced_graph.recompile()
+    ##################################################################################################
 
     # print("traced_graph:\n", traced_graph.code)
     save_graphviz_dot(traced_graph, 'traced_graph')
