@@ -95,8 +95,8 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     args = (rand_input, 0.0012345, module, opt)
     kwargs = {}
 
-# Copied from _compile
-##################################################################################################
+    # Copied from _compile
+    ##################################################################################################
     params = dict(module.named_parameters())
     buffers = dict(module.named_buffers())
 
@@ -145,6 +145,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args, kwargs)
+
 
 ##################################################################################################
     traced_graph = preprocess_traced_graph(traced_graph)
@@ -197,7 +198,6 @@ def test_main(model_cls, input_size, split_ann_or_policy):
             assert val == val_copy
 
     print(f"passed {model_cls.__name__}")
-
 
 if __name__ == '__main__':
     test_main(Foo, (16, 1024), {'norm': PipeSplitWrapper.SplitPoint.END})

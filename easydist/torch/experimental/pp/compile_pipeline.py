@@ -239,11 +239,11 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
     outputs = []
     for node in gm.graph.nodes:
         if node.op == 'placeholder':
-            if node.name in inputs: # only those in inputs
+            if node.name in inputs:  # only those in inputs
                 env[node.name] = new_graph.placeholder(node.name)
         elif node.op == 'call_function':
             if node.target == operator.getitem:
-                continue # getitem is handled in foreach operators
+                continue  # getitem is handled in foreach operators
             elif '_foreach_' == node.name[:9]:  # handle foreach operators
                 list_args_mask = []
                 args = []
@@ -267,7 +267,8 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
                     else:
                         kwargs[kwarg_name] = kwarg
 
-                assert len(set(list_args_mask)) == 1, "input list of foreach operators should have the same mask"
+                assert len(set(list_args_mask)
+                           ) == 1, "input list of foreach operators should have the same mask"
 
                 env[node.name] = new_graph.create_node(op='call_function',
                                                        name=node.name,
@@ -297,7 +298,8 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
                     else:  # Number or _complex
                         args.append(arg)
                 if len(args) != len(node.args):
-                    assert len(args) == 0, "This node shall be completed removed since it has no args"
+                    assert len(
+                        args) == 0, "This node shall be completed removed since it has no args"
                     continue
                 env[node.name] = new_graph.create_node(op='call_function',
                                                        name=node.name,
@@ -315,7 +317,7 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
     new_graph.eliminate_dead_code()
     new_graph.lint()
 
-    new_gm = fx.GraphModule(gm, new_graph)  
+    new_gm = fx.GraphModule(gm, new_graph)
 
     injected_states = {}
     to_pop = []
@@ -326,7 +328,7 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs: List[str]
     for name in to_pop:
         gm.injected_states.pop(name)
 
-    new_gm.injected_states = injected_states # TODO @botbw: move this to meta
+    new_gm.injected_states = injected_states  # TODO @botbw: move this to meta
     new_gm.outputs_spec = outputs
 
     return new_gm
@@ -338,7 +340,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     global_outputs_spec = [node.name for node in list(traced_gm.graph.nodes)[-1].args[0]]
 
     phs_spec_unflatten = pytree.tree_unflatten(global_phs_spec, args_spec)
-    states_spec_flatten, _ = pytree.tree_flatten(phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
+    states_spec_flatten, _ = pytree.tree_flatten(
+        phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
     inv_params = {arg: param_name for param_name, arg in phs_spec_unflatten[0].items()}
 
     splited_global = split_by(model, traced_gm, step_split_point)
@@ -360,7 +363,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 bw_gm.inputs_spec)  # saved self.forward returns for self.bw_gm
 
             self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
-                self.fw_gm_outputs_saved_for_bw) # args for self.backward
+                self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
             self.args_saved_for_bw = {}
             self.outputs = {}
@@ -369,8 +372,10 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 params = list(set(self.fw_gm.injected_states) & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
                 grad_inputs = list(set(bw_gm.outputs_spec) & set(full_step_gm.inputs_spec))
-                input_optim_states, _ = pytree.tree_flatten(
-                    [phs_spec_unflatten[2][param_name] for param_name in param_names if param_name in phs_spec_unflatten[2]])
+                input_optim_states, _ = pytree.tree_flatten([
+                    phs_spec_unflatten[2][param_name] for param_name in param_names
+                    if param_name in phs_spec_unflatten[2]
+                ])
                 self.step_gm_args = params + grad_inputs + input_optim_states
                 self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
 
@@ -395,7 +400,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                         1. save for backward if it appears in self.bw_gm.inputs_spec (intermediate values for example)
                         2. save for output if it appears in global_outputs_spec (original model outputs for example)
             '''
-            assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
+            assert set(kwargs.keys(
+            )) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
             kwargs4gm = {}
             for arg_name in self.fw_gm.inputs_spec:
                 if arg_name in kwargs:
@@ -472,7 +478,6 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
             return rets
 
-
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}
 
     def gen_stateful_submod(node, submod):
@@ -503,11 +508,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             assert not any(getitem_users)
             outputs_spec.append(node.name)
             if 'call_module' in {user.op for user in node.users}:
-                    outputs_used_by_next_stage.append(node.name)
+                outputs_used_by_next_stage.append(node.name)
 
         # TODO @botbw: move this to meta
-        assert not (hasattr(submod, 'inputs_spec')
-                    or hasattr(submod, 'injected_states') or hasattr(submod, 'outputs_spec')
+        assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
+                    or hasattr(submod, 'outputs_spec')
                     or hasattr(submod, 'outputs_used_by_next_stage'))
         submod.inputs_spec = inputs_spec
         submod.injected_states = injected_states
@@ -522,7 +527,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
         if node.op == 'call_module':
             submod_global_name = node.target
             submod_global = getattr(splited_global, submod_global_name)
-            if hasattr(submod_global, '__ed_step_gm'): # optimizer gm
+            if hasattr(submod_global, '__ed_step_gm'):  # optimizer gm
                 step_gm_global = gen_stateful_submod(node, submod_global)
 
                 assert current_stateful_fw_bw is not None, "There should be a stateful_bw_fw before optimizer step"
@@ -532,9 +537,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     compiled_stage = CompiledStage(fw_gm, bw_gm, step_gm_global)
                     compiled_stages.append(compiled_stage)
 
-                assert len(step_gm_global.injected_states) == 0, "All states of step_gm_global should have been injected to step_gm"
+                assert len(
+                    step_gm_global.injected_states
+                ) == 0, "All states of step_gm_global should have been injected to step_gm"
                 current_stateful_fw_bw = None
-            else: # fw bw gm
+            else:  # fw bw gm
                 splited_fw_bw_gm = split_by(submod_global, submod_global, fw_bw_split_point)
 
                 stateful_fw_bw = []
