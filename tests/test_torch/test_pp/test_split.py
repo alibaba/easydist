@@ -83,8 +83,9 @@ def train_step(input, label, model, opt):
 
 def test_main(model_cls, input_size, split_ann_or_policy):
     module = model_cls().cuda().train().double()
-    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True) #, momentum=0.9)
+    # opt = None
+    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True) #, momentum=0.9)
     if isinstance(split_ann_or_policy, dict):
         annotate_split_points(module, split_ann_or_policy)
     else:
@@ -94,6 +95,8 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     args = (rand_input, 0.0012345, module, opt)
     kwargs = {}
 
+# Copied from _compile
+##################################################################################################
     params = dict(module.named_parameters())
     buffers = dict(module.named_buffers())
 
@@ -117,6 +120,13 @@ def test_main(model_cls, input_size, split_ann_or_policy):
                 if 'step' in named_states[n]:
                     named_states[n]['step'] -= 1
 
+    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+
+    # fix for sgd withtout momentum
+    if all(state is None for state in flat_named_states):
+        named_states = {}
+        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+
     def stateless_func(func, params, buffers, named_states, args, kwargs):
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
@@ -135,9 +145,11 @@ def test_main(model_cls, input_size, split_ann_or_policy):
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args, kwargs)
+
+##################################################################################################
     traced_graph = preprocess_traced_graph(traced_graph)
 
-    print("traced_graph:\n", traced_graph.code)
+    # print("traced_graph:\n", traced_graph.code)
     save_graphviz_dot(traced_graph, 'traced_graph')
 
     args_unflatten = (params, buffers, named_states, args, kwargs)

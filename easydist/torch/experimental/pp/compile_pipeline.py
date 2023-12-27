@@ -370,7 +370,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 param_names = set(inv_params[name] for name in params)
                 grad_inputs = list(set(bw_gm.outputs_spec) & set(full_step_gm.inputs_spec))
                 input_optim_states, _ = pytree.tree_flatten(
-                    [phs_spec_unflatten[2][param_name] for param_name in param_names])
+                    [phs_spec_unflatten[2][param_name] for param_name in param_names if param_name in phs_spec_unflatten[2]])
                 self.step_gm_args = params + grad_inputs + input_optim_states
                 self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
 
