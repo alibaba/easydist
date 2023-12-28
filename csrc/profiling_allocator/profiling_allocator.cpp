@@ -105,23 +105,29 @@ public:
       }
 
       // print graph_execution_order
+      int print_count = 0;
       std::cout << "graph_execution_order: [";
       for (auto i: graph_execution_order) {
-         std::cout << i << ", ";
+         std::cout << i;
+         if(print_count++ != graph_execution_order.size() - 1) std::cout << ", ";
       }
       std::cout << "]" << std::endl;
 
       // print global_output_indexes
+      print_count = 0;
       std::cout << "global_output_indexes: [";
       for (auto i: global_output_indexes) {
-         std::cout << i << ", ";
+         std::cout << i;
+         if(print_count++ != global_output_indexes.size() - 1) std::cout << ", ";
       }
       std::cout << "]" << std::endl;
 
       // print global_assigned_addresses
+      print_count = 0;
       std::cout << "global_assigned_addresses: [";
       for (auto i: global_assigned_addresses) {
-         std::cout << i << ", ";
+         std::cout << i;
+         if(print_count++ != global_assigned_addresses.size() - 1) std::cout << ", ";
       }
       std::cout << "]" << std::endl;
    }
