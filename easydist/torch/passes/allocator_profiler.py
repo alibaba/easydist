@@ -280,3 +280,5 @@ class AllocatorProfiler(Interpreter):
         memory_plan['foo'] = NodeMemoryPlan([0, 2], [140231118422016, 140233702113280], 3)
         memory_plan['bar'] = NodeMemoryPlan([1, 3], [140245869126656, 140245869175808], 4)
         __main__.memory_plan = memory_plan
+        graph_execution_order = ['bar', 'foo']
+        __main__.graph_execution_order = graph_execution_order

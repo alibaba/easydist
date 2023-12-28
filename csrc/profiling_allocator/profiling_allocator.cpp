@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 
 extern "C" {
@@ -17,10 +18,12 @@ PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
 
 std::unordered_set<void*> profiling_ptrs;
+std::unordered_set<void*> assigned_ptrs;
 bool memory_plan_initialized = false;
 bool runtime_shortcut = false;
 
 class NodeMemoryPlan {
+   int malloc_counter = 0;
 public:
    std::vector<int> output_indexes;
    std::vector<uintptr_t> assigned_addresses;
@@ -35,9 +38,139 @@ public:
       :  output_indexes(std::move(output_indexes)),
          assigned_addresses(std::move(assigned_addresses)),
          total_mallocs(total_mallocs) {}
+
+   void* get_assigned_address() {
+      // 1. return assigned address if current malloc is for output
+      // 2. return nullptr if not for output
+      void* ptr = nullptr;
+      if (std::find(output_indexes.begin(), output_indexes.end(), malloc_counter) != output_indexes.end()) {
+         ptr = reinterpret_cast<void*>(assigned_addresses[malloc_counter]);
+      }
+      malloc_counter++;
+      malloc_counter %= total_mallocs;
+      return ptr;
+   }
 };
 
-std::unordered_map<std::string, NodeMemoryPlan> graph_memory_plan;
+class GraphMemoryPlan {
+   std::unordered_map<std::string, NodeMemoryPlan> m_plan;
+   std::vector<std::string> graph_execution_order;
+   std::vector<int> global_output_indexes;
+   std::vector<uintptr_t> global_assigned_addresses;
+   int global_malloc_counter = 0;
+   bool is_graph_execution_order_set = false;
+   bool is_global_info_ready = false;
+   bool is_global_output_indexes_initialized = false;
+   bool is_global_assigned_addresses_initialized = false;
+public:
+   NodeMemoryPlan& operator[](const std::string& key) {
+        return m_plan[key];
+   }
+
+   auto find(const std::string& key) {
+      return m_plan.find(key);
+   }
+
+   auto end() {
+      return m_plan.end();
+   }
+
+   void set_graph_execution_order(std::vector<std::string>&& new_order) {
+      graph_execution_order = std::move(new_order);
+      is_graph_execution_order_set = true;
+   }
+
+   void init_global_info() {
+      build_global_output_indexes();
+      build_global_assigned_addresses();
+      is_global_info_ready = is_global_output_indexes_initialized && is_global_assigned_addresses_initialized;
+   }
+
+   void* get_global_assigned_address() {
+      void* ptr = nullptr;
+      if (std::find(
+         global_output_indexes.begin(),
+         global_output_indexes.end(),
+         global_malloc_counter) != global_output_indexes.end()) {
+         ptr = reinterpret_cast<void*>(global_assigned_addresses[global_malloc_counter]);
+      }
+      global_malloc_counter++;
+      return ptr;
+   }
+
+   void print_global_info() {
+      if (!is_global_info_ready){
+         std::cerr << "global_info not ready yet!" << std::endl;
+         return;
+      }
+
+      // print graph_execution_order
+      std::cout << "graph_execution_order: [";
+      for (auto i: graph_execution_order) {
+         std::cout << i << ", ";
+      }
+      std::cout << "]" << std::endl;
+
+      // print global_output_indexes
+      std::cout << "global_output_indexes: [";
+      for (auto i: global_output_indexes) {
+         std::cout << i << ", ";
+      }
+      std::cout << "]" << std::endl;
+
+      // print global_assigned_addresses
+      std::cout << "global_assigned_addresses: [";
+      for (auto i: global_assigned_addresses) {
+         std::cout << i << ", ";
+      }
+      std::cout << "]" << std::endl;
+   }
+
+private:
+   void build_global_output_indexes() {
+      if (is_global_output_indexes_initialized) {
+         std::cerr << "global_output_indexes already initialized!" << std::endl;
+         exit(-1);
+      }
+
+      if (!is_graph_execution_order_set) {
+         std::cerr << "graph_execution_order not ready!" << std::endl;
+         exit(-1);
+      }
+
+      int current_index_offset = 0;
+      for (const auto& node_name: graph_execution_order) {
+         for (const auto& index: m_plan[node_name].output_indexes) {
+            global_output_indexes.push_back(current_index_offset + index);
+         }
+         current_index_offset += m_plan[node_name].total_mallocs;
+      }
+      is_global_output_indexes_initialized = true;
+   }
+
+   void build_global_assigned_addresses() {
+      if (is_global_assigned_addresses_initialized) {
+         std::cerr << "global_assigned_addresses already initialized!" << std::endl;
+         exit(-1);
+      }
+
+      if (!is_graph_execution_order_set) {
+         std::cerr << "graph_execution_order not ready!" << std::endl;
+         exit(-1);
+      }
+
+      for (const auto& node_name: graph_execution_order) {
+         const auto& next_assigned_addresses = m_plan[node_name].assigned_addresses;
+         global_assigned_addresses.insert(
+            global_assigned_addresses.end(),
+            next_assigned_addresses.begin(),
+            next_assigned_addresses.end());
+      }
+      is_global_assigned_addresses_initialized = true;
+   }
+};
+
+GraphMemoryPlan graph_memory_plan;
 
 void init_memory_plan() {
    if (memory_plan_initialized) {
@@ -55,7 +188,6 @@ void init_memory_plan() {
 
       // get values according to the key
       PyObject *node_memory_plan = PyDict_GetItem(memory_plan, key);
-      std::cout << "wuhao key: " << PyUnicode_AsUTF8(key) << std::endl;
 
       // read attributes from node_memory_plan
       //
@@ -89,6 +221,19 @@ void init_memory_plan() {
          std::move(new_assigned_addresses),
          new_total_mallocs);
    }
+
+   // read graph_execution_order
+   std::vector<std::string> new_graph_execution_order;
+   PyObject *py_graph_execution_order = PyDict_GetItemString(global_dict, "graph_execution_order");
+   for (Py_ssize_t i = 0; i < PyList_Size(py_graph_execution_order); i++) {
+      PyObject *current_node_name = PyList_GetItem(py_graph_execution_order, i);
+      new_graph_execution_order.push_back(PyUnicode_AsUTF8(current_node_name));
+   }
+   graph_memory_plan.set_graph_execution_order(std::move(new_graph_execution_order));
+
+   graph_memory_plan.init_global_info();
+
+   graph_memory_plan.print_global_info();
 
    // initialization finished
    memory_plan_initialized = true;
@@ -185,8 +330,20 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
       std::cerr << "Error: Memory plan is not initialized!" << std::endl;
       exit(-1);
    }
-   void *ptr;
-   cudaMalloc(&ptr, size);
+   void *ptr = nullptr;
+   op_name = PyDict_GetItemString(global_dict, "op_name");
+   std::string op_name_key = std::string(PyBytes_AsString(PyUnicode_AsUTF8String(op_name)));
+
+   // find if op_name is in memory plan
+   if (graph_memory_plan.find(op_name_key) != graph_memory_plan.end()) {
+      // if op_name in memory plan, set ptr to assigned_address
+      ptr = graph_memory_plan[op_name_key].get_assigned_address();
+   }
+
+   // allocate memory if is not an assigned address
+   if (ptr == nullptr) {
+      cudaMalloc(&ptr, size);
+   }
    return ptr;
 }
 
