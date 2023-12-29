@@ -382,7 +382,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     # only profile on rank 0
     local_rank = int(os.environ["LOCAL_RANK"])
-    if local_rank == 0:
+    if mdconfig.use_meta_allocator and local_rank == 0:
         logging.info("profiling fx_module's memory...")
 
         import __main__

@@ -83,5 +83,7 @@ rcpsp_iter_round = 1 # odd_even rounds
 override_dtensor_rule = False
 
 # runtime
-
 use_contiguous_buffer = False
+
+# meta allocator
+use_meta_allocator = True

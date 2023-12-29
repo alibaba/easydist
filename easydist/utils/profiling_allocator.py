@@ -16,9 +16,12 @@ import torch
 import ctypes
 import os
 import __main__
+import easydist
 
 
 def init_profiling_allocator():
+    if not easydist.config.use_meta_allocator:
+        return
     register_global_variables()
     swap_to_profiling_allocator()
 
