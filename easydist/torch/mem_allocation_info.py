@@ -39,6 +39,9 @@ class OutTensorMemInfo:
         self.arg_index = arg_index
         self.tensor_index = tensor_index
 
+    def size(self) -> int:
+        return self.mem_size
+
     def __str__(self) -> str:
         mem_info_str = ""
         if self.is_reference:
@@ -53,12 +56,13 @@ class OutTensorMemInfo:
 
 class NodeMemInfo:
     def __init__(self):
-        self.out_tensor_infos = []
+        self.out_tensor_infos = []  # list of OutTensorMemInfo
 
     def add_out_tensor_mem_info(self, out_index, mem_size, mem_index,
                                 is_reference, arg_index=-1, tensor_index=-1):
         out_tensor_mem_info = OutTensorMemInfo(
-                                  out_index, mem_size, mem_index, is_reference, arg_index, tensor_index)
+                                  out_index, mem_size, mem_index, is_reference,
+                                  arg_index, tensor_index)
         self.out_tensor_infos.append(out_tensor_mem_info)
 
     def __str__(self) -> str:
@@ -73,6 +77,10 @@ class GraphMemInfo:
 
     def get_node_mem_info(self, node_name) -> NodeMemInfo:
         return self.node_mem_infos[node_name]
+
+    def get_out_vars(self, node):
+        node_mem_info = self.get_node_mem_info(node.name)
+        return node_mem_info.out_tensor_infos
 
     def __str__(self) -> str:
         graph_mem_info_str = ""
