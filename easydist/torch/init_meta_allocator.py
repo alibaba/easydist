@@ -19,7 +19,7 @@ import __main__
 import easydist
 
 
-def init_profiling_allocator():
+def init_meta_allocator():
     if not easydist.config.use_meta_allocator:
         return
     register_global_variables()

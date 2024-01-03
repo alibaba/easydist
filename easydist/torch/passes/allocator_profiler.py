@@ -13,7 +13,6 @@
 # ==============================================================================
 
 from typing import Any, List, Dict, Tuple
-from collections import defaultdict
 
 import __main__
 import torch.utils._pytree as pytree
