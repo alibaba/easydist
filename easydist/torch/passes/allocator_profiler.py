@@ -212,8 +212,6 @@ class AllocatorProfiler(Interpreter):
             qualified_name = "output"
         else:
             qualified_name = _get_qualified_name(n.target)
-            if qualified_name == 'easydist.torch.passes.sharding.all_reduce_end':
-                return None
 
         # create dict to store addresses for this node
         node_profiling_info = NodeProfilingInfo(n.name)
@@ -228,7 +226,7 @@ class AllocatorProfiler(Interpreter):
 
             # record input addresses
             # TODO(wuhao): use customized tree_flatten, avoid flatten of non-tensors
-            constant_types = [type(None), bool, int, float, torch.dtype]
+            constant_types = [type(None), bool, int, float, torch.dtype, str]
             for arg_index, materialized_input in enumerate(materialized_inputs):
                 for tensor_index, flat_input in enumerate(pytree.tree_flatten(materialized_input)[0]):
                     if isinstance(flat_input, torch.Tensor):
@@ -236,7 +234,7 @@ class AllocatorProfiler(Interpreter):
                     elif type(flat_input) in constant_types:
                         continue
                     else:
-                        print('Unexpected input!', type(flat_input), flat_input)
+                        assert False, f'Unexpected input: {type(flat_input)}, {flat_input}'
 
             # set op_name for profiling_allocator.so
             __main__.op_name = n.name
@@ -256,7 +254,7 @@ class AllocatorProfiler(Interpreter):
                 elif flat_output is None:
                     continue
                 else:
-                    print("Unexpected output!", type(flat_input), flat_input)
+                    assert False, f'Unexpected output: {type(flat_input)}, {flat_input}'
 
             # saving profiling info
             self.profiling_info.set_node_profiling_info(n.name, node_profiling_info)

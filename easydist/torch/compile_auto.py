@@ -380,10 +380,9 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
-    # only profile on rank 0
-    local_rank = int(os.environ["LOCAL_RANK"])
-    if mdconfig.use_meta_allocator and local_rank == 0:
-        logging.info("profiling fx_module's memory...")
+    if mdconfig.use_meta_allocator:
+        if rank == 0:
+            logging.info("profiling fx_module's memory...")
 
         import __main__
         # setting allocator to profiling mode
@@ -394,13 +393,17 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
         _ = alloc_profiler.run([])
         graph_mem_info = alloc_profiler.create_graph_mem_info()
-        print(str(graph_mem_info))
+
+        # print profiling results on rank 0
+        if rank == 0:
+            print(graph_mem_info)
 
         # setting allocator back to runtime mode
         alloc_profiler.load_memory_plan()
         __main__.allocator_mode = 'runtime'
 
-        logging.info("finish profiling fx_module's memory")
+        if rank == 0:
+            logging.info("finish profiling fx_module's memory")
 
     class EDCompiledFunc:
 

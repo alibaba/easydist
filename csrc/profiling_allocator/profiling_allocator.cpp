@@ -282,9 +282,6 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
    void *ptr;
    cudaMalloc(&ptr, size);
 
-   // only profile on device 0
-   if (device != 0) return ptr;
-
    // read start_recording flag from global variables
    // start_recording is a Borrowed reference.
    start_recording = PyDict_GetItemString(global_dict, "start_recording");
