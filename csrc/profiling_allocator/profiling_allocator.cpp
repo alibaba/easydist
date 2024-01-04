@@ -178,7 +178,7 @@ private:
 
 GraphMemoryPlan graph_memory_plan;
 
-void init_memory_plan() {
+void init_memory_plan(int device) {
    if (memory_plan_initialized) {
       std::cerr << "Error: Memory plan already initialized!" << std::endl;
       exit(-1);
@@ -239,7 +239,7 @@ void init_memory_plan() {
 
    graph_memory_plan.init_global_info();
 
-   graph_memory_plan.print_global_info();
+   if (device == 0) graph_memory_plan.print_global_info();
 
    // initialization finished
    memory_plan_initialized = true;
@@ -375,7 +375,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
       return ptr;
    } else if (allocator_mode_string == "runtime") {
       runtime_shortcut = true;
-      init_memory_plan();
+      init_memory_plan(device);
       return runtime_malloc(size, device, stream);
    } else {
       std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;

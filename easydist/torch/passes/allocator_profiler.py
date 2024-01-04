@@ -202,8 +202,6 @@ class AllocatorProfiler(Interpreter):
         Returns:
             Any: The result of executing ``n``
         """
-        if n.ed_info.node_type is EDNodeType.COMMUNICATION:
-            return None
 
         if n.op == "placeholder":
             return None
@@ -242,7 +240,7 @@ class AllocatorProfiler(Interpreter):
             # tell profiling_allocator to start profiling
             __main__.start_recording = True
 
-            output = getattr(self, n.op)(n.target, materialized_inputs, {})
+            output = getattr(self, n.op)(n.target, materialized_inputs, n.kwargs)
 
             # flatten to handle possible tuples
             flat_outputs, _ = pytree.tree_flatten(output)
