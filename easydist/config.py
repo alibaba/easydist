@@ -71,12 +71,14 @@ master_port = int(_get_env_or_raise("MASTER_PORT"))
 
 # Tile communication
 enable_tile_comm = False
+critical_context_length = 100
+tile_context_length = 15
 nvlink_processor_usage = 0.15
 
 # Scheduling communication
 comm_optimization = False
 # 'general', 'odd_even'
-rcpsp_method = 'odd_even'
+rcpsp_method = 'general'
 rcpsp_iter_round = 1 # odd_even rounds
 override_dtensor_rule = False
 

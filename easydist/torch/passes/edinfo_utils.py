@@ -81,7 +81,8 @@ def annotation_edinfo(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModul
             # annotate node type
             if node.target in COMM_FUNCS:
                 node.ed_info.node_type = EDNodeType.COMMUNICATION
-            elif node.target == operator.getitem:
+            # (TODO) hard code here to avoid to runtime profile torch.ops.aten._fused_adam.default
+            elif node.target in [operator.getitem, torch.ops.aten._fused_adam.default]:
                 node.ed_info.node_type = EDNodeType.AUXILIARY
             else:
                 node.ed_info.node_type = EDNodeType.COMPUTATION
