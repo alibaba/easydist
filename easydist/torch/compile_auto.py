@@ -277,7 +277,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     else:
         sharded_graph = sharding_transform(traced_graph, opt_strategy, state_io_map)
         if mdconfig.enable_tile_comm:
-            sharded_graph = runtime_prof(sharded_graph)
+            sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
             sharded_graph = tile_comm(sharded_graph)
 
     sharded_graph = fix_embedding(sharded_graph, recover=True)

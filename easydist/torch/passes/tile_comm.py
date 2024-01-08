@@ -255,17 +255,33 @@ class TileSolver:
         self.tile_cost = self.tile_cost + mip.xsum(mip_matrix[i][j] * cost_matrix[i][j]
                                                    for i in range(shape_1) for j in range(shape_2))
 
+    def strategy_tile_cost(self, post_s, prev_s):
+        tile_cost = 0
+        for tiled_node in post_s + prev_s:
+            if tiled_node.node.ed_info.tiled_runtime_ms is None:
+                continue
+            combination_ann = tiled_node.node.ed_info.spmd_annotation["combination_ann"]
+            for shard_dim_id, combine_func in combination_ann.items():
+                if combine_func.func == CombinationFunc.gather and combine_func.keywords[
+                        'dim'] == tiled_node.tile_axis:
+                    if shard_dim_id in tiled_node.node.ed_info.tiled_runtime_ms:
+                        tile_cost += tiled_node.node.ed_info.tiled_runtime_ms[
+                            shard_dim_id] - tiled_node.node.ed_info.runtime_ms
+
+        return tile_cost
+
+
     def get_cost_matrix(self, node, node_prev_strategy, node_post_strategy,
                         cnode_axis_prev_strategy, cnode_axis_post_strategy):
-        
+
         runtime_ms = node.ed_info.runtime_ms
         num_tiles = 2
-        cost_matrix_1 = [[runtime_ms for _ in range(len(node_post_strategy))]
-                         for _ in range(len(node_prev_strategy))]
-        cost_matrix_2 = [[runtime_ms / (num_tiles - 1) for _ in range(len(node_post_strategy))]
-                         for _ in range(len(node_prev_strategy))]
-        cost_matrix_3 = [[runtime_ms / (num_tiles - 1) for _ in range(len(node_post_strategy))]
-                         for _ in range(len(node_prev_strategy))]
+        cost_matrix_1 = [[runtime_ms + self.strategy_tile_cost(post_s, prev_s) for post_s in node_post_strategy]
+                         for prev_s in node_prev_strategy]
+        cost_matrix_2 = [[runtime_ms / (num_tiles - 1) + self.strategy_tile_cost(post_s, prev_s) for post_s in node_post_strategy]
+                         for prev_s in node_prev_strategy]
+        cost_matrix_3 = [[runtime_ms / (num_tiles - 1) + self.strategy_tile_cost(post_s, prev_s) for post_s in node_post_strategy]
+                         for prev_s in node_prev_strategy]
 
         for i in range(len(node_prev_strategy)):
             for j in range(len(node_post_strategy)):
