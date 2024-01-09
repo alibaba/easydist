@@ -83,7 +83,8 @@ class EDInfo:
     spmd_annotation: Any = None
     strategy: NodeSPMDStrategy = None
     runtime_ms: float = 0.0
-    normalized_int_runtime_ms = 1
+    tiled_runtime_ms: Dict = None
+    normalized_int_runtime_ms: int = 1
     comm_meta = None  # {comm_vol, comm_shape}
 
     def is_communication(self):
