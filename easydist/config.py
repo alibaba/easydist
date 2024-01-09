@@ -48,6 +48,8 @@ easydist_dir = os.path.join(Path.home(), ".easydist")
 prof_db_path = os.path.join(easydist_dir, "perf.db")
 dump_prof_db = False
 
+dump_fx_graph = os.environ.get("DUMP_FX_GRAPH", "False").upper() in ["1", "TRUE"]
+
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"
@@ -85,5 +87,5 @@ override_dtensor_rule = False
 # runtime
 use_contiguous_buffer = False
 
-# meta allocator
-use_meta_allocator = True
+# memory optimization
+enable_memory_opt = os.environ.get("ENABLE_MEMORY_OPT", "False").upper() in ["1", "TRUE"]

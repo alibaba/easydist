@@ -20,7 +20,7 @@ import easydist
 
 
 def init_meta_allocator():
-    if not easydist.config.use_meta_allocator:
+    if not easydist.config.enable_memory_opt:
         return
     register_global_variables()
     swap_to_profiling_allocator()

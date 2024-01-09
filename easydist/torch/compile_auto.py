@@ -31,6 +31,7 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribute_tensor)
 from torch.fx._pytree import tree_flatten_spec
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.graph_drawer import FxGraphDrawer
 from torch.nn.utils import stateless
 
 import easydist.config as mdconfig
@@ -44,6 +45,7 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
+from easydist.torch.schedule.memory_scheduler import MemoryScheduler
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -252,6 +254,14 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
 
+    if mdconfig.dump_fx_graph:
+        print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
+        drawer = FxGraphDrawer(traced_graph, "traced_fx", ignore_getattr=True)
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
@@ -296,6 +306,14 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
+
+    if mdconfig.dump_fx_graph:
+        print(f"node num in sharded graph: {len(sharded_graph.graph.nodes)}")
+        drawer = FxGraphDrawer(sharded_graph, "shard_fx", ignore_getattr=True)
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
@@ -380,7 +398,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
-    if mdconfig.use_meta_allocator:
+    if mdconfig.enable_memory_opt:
         if rank == 0:
             logging.info("profiling fx_module's memory...")
 
@@ -395,8 +413,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         graph_mem_info = alloc_profiler.create_graph_mem_info()
 
         # print profiling results on rank 0
-        if rank == 0:
-            print(graph_mem_info)
+        #if rank == 0:
+        #    print(graph_mem_info)
 
         # setting allocator back to runtime mode
         alloc_profiler.load_memory_plan()
@@ -404,6 +422,11 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
         if rank == 0:
             logging.info("finish profiling fx_module's memory")
+
+            mem_scheduler = MemoryScheduler(sharded_graph,
+                                            graph_mem_info)
+            required_memory, schedules, ordered_schedules, mem_locations = \
+                                            mem_scheduler.create_min_mem_schedule()
 
     class EDCompiledFunc:
 
