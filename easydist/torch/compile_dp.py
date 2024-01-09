@@ -323,7 +323,7 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
             shape_info[node.name] = {}
 
     if mdconfig.enable_tile_comm:
-        sharded_graph = runtime_prof(sharded_graph)
+        sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
         sharded_graph = tile_comm(sharded_graph)
 
     if mdconfig.comm_optimization is True:

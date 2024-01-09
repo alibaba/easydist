@@ -262,6 +262,8 @@ class TileSolver:
                 continue
             combination_ann = tiled_node.node.ed_info.spmd_annotation["combination_ann"]
             for shard_dim_id, combine_func in combination_ann.items():
+                if isinstance(combine_func, list):
+                    combine_func = combine_func[0]
                 if combine_func.func == CombinationFunc.gather and combine_func.keywords[
                         'dim'] == tiled_node.tile_axis:
                     if shard_dim_id in tiled_node.node.ed_info.tiled_runtime_ms:
@@ -302,8 +304,8 @@ class TileSolver:
 
         for i in range(len(node_prev_strategy)):
             for j in range(len(node_post_strategy)):
-                 cost_matrix_1[i][j] = max(cost_matrix_1[i][j], cost_matrix_2[i][j],
-                                           cost_matrix_3[i][j], 0)
+                cost_matrix_1[i][j] = max(cost_matrix_1[i][j], cost_matrix_2[i][j],
+                                          cost_matrix_3[i][j], 0)
 
         return cost_matrix_1
 
@@ -445,8 +447,8 @@ def tile_comm(fx_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
             if node.op == 'call_function' and node.ed_info.is_communication():
                 context_length = mdconfig.critical_context_length
                 self_node_idx = node_name_list.index(node.name)
-                context_node_list = node_name_list[max(0, self_node_idx - context_length):min(
-                    len(node_name_list) - 1, self_node_idx + context_length)]
+                context_node_list = set(node_name_list[max(0, self_node_idx - context_length):min(
+                    len(node_name_list) - 1, self_node_idx + context_length)])
                 context_computation_nodes = [
                     node for node in computation_nodes if node.name in context_node_list
                 ]

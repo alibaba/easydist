@@ -24,6 +24,8 @@ from easydist.torch.utils import EDNodeType
 from easydist.torch.init_helper import materialize_random
 from easydist.torch.graph_profile_db import PerfDB
 
+from .sharding import view_op_map
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,7 +81,7 @@ def get_tiled_inputs(materialized_inputs, sharding_ann, tile_dim, num_tiles):
 
 
 def runtime_prof(fx_module: torch.fx.GraphModule, tiling_prof=False) -> torch.fx.GraphModule:
-    logger.info("runtime profiling pass")
+    logger.info(f"runtime profiling pass, tiling_prof={tiling_prof}")
 
     # make sure all rank have same runtime profiling result
     runtime_prof_result = dict()
@@ -112,6 +114,9 @@ def runtime_prof(fx_module: torch.fx.GraphModule, tiling_prof=False) -> torch.fx
                     num_tiles = 2
                     tiled_runtime_prof_result[node.name] = {}
                     for tile_dim in node.ed_info.spmd_annotation["combination_ann"]:
+                        if node.target in view_op_map:
+                            tiled_runtime_prof_result[node.name][tile_dim] = ops_elapsed_time_
+                            continue
                         tiled_inputs = get_tiled_inputs(
                             materialized_inputs, node.ed_info.spmd_annotation['sharding_ann'],
                             tile_dim, num_tiles)
