@@ -365,8 +365,12 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 bw_gm.inputs_spec)  # saved self.forward returns for self.bw_gm
 
             # TODO @botbw: better way of doing this
-            self.fw_func_returns = set({output for output, users in self.fw_gm.call_module_users.items() if not (len(users) == 1 and next(iter(users)) == bw_gm.name)}) # not only used by bw
-            
+            self.fw_func_returns = set({
+                output
+                for output, users in self.fw_gm.call_module_users.items()
+                if not (len(users) == 1 and next(iter(users)) == bw_gm.name)
+            })  # not only used by bw
+
             self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
                 self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
@@ -481,7 +485,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 if node.name in global_outputs_spec:
                     self.outputs[node.name] = ret
 
-            return None # step should always return None
+            return None  # step should always return None
 
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}
 
@@ -518,8 +522,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
         # TODO @botbw: move this to meta
         assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
-                    or hasattr(submod, 'outputs_spec')
-                    or hasattr(submod, 'call_module_users')
+                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
                     or hasattr(submod, 'name'))
         submod.inputs_spec = inputs_spec
         submod.injected_states = injected_states
@@ -585,7 +588,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             if node.name not in states_spec_flatten and len(node.users) > 0:
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
-            if submod_idx < num_stage: # forward
+            if submod_idx < num_stage:  # forward
                 stage = compiled_stages[submod_idx]
                 out_maybe_tuple = g.call_function(
                     stage.forward,
@@ -593,7 +596,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                             for arg_name in stage.fw_func_args})
                 for output in stage.fw_func_returns:
                     env[output] = g.call_function(operator.getitem, (out_maybe_tuple, output))
-            else: # backward
+            else:  # backward
                 stage = compiled_stages[2 * num_stage - submod_idx - 1]
                 out_maybe_tuple = g.call_function(
                     stage.backward,
@@ -631,8 +634,7 @@ def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], tor
 
         total_size = param_size + buffer_size
         per_stage_size = total_size // nstages
-        logging.debug(f"Total model size: {total_size}, "
-                      f"per stage size: {per_stage_size}")
+        logging.debug(f"Total model size: {total_size}, " f"per stage size: {per_stage_size}")
 
         gm, rv_nstages = _split_on_size_threshold_with_max_stages(gm, per_stage_size, nstages)
         assert rv_nstages == nstages
@@ -719,8 +721,8 @@ def _split_on_size_threshold_with_max_stages(
             for param_name, size in param_sizes.items():
                 new_size += size
 
-        if (accumulate_size + new_size
-                <= threshold):  # can accommodate this node in current bucket
+        if (accumulate_size + new_size <=
+                threshold):  # can accommodate this node in current bucket
             accumulate_size += new_size
             accumulate_params.update(new_params)
         elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage

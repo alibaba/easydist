@@ -202,6 +202,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
 
     print(f"passed {model_cls.__name__}")
 
+
 if __name__ == '__main__':
     test_main(Foo, (16, 1024), {'norm': PipeSplitWrapper.SplitPoint.END})
     test_main(Foo1, (16, 1024), {
