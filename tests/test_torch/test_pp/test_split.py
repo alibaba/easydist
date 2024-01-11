@@ -73,11 +73,13 @@ class Foo1(torch.nn.Module):
 
 
 def train_step(input, label, model, opt):
-    opt.zero_grad()
+    if opt is not None:
+        opt.zero_grad()
     out = model(input)
     loss = (out - torch.ones_like(out) * label).pow(2).mean()
     loss.backward()
-    opt.step()
+    if opt is not None:
+        opt.step()
     return loss
 
 
