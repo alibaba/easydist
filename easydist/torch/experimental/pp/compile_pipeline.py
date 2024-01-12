@@ -417,12 +417,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     kwargs4gm[arg_name] = kwargs[arg_name]
                 else:
                     kwargs4gm[arg_name] = self.fw_gm.injected_states[arg_name]
+                    if arg_name in global_outputs_spec: # buffers need to be returned TODO botbw: seperate params and buffers?
+                        self.outputs[arg_name] = kwargs4gm[arg_name]
 
                 if arg_name in self.fw_gm_args_saved_for_bw:
                     self.saved_for_bw[arg_name] = kwargs4gm[arg_name]
-
-                if arg_name in global_outputs_spec:
-                    self.outputs[arg_name] = kwargs4gm[arg_name]
 
             output_from_gm = self.fw_gm(**kwargs4gm)
 
@@ -449,8 +448,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     kwargs4gm[arg_name] = self.saved_for_bw[arg_name]
                     self.saved_for_bw.pop(arg_name)
 
-                if arg_name in global_outputs_spec:
-                    self.outputs[arg_name] = kwargs4gm[arg_name]
+                # if arg_name in global_outputs_spec:
+                #     self.outputs[arg_name] = kwargs4gm[arg_name]
 
             assert len(self.saved_for_bw) == 0, "all backward args should be used"
             output_from_gm = self.bw_gm(**kwargs4gm)
@@ -485,6 +484,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 if node.name in global_outputs_spec:
                     self.outputs[node.name] = ret
 
+            raise NotImplementedError("need to update self.fw_gm.injected_states using ret")
             return None  # step should always return None
 
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}

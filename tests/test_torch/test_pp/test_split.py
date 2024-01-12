@@ -85,8 +85,8 @@ def train_step(input, label, model, opt):
 
 def test_main(model_cls, input_size, split_ann_or_policy):
     module = model_cls().cuda().train().double()
-    # opt = None
-    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    opt = None
+    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     if isinstance(split_ann_or_policy, dict):
         annotate_split_points(module, split_ann_or_policy)
