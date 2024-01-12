@@ -8,6 +8,7 @@ import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
 import torch.utils._pytree as pytree
+from easydist.torch.experimental.pp.utils.debug import save_graphviz_dot
 
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
@@ -331,7 +332,7 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: List
 
     new_gm.inputs_spec = inputs_spec
     new_gm.injected_states = injected_states  # TODO @botbw: move this to meta
-    new_gm.outputs_spec = outputs
+    new_gm.outputs_spec = [node.name for node in outputs]
 
     return new_gm
 
@@ -377,8 +378,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             self.saved_for_bw = {}
             self.outputs = {}
 
-            if full_step_gm is not None:
-                params = list(set(self.fw_gm.injected_states) & set(full_step_gm.inputs_spec))
+            if full_step_gm is not None: # TODO @botbw: simplify this
+                params = list(self.fw_gm_injected_states & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
                 grad_inputs = list(set(bw_gm.outputs_spec) & set(full_step_gm.inputs_spec))
                 input_optim_states, _ = pytree.tree_flatten([
@@ -417,7 +418,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     kwargs4gm[arg_name] = kwargs[arg_name]
                 else:
                     kwargs4gm[arg_name] = self.fw_gm.injected_states[arg_name]
-                    if arg_name in global_outputs_spec: # buffers need to be returned TODO botbw: seperate params and buffers?
+                    if arg_name in global_outputs_spec: # params need to be returned directly if there is no opt_gm TODO botbw: seperate params and buffers?
                         self.outputs[arg_name] = kwargs4gm[arg_name]
 
                 if arg_name in self.fw_gm_args_saved_for_bw:
@@ -480,9 +481,9 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     raise RuntimeError(f"arg {arg_name} not found")
             rets = self.step_gm(**kwargs)
 
-            for node, ret in zip(self.step_gm.outputs_spec, rets):
-                if node.name in global_outputs_spec:
-                    self.outputs[node.name] = ret
+            for output, ret in zip(self.step_gm.outputs_spec, rets):
+                if output in global_outputs_spec:
+                    self.outputs[output] = ret
 
             raise NotImplementedError("need to update self.fw_gm.injected_states using ret")
             return None  # step should always return None
