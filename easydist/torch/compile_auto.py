@@ -33,6 +33,7 @@ from torch.fx._pytree import tree_flatten_spec
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.graph_drawer import FxGraphDrawer
 from torch.nn.utils import stateless
+from torch._functorch.partitioners import default_partition
 
 import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
@@ -261,6 +262,22 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         for name, dot_graph in dot_graphs.items():
             dot_graph.write_jpg(f"./tmp/{name}.jpg")
             dot_graph.write_raw(f"./tmp/{name}.txt")
+
+        # seperate fwd/bwd graph
+        fwd_graph, bwd_graph = default_partition(traced_graph, None, num_fwd_outputs=1)
+
+        fwd_drawer = FxGraphDrawer(fwd_graph, "fwd_traced_fx", ignore_getattr=True)
+        fwd_dot_graphs = fwd_drawer.get_all_dot_graphs()
+        for name, dot_graph in fwd_dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
+        bwd_drawer = FxGraphDrawer(bwd_graph, "bwd_traced_fx", ignore_getattr=True)
+        bwd_dot_graphs = bwd_drawer.get_all_dot_graphs()
+        for name, dot_graph in bwd_dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
 
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
