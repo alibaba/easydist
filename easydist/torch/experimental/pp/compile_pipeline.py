@@ -388,6 +388,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 ])
                 self.step_gm_args = params + grad_inputs + input_optim_states
                 self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
+                self.step_outputs_spec_to_states_spec = {output: state for output, state in zip(global_outputs_spec, states_spec_flatten)}
 
         def forward(self, **kwargs):
             '''
@@ -484,8 +485,10 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             for output, ret in zip(self.step_gm.outputs_spec, rets):
                 if output in global_outputs_spec:
                     self.outputs[output] = ret
+                if output in self.step_outputs_spec_to_states_spec:
+                    state_name = self.step_outputs_spec_to_states_spec[output]
+                    self.fw_gm.injected_states[state_name] = ret
 
-            raise NotImplementedError("need to update self.fw_gm.injected_states using ret")
             return None  # step should always return None
 
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}

@@ -94,7 +94,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         module = split_ann_or_policy(module)
 
     rand_input = torch.rand(input_size).cuda().double()
-    args = (rand_input, 0.0012345, module, opt)
+    args = [rand_input, 0.0012345, module, opt]
     kwargs = {}
 
     # Copied from _compile
@@ -156,7 +156,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     # print("traced_graph:\n", traced_graph.code)
     save_graphviz_dot(traced_graph, 'traced_graph')
 
-    args_unflatten = (params, buffers, named_states, args, kwargs)
+    args_unflatten = [params, buffers, named_states, args, kwargs]
 
     def arg_copy_func(x):
         if isinstance(x, torch.Tensor):
@@ -167,7 +167,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
     args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
 
-    ph2name, out2idx, compiled_stages, gm = compile_stateful_stages(module, traced_graph,
+    idx2phname, outname2idx, compiled_stages, gm = compile_stateful_stages(module, traced_graph,
                                                                     args_flatten, args_spec)
 
     id_rand_input = -1
@@ -175,22 +175,29 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         if arg is rand_input:
             id_rand_input = i
             break
+    
+    rand_input1 = torch.rand_like(rand_input)
 
     seed()
     with torch.no_grad():
-        gm(**{ph2name[id_rand_input]: rand_input})
+        gm(**{idx2phname[id_rand_input]: rand_input})
+        gm(**{idx2phname[id_rand_input]: rand_input1})
 
     outputs = {}
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_flatten = [None] * len(out2idx)
+    out_flatten = [None] * len(outname2idx)
     for name in outputs:
-        out_flatten[out2idx[name]] = outputs[name]
+        out_flatten[outname2idx[name]] = outputs[name]
 
     seed()
     with torch.no_grad():
         out_copy = traced_graph(*args_copy)
+        args_copy[:3] = out_copy[:3]
+        args_copy[3][0] = rand_input1
+        out_copy = traced_graph(*args_copy)
+
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
     for i, (val, val_copy) in enumerate(zip(out_flatten, out_flatten_copy)):
