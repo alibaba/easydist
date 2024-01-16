@@ -12,9 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 
+import copy
+
 import torch
 from torch.fx.node import _get_qualified_name
 
+from easydist.torch.utils import create_meta_from_node
 
 def fix_addmm_bias(fx_module: torch.fx.GraphModule):
 
@@ -32,6 +35,8 @@ def fix_addmm_bias(fx_module: torch.fx.GraphModule):
                     node.replace_all_uses_with(add_bias_node)
 
                     add_bias_node.update_arg(0, node)
+
+                add_bias_node.meta = create_meta_from_node(add_bias_node)
 
     fx_module.recompile()
 
@@ -59,6 +64,9 @@ def fix_convoluation_bias(fx_module: torch.fx.GraphModule):
                         node.replace_all_uses_with(add_bias_node)
 
                         add_bias_node.update_arg(0, node)
+
+                    bias_new.meta = create_meta_from_node(bias_new)
+                    add_bias_node.meta = create_meta_from_node(add_bias_node)
 
     fx_module.recompile()
 
