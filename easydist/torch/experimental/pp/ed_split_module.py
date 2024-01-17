@@ -1,3 +1,5 @@
+# Functions in this file are modified from
+# https://github.com/pytorch/pytorch/blob/5667a990fd0aaa1cec2df8f6666fae9df478ee03/torch/fx/passes/split_module.py#L44
 import inspect
 from typing import Any, Callable, Dict, List, Optional
 

@@ -1,10 +1,11 @@
+# Functions in this file are modified from
+# https://github.com/pytorch/pytorch/blob/5667a990fd0aaa1cec2df8f6666fae9df478ee03/torch/fx/experimental/proxy_tensor.py#L1042
+
 import functools
 import inspect
 import os
 from contextlib import nullcontext
 from typing import Any
-# make easydist happy without torchrun
-os.environ['MASTER_PORT'] = '-1'
 
 import torch.fx as fx
 import torch.utils._pytree as pytree
