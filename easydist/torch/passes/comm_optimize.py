@@ -336,6 +336,10 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     elif sche_method == 'rcpsp':
         sche = rcpsp_schedule(fx_module, mem_restrain)
 
+        # reserve the placeholder order
+        sche = [node for node in sche if node.op != "placeholder"]
+        sche = [node for node in fx_module.graph.nodes if node.op == "placeholder"] + sche
+
         _link_nodes(fx_module, sche)
 
         for idx, node in enumerate(sche):
@@ -392,6 +396,7 @@ def _link_nodes(fx_module, node_list):
     '''
     Change the topological order of fx_module according to node_list
     '''
+
     fx_module.graph._root._next = node_list[0]
     node_list[0]._prev = fx_module.graph._root
     for idx, node in enumerate(node_list[:-1]):
