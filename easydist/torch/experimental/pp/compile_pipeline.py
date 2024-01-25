@@ -1,3 +1,4 @@
+import imp
 import logging
 import operator
 from enum import Enum
@@ -53,34 +54,34 @@ def _to_tuple(x):
     return (x, )
 
 
-# see https://pytorch.org/docs/stable/notes/extending.html#how-to-use
-class _FWBWSplitFunc(torch.autograd.Function):
+# # see https://pytorch.org/docs/stable/notes/extending.html#how-to-use
+# class _FWBWSplitFunc(torch.autograd.Function):
 
-    @staticmethod
-    def forward(
-            ctx,
-            *args):  # TODO @botbw: support kwargs: https://github.com/pytorch/pytorch/issues/96337
-        fw_bw_split_point()
-        need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
-        args = tuple(
-            arg.clone() if need_clone(arg) else arg
-            for arg in args)  # TODO @botbw: have to clone? (in case the following op is in-place)
-        return args
+#     @staticmethod
+#     def forward(
+#             ctx,
+#             *args):  # TODO @botbw: support kwargs: https://github.com/pytorch/pytorch/issues/96337
+#         fw_bw_split_point()
+#         need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
+#         args = tuple(
+#             arg.clone() if need_clone(arg) else arg
+#             for arg in args)  # TODO @botbw: have to clone? (in case the following op is in-place)
+#         return args
 
-    @staticmethod
-    def backward(ctx, *grad_output):
-        fw_bw_split_point()
-        return grad_output
-
-
-def fw_bw_split_func(*args, **kwargs):
-    if len(kwargs):
-        raise TypeError(
-            "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet, try SplitPoint.END to solve this"
-            % list(kwargs.keys()))
-    return _FWBWSplitFunc.apply(*args)
+#     @staticmethod
+#     def backward(ctx, *grad_output):
+#         fw_bw_split_point()
+#         return grad_output
 
 
+# def fw_bw_split_func(*args, **kwargs):
+#     if len(kwargs):
+#         raise TypeError(
+#             "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet, try SplitPoint.END to solve this"
+#             % list(kwargs.keys()))
+#     return _FWBWSplitFunc.apply(*args)
+
+from easydist.torch.experimental.pp.split_op import fw_bw_split_func
 # ================================= section start ========================================
 # The idea of functions in this section are borrowed from
 # https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L1206
@@ -320,7 +321,6 @@ class SplitPatcher(_Patcher):
             def step_wrapper(opt, *args, **kwargs):
                 step_split_point()
                 orig_step(opt, *args, **kwargs)
-                step_split_point()
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
 
@@ -328,7 +328,7 @@ class SplitPatcher(_Patcher):
 
         # TODO @botbw: register_module_full_backward_pre_hook
         def backward_wrapper(tensor, *args, **kwargs):
-            fw_bw_split_point()
+            tensor = fw_bw_split_func(tensor)
             orig_backward(tensor, *args, **kwargs)
 
         patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
@@ -373,6 +373,7 @@ def split_by(mod: torch.nn.Module, traced: torch.fx.GraphModule, split_point: Ca
         if isinstance(submodule, torch.fx.GraphModule):
             for node in submodule.graph.nodes:
                 if (node.op, node.target) == ("call_function", split_point):
+
                     submodule.graph.erase_node(node)
                     if split_point == step_split_point:
                         submodule.__ed_step_gm = None  # set flag for step submodule
@@ -713,7 +714,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 ) == 0, "All states of step_gm_global should have been injected to step_gm"
                 current_stateful_fw_bw = None
             else:  # fw bw gm
-                splited_fw_bw_gm = split_by(submod_global, submod_global, fw_bw_split_point)
+                splited_fw_bw_gm = split_by(submod_global, submod_global, torch.ops.easydist.fw_bw_split.default)
 
                 stateful_fw_bw = []
                 for n in splited_fw_bw_gm.graph.nodes:
