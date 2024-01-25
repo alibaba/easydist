@@ -8,6 +8,8 @@ os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
 
+from transformers import OpenAIGPTConfig, OpenAIGPTModel, AutoModel, LlamaModel, LlamaConfig, T5Tokenizer, T5ForConditionalGeneration, T5ForConditionalGeneration
+
 import torch
 import torch.utils._pytree as pytree
 from torch.nn.utils import stateless
@@ -83,8 +85,30 @@ def train_step(input, label, model, opt):
     return loss
 
 
-def test_main(model_cls, input_size, split_ann_or_policy):
-    module = model_cls().cuda().train().double()
+def train_step_gpt(input, label, model, opt):
+    if opt is not None:
+        opt.zero_grad()
+    out = model(input).last_hidden_state
+    loss = (out - torch.ones_like(out) * label).pow(2).mean()
+    loss.backward()
+    if opt is not None:
+        opt.step()
+    return loss
+
+
+def train_step_t5(input, label, model, opt):
+    label = torch.ones_like(input)
+    if opt is not None:
+        opt.zero_grad()
+    loss = model(input_ids=input, labels=label).loss
+    loss.backward()
+    if opt is not None:
+        opt.step()
+    return loss
+
+
+def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
+    module = module.train().double().cuda()
     # opt = None
     # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
@@ -93,7 +117,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     else:
         module = split_ann_or_policy(module)
 
-    rand_input = torch.rand(input_size).cuda().double()
+    rand_input = rand_input_gen_method()
     args = [rand_input, 0.0012345, module, opt]
     kwargs = {}
 
@@ -142,7 +166,7 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         return params, buffers, named_states, grads, ret
 
     with _enable_compile(), SplitPatcher(module, opt):
-        traced_graph = ed_make_fx(partial(stateless_func, train_step),
+        traced_graph = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
@@ -167,16 +191,16 @@ def test_main(model_cls, input_size, split_ann_or_policy):
     args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
     args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
 
-    idx2phname, outname2idx, compiled_stages, gm = compile_stateful_stages(module, traced_graph,
-                                                                    args_flatten, args_spec)
+    idx2phname, outname2idx, compiled_stages, gm = compile_stateful_stages(
+        module, traced_graph, args_flatten, args_spec)
 
     id_rand_input = -1
     for i, arg in enumerate(args_flatten):
         if arg is rand_input:
             id_rand_input = i
             break
-    
-    rand_input1 = torch.rand_like(rand_input)
+
+    rand_input1 = rand_input_gen_method()
 
     seed()
     with torch.no_grad():
@@ -207,67 +231,104 @@ def test_main(model_cls, input_size, split_ann_or_policy):
         else:
             assert val == val_copy
 
-    print(f"passed {model_cls.__name__}")
+
+def gen_rand_input_foo():
+    return torch.rand(16, 1024).cuda().double()
+
+
+def gen_rand_input_imagenet():
+    return torch.rand(16, 3, 224, 224).cuda().double()
+
+
+def factory_gen_rand_input_ids(vocab_size):
+
+    def gen_rand_input_ids():
+        return torch.randint(0, vocab_size, (3, 200)).long().cuda()
+
+    return gen_rand_input_ids
 
 
 if __name__ == '__main__':
-    test_main(Foo, (16, 1024), {'norm'})
-    test_main(Foo1, (16, 1024), {
+    test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
+    test_main(Foo1(), {
         'norm',
         'linear0_1',
-    })
+    }, gen_rand_input_foo, train_step)
+    test_main(alexnet(), {
+        'features.10',
+        'classifier.3',
+    }, gen_rand_input_imagenet, train_step)
     test_main(
-        alexnet, (16, 3, 224, 224), {
-            'features.10',
-            'classifier.3',
-        })
-    test_main(
-        densenet121, (16, 3, 224, 224), {
+        densenet121(), {
             'features.denseblock1.denselayer4.norm2',
             'features.transition2.conv',
             'features.denseblock4.denselayer1.relu1',
             'features',
-        })
+        }, gen_rand_input_imagenet, train_step)
+    test_main(efficientnet_b0(), {
+        'features.2.0.block.1',
+        'features.4.1.block.3',
+        'features.6.1.block.3',
+        'features.8',
+    }, gen_rand_input_imagenet, train_step)
+    test_main(resnet18(), {
+        'layer1',
+        'layer2',
+        'layer3',
+        'layer4',
+    }, gen_rand_input_imagenet, train_step)
     test_main(
-        efficientnet_b0, (16, 3, 224, 224), {
-            'features.2.0.block.1',
-            'features.4.1.block.3',
-            'features.6.1.block.3',
-            'features.8',
-        })
-    test_main(
-        resnet18, (16, 3, 224, 224), {
-            'layer1',
-            'layer2',
-            'layer3',
-            'layer4',
-        })
-    test_main(
-        swin_t, (16, 3, 224, 224), {
+        swin_t(), {
             'features.2.reduction',
             'features.3.0.mlp.1',
             'features.5.1.attn.qkv',
             'features.7.0.stochastic_depth',
-        })
+        }, gen_rand_input_imagenet, train_step)
+    test_main(vgg19(), {
+        'features.10',
+        'features.20',
+        'classifier.3',
+    }, gen_rand_input_imagenet, train_step)
     test_main(
-        vgg19, (16, 3, 224, 224), {
-            'features.10',
-            'features.20',
-            'classifier.3',
-        })
-    test_main(
-        vit_b_16, (16, 3, 224, 224), {
+        vit_b_16(), {
             'encoder.layers.encoder_layer_1.self_attention',
             'encoder.layers.encoder_layer_5.mlp.3',
             'encoder.layers.encoder_layer_9.ln_2',
-        })
+        }, gen_rand_input_imagenet, train_step)
+    test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+        'h.3',
+        'h.6',
+        'h.9',
+    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
-    test_main(Foo, (16, 1024), split_into_equal_size(2))
-    test_main(Foo1, (16, 1024), split_into_equal_size(2))
-    test_main(alexnet, (16, 3, 224, 224), split_into_equal_size(3))
-    test_main(densenet121, (16, 3, 224, 224), split_into_equal_size(5))
-    test_main(efficientnet_b0, (16, 3, 224, 224), split_into_equal_size(10))
-    test_main(resnet18, (16, 3, 224, 224), split_into_equal_size(4))
-    test_main(swin_t, (16, 3, 224, 224), split_into_equal_size(10))
-    test_main(vgg19, (16, 3, 224, 224), split_into_equal_size(3))
-    test_main(vit_b_16, (16, 3, 224, 224), split_into_equal_size(10))
+    test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    test_main(alexnet(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    test_main(densenet121(), split_into_equal_size(5), gen_rand_input_imagenet, train_step)
+    test_main(efficientnet_b0(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    test_main(resnet18(), split_into_equal_size(4), gen_rand_input_imagenet, train_step)
+    test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+
+    # # ======== not working ========
+    # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
+    #     'encoder.layer.3',
+    #     'encoder.layer.6',
+    #     'encoder.layer.9',
+    # }, factory_gen_rand_input_ids(30522), train_step_gpt)  # None in output?
+
+    # test_main(LlamaModel(LlamaConfig()), {
+    #     'layers.8',
+    #     'layers.16',
+    #     'layers.24',
+    # }, factory_gen_rand_input_ids(LlamaConfig().vocab_size),
+    #           train_step_gpt)  # overflow? OOM on my machine
+
+    # test_main(
+    #     T5ForConditionalGeneration.from_pretrained("t5-small"), {
+    #         'encoder.block.2',
+    #         'encoder',
+    #         'decoder.block.2',
+    #     }, factory_gen_rand_input_ids(32128),
+    #     train_step_t5)  # module not outputting tensors or list/tuple of tensors but python class

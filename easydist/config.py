@@ -20,7 +20,7 @@ from pathlib import Path
 def _get_env_or_raise(env_var: str) -> str:
     env_val = os.environ.get(env_var, None)
     if not env_val:
-        raise ValueError("environment variable {env_var} expected, but not set")
+        raise ValueError(f"environment variable {env_var} expected, but not set")
     else:
         return env_val
 

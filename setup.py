@@ -59,6 +59,7 @@ setuptools.setup(
         "torch": [
             "torch",
             "torchvision",
+            "transformers"
         ],
         "jax": [
             "jax[cuda11_pip]",
