@@ -9,8 +9,10 @@ import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
 import torch.utils._pytree as pytree
-from easydist.torch.experimental.pp.utils.debug import save_graphviz_dot
+from torch._guards import detect_fake_mode
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 
@@ -494,12 +496,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     global_outputs_spec = [
         node.name if node else None for node in list(traced_gm.graph.nodes)[-1].args[0]
     ]
-
     phs_spec_unflatten = pytree.tree_unflatten(global_phs_spec, args_spec)
     states_spec_flatten, _ = pytree.tree_flatten(
         phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
     inv_params = {arg: param_name for param_name, arg in phs_spec_unflatten[0].items()}
-
+    node_metas = {node.name: node.meta for node in traced_gm.graph.nodes}
     splited_global = split_by(model, traced_gm, step_split_point)
 
     class CompiledStage:
@@ -729,8 +730,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
                 current_stateful_fw_bw = stateful_fw_bw
 
-    if False:
-        assert len(name2state) == 0, "All states should have been injected"
+    assert len(name2state) == 0, "All states should have been injected"
 
     if current_stateful_fw_bw is not None:  # forward and backward followed by no step
         num_stage = len(current_stateful_fw_bw) // 2
@@ -743,6 +743,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     g = fx.Graph()
     env = {}
     submod_idx = 0
+    node_to_stage = {}
 
     for node in splited_fw_bw_gm.graph.nodes:
         if node.op == 'placeholder':
@@ -750,31 +751,57 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
             if submod_idx < num_stage:  # forward
+                stage_idx = submod_idx
                 stage = compiled_stages[submod_idx]
-                out_maybe_tuple = g.call_function(
-                    stage.forward,
+                node_name = f'stage_{submod_idx}_fw'
+                out_maybe_tuple = g.create_node(
+                    name=node_name,
+                    op='call_function',
+                    target=stage.forward,
                     kwargs={arg_name: env[arg_name]
                             for arg_name in stage.fw_func_args})
+                node_to_stage[node_name] = stage_idx
                 for output in stage.fw_func_returns:
-                    env[output] = g.call_function(operator.getitem, (out_maybe_tuple, output))
+                    env[output] = g.create_node(
+                        name=output,
+                        op='call_function',
+                        target=operator.getitem,
+                        args=(out_maybe_tuple, output)
+                    )
+                    node_to_stage[output] = stage_idx
             else:  # backward
-                stage = compiled_stages[2 * num_stage - submod_idx - 1]
-                out_maybe_tuple = g.call_function(
-                    stage.backward,
+                stage_idx = 2 * num_stage - submod_idx - 1
+                stage = compiled_stages[stage_idx]
+                node_name = f'stage_{stage_idx}_bw'
+                out_maybe_tuple = g.create_node(
+                    name=node_name,
+                    op='call_function',
+                    target=stage.backward,
                     kwargs={arg_name: env[arg_name]
                             for arg_name in stage.bw_func_args})
+                node_to_stage[node_name] = stage_idx
                 for output in stage.bw_gm.outputs_spec:
                     if not output in global_outputs_spec:
-                        env[output] = g.call_function(operator.getitem, (out_maybe_tuple, output))
+                        env[output] = g.create_node(
+                            name=output,
+                            op='call_function',
+                            target=operator.getitem, 
+                            args=(out_maybe_tuple, output))
+                        node_to_stage[output] = stage_idx
                 if hasattr(stage, 'step_gm'):
-                    g.call_function(stage.step)
+                    g.create_node(
+                        name=f'stage_{stage_idx}_step',
+                        op='call_function',
+                        target=stage.step
+                        )
+                    node_to_stage[f'stage_{stage_idx}_step'] = stage_idx
             submod_idx += 1
 
     def eliminate_dead_node():
         raise RuntimeError("This method should be called since the graph doesn't have output node")
-
     setattr(g, 'eliminate_dead_node', eliminate_dead_node)
     gm = fx.GraphModule({}, g)
 
+    save_graphviz_dot(gm, 'gm')
     out2idx = {name: i for i, name in enumerate(global_outputs_spec)}
-    return global_phs_spec, out2idx, compiled_stages, gm
+    return global_phs_spec, out2idx, compiled_stages, gm, node_metas, node_to_stage
