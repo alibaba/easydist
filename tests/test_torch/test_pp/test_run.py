@@ -21,6 +21,7 @@ from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.torch.experimental.pp.PipelineStage import PipelineStage
+import torch.distributed as dist
 
 def seed(seed=42):
     # Set seed for PyTorch
@@ -177,10 +178,13 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         device=device
     )
 
+
     if rank == 0:
         pipe(**{idx2phname[id_rand_input]: 3*torch.ones_like(rand_input, device='cuda')})
     else:
         pipe()
+
+    print(pipe.stage.outputs.keys())
     exit()
 
     seed()
@@ -218,7 +222,6 @@ def gen_rand_input_foo():
 
 if __name__ == '__main__':
     # Initialize distributed environment
-    import torch.distributed as dist
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group(rank=rank, world_size=world_size)

@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.utils import flatten_args, modify_graph_op_device, QualnameMapMixin, map_debug_info
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 def _make_tensor_from_meta(
@@ -131,24 +131,21 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         # Prepare send/recv infrastructure
         self._prepare_send_recv_infra()
         # Cast submodule to device
-        # self._move_submod_to_device()
+        self._move_inject_states_to_device()
         # Move ops argument to device
-        # self._move_ops_to_device()
+        self._move_ops_to_device()
 
-    def _move_submod_to_device(self):
+    def _move_inject_states_to_device(self):
         # Move submodule to indicated device if possible
         # Note: we cannot move meta module to real devices because meta tensors
         # do not support to() method. One needs to do an in-place tensor swap in
         # that case.
-        has_meta_param = any(
+        assert not any(
             isinstance(p, FakeTensor) or p.is_meta
             for p in self.submod.parameters()
         )
-        if has_meta_param:
-            logger.debug(f"[{self.group_rank}] Found meta parameters!")
-        else:
-            logger.debug(f"[{self.group_rank}] No meta parameters found!")
-            self.submod.to(self.device)
+        for _, tensor in self.stage.fw_gm.injected_states.items():
+            tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;
@@ -156,7 +153,10 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         # code.  Here we provide a workaround for users to manually modify the
         # "device" kwarg of operations. Such operation may include:
         # `torch.ones`, `torch.zeros`, `torch.rand`, etc.
-        modify_graph_op_device(self.submod, self.device)
+        modify_graph_op_device(self.stage.fw_gm, self.device)
+        modify_graph_op_device(self.stage.bw_gm, self.device)
+        if self.stage.has_step():
+            modify_graph_op_device(self.stage.step_gm, self.device)
 
     def is_first(self):
         return self.stage_index == 0
@@ -391,7 +391,7 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         self,
         chunk: int,
     ):
-        composite_args, composite_kwargs = self._recv_and_fill_inputs(
+        _, composite_kwargs = self._recv_and_fill_inputs(
             self.args_split,
             self.kwargs_split,
             self.fw_args_recv_info,
@@ -400,9 +400,7 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         )
 
         # Compute forward
-        output = self.stage.forward(
-            *composite_args, **composite_kwargs
-        )
+        output = self.stage.forward(**composite_kwargs)
 
         assert isinstance(output, dict), "Only dict output is supported"
         logger.debug(map_debug_info(output))
@@ -413,8 +411,6 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         send_reqs = self._send_output_dict(self.fw_act_send_info, output)
         self.all_fw_send_reqs += send_reqs
 
-
-
     def backward_one_chunk(
         self,
         bwd_chunk: int,
@@ -422,7 +418,7 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         if not self.bw_node:
             return {}
 
-        composite_args, composite_kwargs = self._recv_and_fill_inputs(
+        _, composite_kwargs = self._recv_and_fill_inputs(
             None,
             None,
             self.bw_args_recv_info,
@@ -436,6 +432,9 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         grad_send_reqs = self._send_output_dict(self.bw_act_send_info, grads_input)
         self.all_bw_send_reqs += grad_send_reqs
 
+        if self.step_node is not None:
+            self.stage.step()
+
     def clear_runtime_states(self):
         # Activation send requests of all chunk
         self.all_fw_send_reqs.clear()
@@ -446,11 +445,8 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
 
     def merge_output_chunks(self):
         return self.stage.outputs
-        # return merge_chunks(
-        #     self.output_chunks,
-        #     self.pipe.output_chunk_spec,
-        # )
 
+    @torch.no_grad
     def __call__(self, *args, **kwargs):
         # Clean per iteration
         self.clear_runtime_states()
@@ -478,11 +474,8 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         for work in self.all_bw_send_reqs:
             work.wait()
 
-        # Last rank return merged results per original format
-        if self.is_last():
-            return self.merge_output_chunks()
-        else:
-            return None
+        logger.debug(f"[{self.group_rank}] All sends finished")
+
 
 
 # class PipelineStage1F1B(PipelineStage):

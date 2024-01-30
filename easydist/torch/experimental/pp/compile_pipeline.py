@@ -648,6 +648,9 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
             return None  # step should always return None
 
+        def has_step(self):
+            return hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')
+
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}
 
     def gen_stateful_submod(node, submod):
