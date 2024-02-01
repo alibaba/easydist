@@ -417,7 +417,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     if mdconfig.enable_memory_opt:
         if rank == 0:
-            logging.info("profiling fx_module's memory...")
+            logging.info("profiling fx module's memory...")
 
         import __main__
         # setting allocator to profiling mode
@@ -438,12 +438,28 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         __main__.allocator_mode = 'runtime'
 
         if rank == 0:
-            logging.info("finish profiling fx_module's memory")
+            logging.info("finish profiling fx module's memory")
 
             mem_scheduler = MemoryScheduler(sharded_graph,
                                             graph_mem_info)
-            required_memory, schedules, ordered_schedules, mem_locations = \
-                                            mem_scheduler.create_min_mem_schedule()
+
+            if mdconfig.enable_reschedule:
+                required_memory, schedules, ordered_schedules, mem_locations = \
+                                        mem_scheduler.create_min_mem_plan()
+            else:
+                pre_scheded_nodes = {}
+                step = 0
+                for node in sharded_graph.graph.nodes:
+                    if (
+                        node.op != 'placeholder'
+                        and node.op != 'get_attr'
+                        and node.op != 'output'
+                    ):
+                        pre_scheded_nodes[node] = step
+                        step += 1
+                required_memory, schedules, ordered_schedules, mem_locations = \
+                                        mem_scheduler.create_min_mem_plan(
+                                            pre_scheded_nodes=pre_scheded_nodes)
 
     class EDCompiledFunc:
 

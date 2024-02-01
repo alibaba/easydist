@@ -89,3 +89,7 @@ use_contiguous_buffer = False
 
 # memory optimization
 enable_memory_opt = os.environ.get("ENABLE_MEMORY_OPT", "False").upper() in ["1", "TRUE"]
+
+# reschedule ops
+enable_reschedule = os.environ.get("ENABLE_RESCHEDULE", "False").upper() in ["1", "TRUE"]
+

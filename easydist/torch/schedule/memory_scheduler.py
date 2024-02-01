@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from enum import Enum
 from typing import Tuple, Set
+import intervaltree
 
 import easydist.config as mdconfig
 from easydist.torch.mem_allocation_info import GraphMemInfo
@@ -24,7 +25,7 @@ from mip import (
 logger = logging.getLogger(__name__)
 
 class OverlapType(Enum):
-    OVERLAP_FORCE_SHARE = 1  # lifetimes definitely overlap: inplace or getitem operator
+    FORCE_SHARE = 1          # definitely share memory: inplace or getitem operator
     OVERLAP_NOT_SHARE = 2    # lifetimes definitely overlap: neither inplace nor getitem operator
     POSSIBLE_OVERLAP = 3     # not sure if lifetimes overlap before scheduling
     NEVER_OVERLAP = 4        # lifetimes definitely not overlap: no requirement for share
@@ -40,39 +41,53 @@ class MemSharedTensorGroup:
     def has_mult_tensors(self):
         return len(self.tensors) > 1
 
-    def source_asap_max(self, depend_info) -> int:
-        asap_max = 0
+    def source_asap_max(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
+        asap_max = -1
         for tensor in self.tensors:
+            if tensor[0] not in node_set:
+                continue
             node_asap = depend_info.asap(tensor[0])
             if asap_max < node_asap:
                 asap_max = node_asap
+        if asap_max == -1:
+            asap_max = 0
         return asap_max
 
-    def source_asap_min(self, depend_info ) -> int:
+    def source_asap_min(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
         asap_min = sys.maxsize
         for tensor in self.tensors:
+            if tensor[0] not in node_set:
+                asap_min = 0
+                break
             node_asap = depend_info.asap(tensor[0])
             if asap_min > node_asap:
                 asap_min = node_asap
         return asap_min
 
-    def source_alap_max(self, depend_info) -> int:
-        alap_max = 0
+    def source_alap_max(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
+        alap_max = -1
         for tensor in self.tensors:
+            if tensor[0] not in node_set:
+                continue
             node_alap = depend_info.alap(tensor[0])
             if alap_max < node_alap:
                 alap_max = node_alap
+        if alap_max == -1:
+            alap_max = 0
         return alap_max
 
-    def source_alap_min(self, depend_info) -> int:
+    def source_alap_min(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
         alap_min = sys.maxsize
         for tensor in self.tensors:
+            if tensor[0] not in node_set:
+                alap_min = 0
+                break
             node_alap = depend_info.alap(tensor[0])
             if alap_min > node_alap:
                 alap_min = node_alap
         return alap_min
 
-    def sink_nodes(self) -> Set[torch.fx.Node]:
+    def sink_nodes(self, node_set: Set[torch.fx.Node]) -> Set[torch.fx.Node]:
         if not self.sink_nodes_cache:
             nodes_in_group = set()
             for tensor in self.tensors:
@@ -82,21 +97,23 @@ class MemSharedTensorGroup:
                 for user in node.users:
                     #if user in nodes_in_group:
                     #    continue
+                    if user not in node_set:
+                        continue
                     self.sink_nodes_cache.add(user)
         return self.sink_nodes_cache
 
-    def sink_asap_max(self, depend_info) -> int:
-        sink_nodes_ = self.sink_nodes()
-        asap_max = 0
+    def sink_asap_max(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
+        sink_nodes_ = self.sink_nodes(node_set)
+        asap_max = -1
         for sink in sink_nodes_:
             asap = depend_info.asap(sink)
             if asap_max < asap:
                 asap_max = asap
         return asap_max
 
-    def sink_alap_max(self, depend_info) -> int:
-        sink_nodes_ = self.sink_nodes()
-        alap_max = 0
+    def sink_alap_max(self, depend_info, node_set: Set[torch.fx.Node]) -> int:
+        sink_nodes_ = self.sink_nodes(node_set)
+        alap_max = -1
         for sink in sink_nodes_:
             alap = depend_info.alap(sink)
             if alap_max < alap:
@@ -108,14 +125,14 @@ class DependencyInfo:
     def __init__(self,
                  nodes_to_schedule,     # list of nodes to be scheduled
                  graph_mem_info,        # GraphMemInfo
-                 user_sched_constraints,
+                 pre_scheded_nodes,
                  one_step_one_op):     # user's schedule
         self.nodes_to_schedule = nodes_to_schedule
         self.graph_mem_info = graph_mem_info
         self.node_set = set(nodes_to_schedule)
         self.cache_prev_nodes = {}
         self.cache_post_nodes = {}
-        self.user_sched_constraints = user_sched_constraints
+        self.pre_scheded_nodes = pre_scheded_nodes
         self.one_step_one_op = one_step_one_op
 
         # map: node -> (asap, alap)
@@ -197,7 +214,7 @@ class DependencyInfo:
         #         set type OverlapType.NEVER_OVERLAP
         # 2. var1 memory and var2 memory definitely overlap sometime
         #    2.1. var1 and var2 are in the same shared memory group
-        #         set type OverlapType.OVERLAP_FORCE_SHARE
+        #         set type OverlapType.FORCE_SHARE
         #    2.2. var1's memory and var2's memory are used by the same node.
         #         such as
         #             1). var1 and var2 are connected by a node
@@ -229,14 +246,19 @@ class DependencyInfo:
         tensor2_key = (node2, out_idx2)
         tensor2_group = self.mem_share_info[tensor2_key]
         if id(tensor1_group) == id(tensor2_group):
-            return OverlapType.OVERLAP_FORCE_SHARE
+            logger.info(f"{node1}:{out_idx1} with rng [{self.edge_makespans[node1]}] and {node2}:{out_idx2} with rng [{self.edge_makespans[node2]}] share memory")
+            return OverlapType.FORCE_SHARE
 
-        # two tensors never overlap?
         src_asap_min1, snk_alap_max1 = self.get_possible_live_span(tensor1_group)
         src_asap_min2, snk_alap_max2 = self.get_possible_live_span(tensor2_group)
 
         if snk_alap_max1 < src_asap_min2 or src_asap_min1 > snk_alap_max2:
-            # never overlap
+            # two tensors never overlap
+            #edge_lb1, edge_ub1 = self.edge_makespans[node1]
+            #edge_lb2, edge_ub2 = self.edge_makespans[node2]
+            #print(("(1. {}:{}) with rng [{}, {}] and (2. {}:{}) with rng [{}, {}] never overlap").format(node1, out_idx1, edge_lb1, edge_ub1, node2, out_idx2, edge_lb2, edge_ub2))
+            #print(("  1. src asap min: {}, snk alap max: {}").format(src_asap_min1, snk_alap_max1))
+            #print(("  2. src asap min: {}, snk alap max: {}").format(src_asap_min2, snk_alap_max2))
             return OverlapType.NEVER_OVERLAP
 
         if (
@@ -245,10 +267,12 @@ class DependencyInfo:
         ):
             if self.is_user_before(node1, node2):
                 # never overlap
+                logger.info(f"{node1}:{out_idx1} with rng [{self.edge_makespans[node1]}] is definitely before {node2}:{out_idx2} with rng [{self.edge_makespans[node2]}]")
                 return OverlapType.NEVER_OVERLAP
 
             if self.is_user_before(node2, node1):
                 # never overlap
+                logger.info(f"{node2}:{out_idx2} with rng [{self.edge_makespans[node2]}] is definitely before {node1}:{out_idx1} with rng [{self.edge_makespans[node1]}]")
                 return OverlapType.NEVER_OVERLAP
 
         live_same_time = False
@@ -282,8 +306,12 @@ class DependencyInfo:
 
     def get_possible_live_span(self, tensor_group):
         if tensor_group.has_mult_tensors():
-            src_asap_min = tensor_group.source_asap_min(self)
-            snk_alap_max = tensor_group.sink_alap_max(self)
+            src_asap_min = tensor_group.source_asap_min(self, self.node_set)
+            if src_asap_min == -1:
+                src_asap_min = 0
+            snk_alap_max = tensor_group.sink_alap_max(self, self.node_set)
+            if snk_alap_max == -1:
+                snk_alap_max = self.num_steps - 1
         else:
             tensor_lst = list(tensor_group.tensors)
             node = tensor_lst[0][0]
@@ -295,8 +323,12 @@ class DependencyInfo:
         tensor_key = (node, out_idx)
         tensor_group = self.mem_share_info[tensor_key]
         if tensor_group.has_mult_tensors():
-            src_alap_min = tensor_group.source_alap_min(self)
-            snk_asap_max = tensor_group.sink_asap_max(self)
+            src_alap_min = tensor_group.source_alap_min(self, self.node_set)
+            if src_alap_min == -1:
+                src_alap_min = 0
+            snk_asap_max = tensor_group.sink_asap_max(self, self.node_set)
+            if snk_asap_max == -1:
+                snk_asap_max = self.num_steps - 1
         else:
             tensor_lst = list(tensor_group.tensors)
             node = tensor_lst[0][0]
@@ -351,7 +383,7 @@ class DependencyInfo:
                     continue
                 prev_nodes.add(arg)
                 if arg not in self.cache_prev_nodes:
-                    self.cache_prev_nodes[arg] = find_all_prev_nodes(arg)
+                    self.cache_prev_nodes[arg] = self.find_all_prev_nodes(arg)
                 prev_nodes.update(self.cache_prev_nodes[arg])
             else:
                 print(("ignore arg ").format(arg))
@@ -372,7 +404,7 @@ class DependencyInfo:
                 continue
             post_nodes.add(user)
             if user not in self.cache_post_nodes:
-                self.cache_post_nodes[user] = find_all_post_nodes(user)
+                self.cache_post_nodes[user] = self.find_all_post_nodes(user)
             post_nodes.update(self.cache_post_nodes[user])
 
         self.cache_post_nodes[node] = post_nodes
@@ -405,12 +437,12 @@ class DependencyInfo:
                     continue
                 arg_asap = self._compute_asap_by_depth(arg, asaps)
                 asap = max(arg_asap+1, asap)
-        if self.user_sched_constraints and node in self.user_sched_constraints:
-            if asap > self.user_sched_constraints[node]:
+        if self.pre_scheded_nodes and node in self.pre_scheded_nodes:
+            if asap > self.pre_scheded_nodes[node]:
                 raise ValueError(
                     "Infeasible user schedule constraint for node %s: user specified at %d, min feasible %d"
-                    % (node.name, self.user_sched_constraints[node], asap))
-            asap = self.user_sched_constraints[node]
+                    % (node.name, self.pre_scheded_nodes[node], asap))
+            asap = self.pre_scheded_nodes[node]
 
         asaps[node] = asap
         return asap
@@ -432,12 +464,12 @@ class DependencyInfo:
             user_alap = self._compute_alap_by_depth(user, alaps)
             alap = min(user_alap-1, alap)
 
-        if self.user_sched_constraints and node in self.user_sched_constraints:
-            if alap < self.user_sched_constraints[node]:
+        if self.pre_scheded_nodes and node in self.pre_scheded_nodes:
+            if alap < self.pre_scheded_nodes[node]:
                 raise ValueError(
                     "Infeasible user schedule constraint for node %s: user specified at %d, max feasible %d"
-                    % (node.name, self.user_sched_constraints[node], alap))
-            alap = self.user_sched_constraints[node]
+                    % (node.name, self.pre_scheded_nodes[node], alap))
+            alap = self.pre_scheded_nodes[node]
 
         alaps[node] = alap
         return alap
@@ -467,8 +499,8 @@ class DependencyInfo:
     def compute_node_makespans(self):
         assert not self.node_makespans
         node_num = len(self.nodes_to_schedule)
-        if self.user_sched_constraints:
-            for node,step in self.user_sched_constraints.items():
+        if self.pre_scheded_nodes:
+            for node,step in self.pre_scheded_nodes.items():
                 self.node_makespans[node] = (step, step)
 
         if self.node_makespans:
@@ -489,7 +521,8 @@ class DependencyInfo:
             user_ub_max = ub
             for user in node.users:
                 if user not in self.node_set:
-                    continue
+                    user_ub_max = self.num_steps - 1
+                    break
                 _, user_ub = self.node_makespans[user]
                 user_ub_max = max(user_ub_max, user_ub)
 
@@ -536,10 +569,6 @@ class MemoryScheduler:
 
         self.node_set = set(self.nodes_to_schedule)
 
-        # try run fx graph to determine output tensor size of each node
-        # key: node, value: (mem size, mem alloc index)
-        self.node_out_mem = {}
-
     def total_tensor_size(self, align_scale: int):
         total_size = 0
         total_align_scaled_size = 0
@@ -558,14 +587,14 @@ class MemoryScheduler:
 
     def build_ilp_model(
         self,
+        one_step_one_op,
         mem_limit=sys.maxsize,
-        user_sched_constraints=None,
-        one_step_one_op=False,
+        pre_scheded_nodes=None,
     ) -> Tuple[Model, OrderedDict]:
 
         depend_info = DependencyInfo(self.nodes_to_schedule,
                                      self.graph_mem_info,
-                                     user_sched_constraints,
+                                     pre_scheded_nodes,
                                      one_step_one_op)
         edge_makespans = depend_info.compute_edge_makespans()
         print("asap and alap information:")
@@ -618,15 +647,17 @@ class MemoryScheduler:
         create_vars_per_step = [[] for _ in range(self.num_steps)]
         for node in self.nodes_to_schedule:
             lb, ub = edge_makespans[node]
-            assert lb < self.num_steps
-            assert ub < self.num_steps
+            assert lb < self.num_steps, f"node({node.name}): lb({lb}) is not less than num_steps({self.num_steps})"
+            assert ub < self.num_steps, f"node({node.name}): ub({ub}) is not less than num_steps({self.num_steps})"
             #print(("node name: {}, node op: {}, span: ({},{})").format(node,node.op,lb,ub))
             out_vars = self.graph_mem_info.get_out_vars(node)
             #print(("out_vars: {}").format(out_vars))
             for step in range(lb, ub+1):
                 for idx,out_var in enumerate(out_vars):
                     out_idx = out_var.out_index
-                    out_name = node.name + "[" + str(out_idx) + "]"
+                    out_name = node.name + "_" + str(out_idx) + "_"
+                    out_name = out_name.replace("[", "_")
+                    out_name = out_name.replace("]", "_")
 
                     var_name = out_name + "_create_step" + str(step)
                     v = model.add_var(var_type=BINARY, name=var_name)
@@ -639,14 +670,14 @@ class MemoryScheduler:
                     v = model.add_var(var_type=BINARY, name=var_name)
                     preserve_vars[node][out_idx][step] = v
 
-            if user_sched_constraints:
-                if node in user_sched_constraints:
+            if pre_scheded_nodes:
+                if node in pre_scheded_nodes:
                     # node is scheduled by user
-                    user_step = user_sched_constraints[node]
-                    assert user_step >= lb
-                    assert user_step <= ub
+                    scheded_step = pre_scheded_nodes[node]
+                    assert scheded_step >= lb
+                    assert scheded_step <= ub
                     for step in range(lb, ub+1):
-                        if step != user_step:
+                        if step != scheded_step:
                             for out_var in out_vars:
                                 out_idx = out_var.out_index
                                 model += create_vars[node][out_idx][step] == 0
@@ -655,8 +686,8 @@ class MemoryScheduler:
                                 out_idx = out_var.out_index
                                 model += create_vars[node][out_idx][step] == 1
                 for snk in node.users:
-                    if snk in user_sched_constraints:
-                        snk_step = user_sched_constraints[snk]
+                    if snk in pre_scheded_nodes:
+                        snk_step = pre_scheded_nodes[snk]
                         assert snk_step >= lb
                         assert snk_step <= ub
                         for out_var in out_vars:
@@ -801,10 +832,13 @@ class MemoryScheduler:
 
         # generate addresses
         gen_allocation = False
-        if user_sched_constraints:
-            for node in self.nodes_to_schedule:
-                assert node in user_sched_constraints
+        manual_alloc = True
+        if pre_scheded_nodes:
             gen_allocation = True
+            for node in self.nodes_to_schedule:
+                if node not in pre_scheded_nodes:
+                    manual_alloc = False
+                    break
 
         addresses = OrderedDict()
         if gen_allocation:
@@ -817,21 +851,105 @@ class MemoryScheduler:
                     out_size = out_var.size()
                     assert out_idx < len(out_vars)
                     assert out_size > 0
+                    var_name = node.name.replace("[", "_")
+                    var_name = var_name.replace("]", "_")
                     addr_var = model.add_var(var_type=INTEGER,
-                                             name="%s[%d]" % (node.name, out_idx),
+                                             name="%s_o_%d" % (var_name, out_idx),
                                              lb=0,
                                              ub=max_address-((out_size+self.gcd-1)//self.gcd))
                     node_out_addr_vars[out_idx] = addr_var
                 addresses[node] = node_out_addr_vars
 
-            processed = set()
+            fixed_locations = {}
+            if manual_alloc:
+                min_start = 0
+                max_end = self.num_steps
+                base_address = 0
+                processed_nodes = set()
+                mem_used = intervaltree.IntervalTree()
+                while max_end > min_start:
+                    max_duration = 0
+                    next_tensors = None
+                    next_nd = None
+
+                    for nd, span in edge_makespans.items():
+                        if span[0] < min_start:
+                            continue
+                        if span[1] > max_end:
+                            continue
+                        if nd in processed_nodes:
+                            continue
+                        out_vars = self.graph_mem_info.get_out_vars(nd)
+                        candidate_tensors = []
+                        for var in out_vars:
+                            if var.is_reference:
+                                continue
+                            candidate_tensors.append(var)
+
+                        if not candidate_tensors:
+                            continue
+
+                        duration = span[1] - span[0]
+                        if duration > max_duration:
+                            max_duration = duration
+                            next_tensors = candidate_tensors
+                            next_nd = nd
+                    if not next_nd:
+                        break
+
+                    min_start = edge_makespans[next_nd][0]
+                    max_end = edge_makespans[next_nd][1]
+                    processed_nodes.add(next_nd)
+                    for var in next_tensors:
+                        model += addresses[next_nd][var.out_index] == base_address
+                        fixed_locations[(next_nd, var.out_index)] = base_address
+                        base_address += (var.mem_size+self.gcd-1)//self.gcd
+
+                    mem_used[min_start : max_end + 1] = base_address
+
+                print(("mem used: {}").format(mem_used))
+                print("base_address: %d" % base_address)
+                max_mem = base_address
+                for nd, addr_lst in addresses.items():
+                    out_vars = self.graph_mem_info.get_out_vars(nd)
+                    assert len(out_vars) == len(addr_lst)
+                    for out_var in out_vars:
+                        if out_var.is_reference:
+                            continue
+                        if (nd, out_var.out_index) not in fixed_locations:
+                            span = edge_makespans[nd]
+                            max_address_used = 0
+                            print(("mem used overlap: {} with span {}").format(mem_used.overlap(span[0], span[1] + 1), span))
+                            for interval in mem_used.overlap(span[0], span[1] + 1):
+                                print(f"address {interval.data} is used, not avaliable for span [{span}]")
+                                max_address_used = max(max_address_used, interval.data)
+                            addr_var = addresses[nd][out_var.out_index]
+                            addr_var.lb = max_address_used
+
+                            new_address = max_address_used + (out_var.mem_size+self.gcd-1)//self.gcd
+                            print(("node {}: out idx: {}, lb: {}, ub: {}\n").format(nd, out_var.out_index, max_address_used, new_address))
+
+                            mem_used[span[0] : span[1] + 1] = new_address
+                            max_mem = max(max_mem, new_address)
+
+                print("max mem: %d" % max_mem)
+                for nd, addr_lst in addresses.items():
+                    out_vars = self.graph_mem_info.get_out_vars(nd)
+                    for out_var in out_vars:
+                        if out_var.is_reference:
+                            continue
+                        if (nd, out_var.out_index) not in fixed_locations:
+                            addr = addr_lst[out_var.out_index]
+                            model += addr <= max_mem - (out_var.mem_size+self.gcd-1)//self.gcd
+
+            processed_node_pairs = set()
             for nd1, span1 in edge_makespans.items():
                 for nd2, span2 in edge_makespans.items():
                     if nd1 is nd2:
                         continue
-                    if (nd2, nd1) in processed:
+                    if (nd2, nd1) in processed_node_pairs:
                         continue
-                    processed.add((nd1, nd2))
+                    processed_node_pairs.add((nd1, nd2))
                     overlap_live_start = max(span1[0], span2[0])
                     overlap_live_stop = min(span1[1], span2[1])
 
@@ -848,13 +966,15 @@ class MemoryScheduler:
                             if overlap_type == OverlapType.NEVER_OVERLAP:
                                 # need not add constraint for two memory addresses
                                 continue
-                            elif overlap_type == OverlapType.OVERLAP_FORCE_SHARE:
+                            elif overlap_type == OverlapType.FORCE_SHARE:
                                 model += addresses[nd1][idx1] == addresses[nd2][idx2]
                             elif overlap_type == OverlapType.OVERLAP_NOT_SHARE:
                                 # create a binary var to represent var1 memory is
                                 # below var2 memory
-                                v_name = nd1.name + "[" + str(idx1) + "]_below_" + \
-                                         nd2.name + "[" + str(idx2) + "]"
+                                v_name = nd1.name + "_" + str(idx1) + "_below_" + \
+                                         nd2.name + "_" + str(idx2)
+                                v_name = v_name.replace("[", "_")
+                                v_name = v_name.replace("]", "_")
                                 v1_below_v2 = model.add_var(var_type=BINARY, name=v_name)
                                 model += addresses[nd1][idx1] + ((var1.size()+self.gcd-1)//self.gcd) \
                                          - addresses[nd2][idx2] <= \
@@ -866,8 +986,10 @@ class MemoryScheduler:
                                 assert overlap_type == OverlapType.POSSIBLE_OVERLAP
                                 # It is possible that two tensor's memory using
                                 # spans overlap.
-                                v_base_name = nd1.name + "[" + str(idx1) + "]_" + \
-                                              nd2.name + "[" + str(idx2) + "]"
+                                v_base_name = nd1.name + "_" + str(idx1) + "_" + \
+                                              nd2.name + "_" + str(idx2) + "_"
+                                v_base_name = v_base_name.replace("[", "_")
+                                v_base_name = v_base_name.replace("]", "_")
                                 v1_name = v_base_name + "_v1"
                                 v1 = model.add_var(var_type=BINARY, name=v1_name)
                                 v2_name = v_base_name + "_v2"
@@ -901,6 +1023,7 @@ class MemoryScheduler:
                     out_idx = out_var.out_index
                     out_size = out_var.size()
                     addr = addr_lst[out_idx]
+                    print(("addr var: {}, aligned size: {}").format(addr, ((out_size+self.gcd-1)//self.gcd)))
                     model += peak_mem_usage >= addr + ((out_size+self.gcd-1)//self.gcd)
 
         for step, mem_usage in mem_per_step.items():
@@ -909,13 +1032,17 @@ class MemoryScheduler:
         obj = peak_mem_usage
 
         # set optimization objective
+        model.verbose = 1
         model.objective = minimize(obj)
 
         return model, addresses, create_vars, preserve_vars, peak_mem_usage
 
-    def create_min_mem_schedule(self):
+    def create_min_mem_plan(self, one_step_one_op=True, pre_scheded_nodes=None):
         model, addresses, create_vars, preserve_vars, peak_mem_usage = \
-                                                        self.build_ilp_model()
+                       self.build_ilp_model(one_step_one_op=one_step_one_op,
+                                            pre_scheded_nodes=pre_scheded_nodes)
+
+        model.write("./tmp/addr_gen.lp")
 
         start_time = time.time()
         logger.info("Start ILP solver for minimize memory usage")
@@ -936,7 +1063,13 @@ class MemoryScheduler:
                 logger.info(f"Feasible solution was found with objective value: {model.objective_value}")
         else:
             logger.info("No solution was found")
-        
+
+        if (
+            model.status == OptimizationStatus.INFEASIBLE
+            or model.status == OptimizationStatus.NO_SOLUTION_FOUND
+        ):
+            return (None, None, None, None)
+
         # extract schedules for return
         schedules = defaultdict(lambda: 0)
         for node in self.nodes_to_schedule:
@@ -981,6 +1114,7 @@ class MemoryScheduler:
                             mem_size = out_var.size()
                             break
                 assert mem_size > 0
+                logger.info(f"{node}:{out_vars[idx].out_index}: addr: {addr.x}-{addr.x-1+(mem_size+self.gcd-1)//self.gcd}, orig size: {mem_size}")
                 mem_addr = int(addr.x + 0.5)*self.gcd
                 mem_addrs.append((mem_addr, mem_size))
             mem_locations[node] = mem_addrs
@@ -994,10 +1128,10 @@ class MemoryScheduler:
         graph_mem_addr_str = "graph memory addresses:\n"
         for node,mem_addrs in mem_locations.items():
             node_mem_str = node.name + ": "
-            for mem_addr in mem_addrs:
-                node_mem_str += "([" + str(mem_addr) + "~" + \
-                                str(mem_addr+mem_size-1) + "], " + \
-                                str(mem_size()) + "), "
+            for mem_addr_size in mem_addrs:
+                node_mem_str += "([" + str(mem_addr_size[0]) + "~" + \
+                                str(mem_addr_size[0]+mem_addr_size[1]-1) + "], " + \
+                                str(mem_addr_size[1]) + "), "
 
             graph_mem_addr_str += node_mem_str + "\n"
         logger.info(graph_mem_addr_str)
