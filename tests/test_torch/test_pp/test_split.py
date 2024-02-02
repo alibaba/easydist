@@ -191,7 +191,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
     args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
 
-    idx2phname, outname2idx, compiled_stages, gm = compile_stateful_stages(
+    idx2phname, outname2idx, compiled_stages, gm, _, _ = compile_stateful_stages(
         module, traced_graph, args_flatten, args_spec)
 
     id_rand_input = -1

@@ -62,7 +62,6 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         device: torch.device,
         group: dist.ProcessGroup = None,
     ):
-        assert num_chunks == 1, "No minibatch for now"
         self.node_to_stage = node_to_stage
         self.node_metas = node_metas
         compiled_stage = compiled_stages[stage_index]
@@ -84,7 +83,8 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         # Grad send requests of all chunk
         self.all_bw_send_reqs: List[dist.Work] = []
         # Caching chunk outputs for final output merge or reduction
-        self.output_chunks: List[Any] = []
+        self.saved_for_bw_chunks: List[Any] = [{} for _ in range(self.chunks)]
+        self.outputs_chunks: List[Any] = [{} for _ in range(self.chunks)]
 
         self.split_gm = split_gm
         self.stage = compiled_stage
@@ -302,15 +302,13 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         self.args_split = None
         self.kwargs_split = None
         if args or kwargs:
-            assert self.chunks == 1, "No minibatch for now"
-            self.args_split, self.kwargs_split = [args], [kwargs]
-            # self.args_split, self.kwargs_split = split_args_kwargs_into_chunks(
-            #     args,
-            #     kwargs,
-            #     self.chunks,
-            #     self.pipe.args_chunk_spec,
-            #     self.pipe.kwargs_chunk_spec,
-            # )
+            self.args_split, self.kwargs_split = split_args_kwargs_into_chunks(
+                args,
+                kwargs,
+                self.chunks,
+                None, #self.pipe.args_chunk_spec,
+                None, #self.pipe.kwargs_chunk_spec,
+            )
 
     def _recv_and_fill_inputs(
         self,
@@ -400,13 +398,11 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         )
 
         # Compute forward
-        output = self.stage.forward(**composite_kwargs)
+        output = self.stage.forward(self.saved_for_bw_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs)
 
         assert isinstance(output, dict), "Only dict output is supported"
         logger.debug(map_debug_info(output))
-        # Unify output form to tuple for easy correspondance with
-        # Prepare for final output merge or reduction
-        self.output_chunks.append(output)
+
         # Send activations
         send_reqs = self._send_output_dict(self.fw_act_send_info, output)
         self.all_fw_send_reqs += send_reqs
@@ -427,13 +423,13 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         )
 
         # `stage_backward` node does not have `args`, only `kwargs`
-        grads_input = self.stage.backward(**composite_kwargs)
+        grads_input = self.stage.backward(self.saved_for_bw_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk], **composite_kwargs)
 
         grad_send_reqs = self._send_output_dict(self.bw_act_send_info, grads_input)
         self.all_bw_send_reqs += grad_send_reqs
 
         if self.step_node is not None:
-            self.stage.step()
+            self.stage.step(self.saved_for_bw_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk])
 
     def clear_runtime_states(self):
         # Activation send requests of all chunk
@@ -441,7 +437,11 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         # Grad send requests of all chunk
         self.all_bw_send_reqs.clear()
         # Caching chunk outputs for final output merge or reduction
-        self.output_chunks.clear()
+        self.saved_for_bw_chunks.clear()
+        self.outputs_chunks.clear()
+        for _ in range(self.chunks):
+            self.saved_for_bw_chunks.append({})
+            self.outputs_chunks.append({})
 
     def merge_output_chunks(self):
         return self.stage.outputs

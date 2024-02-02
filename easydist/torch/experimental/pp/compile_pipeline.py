@@ -1,9 +1,8 @@
 import logging
 import operator
-from enum import Enum
+from abc import ABC, abstractmethod
 from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
-from numpy import isin
 
 import torch
 import torch.fx as fx
@@ -15,7 +14,6 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
-
 # ================================= section start ========================================
 # The idea of functions in this section are borrowed from
 # https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L346
@@ -489,6 +487,19 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: List
 
     return new_gm
 
+class CompiledStageBase(ABC):
+    @abstractmethod
+    def forward(self, saved_for_bw, outputs, **kwargs):...
+
+    @abstractmethod
+    def backward(self, saved_for_bw, outputs, **kwargs):...
+
+    @abstractmethod
+    def step(self, saved_for_bw, outputs):...
+
+    @abstractmethod
+    def has_step(self):...
+
 
 # TODO @botbw: simplify
 def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
@@ -503,7 +514,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     node_metas = {node.name: node.meta for node in traced_gm.graph.nodes}
     splited_global = split_by(model, traced_gm, step_split_point)
 
-    class CompiledStage:
+    class CompiledStage(CompiledStageBase):
 
         def __init__(self, fw_gm, bw_gm, full_step_gm):
             self.fw_gm = fw_gm
@@ -529,9 +540,6 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
                 self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
-            self.saved_for_bw = {}
-            self.outputs = {}
-
             if full_step_gm is not None:  # TODO @botbw: simplify this
                 params = list(self.fw_gm_injected_states & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
@@ -547,7 +555,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     for output, state in zip(global_outputs_spec, states_spec_flatten)
                 }
 
-        def forward(self, **kwargs):
+        def forward(self, saved_for_bw, outputs, **kwargs):
             '''
             inputs:
                 kwargs: activations from previous stages
@@ -577,10 +585,10 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 else:
                     kwargs4gm[arg_name] = self.fw_gm.injected_states[arg_name]
                     if arg_name in global_outputs_spec:  # params need to be returned directly if there is no opt_gm TODO botbw: seperate params and buffers?
-                        self.outputs[arg_name] = kwargs4gm[arg_name]
+                        outputs[arg_name] = kwargs4gm[arg_name]
 
                 if arg_name in self.fw_gm_args_saved_for_bw:
-                    self.saved_for_bw[arg_name] = kwargs4gm[arg_name]
+                    saved_for_bw[arg_name] = kwargs4gm[arg_name]
 
             output_from_gm = self.fw_gm(**kwargs4gm)
 
@@ -590,39 +598,39 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     ret[output_name] = output
 
                 if output_name in self.fw_gm_outputs_saved_for_bw:
-                    self.saved_for_bw[output_name] = output
+                    saved_for_bw[output_name] = output
 
                 if output_name in global_outputs_spec:
-                    self.outputs[output_name] = output
+                    outputs[output_name] = output
 
             return ret
 
-        def backward(self, **kwargs):
+        def backward(self, saved_for_bw, outputs, **kwargs):
             assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
             kwargs4gm = {}
             for arg_name in self.bw_gm.inputs_spec:
                 if arg_name in kwargs:
                     kwargs4gm[arg_name] = kwargs[arg_name]
                 else:
-                    kwargs4gm[arg_name] = self.saved_for_bw[arg_name]
-                    self.saved_for_bw.pop(arg_name)
+                    kwargs4gm[arg_name] = saved_for_bw[arg_name]
+                    saved_for_bw.pop(arg_name)
 
                 # if arg_name in global_outputs_spec:
-                #     self.outputs[arg_name] = kwargs4gm[arg_name]
+                #     outputs[arg_name] = kwargs4gm[arg_name]
 
-            assert len(self.saved_for_bw) == 0, "all backward args should be used"
+            assert len(saved_for_bw) == 0, "all backward args should be used"
             output_from_gm = self.bw_gm(**kwargs4gm)
 
             ret = {}
             for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
                 if output_name in global_outputs_spec:
-                    self.outputs[output_name] = output
+                    outputs[output_name] = output
                 else:
                     assert output_name in self.bw_gm.call_module_users, "for bw_gm, output should be neither output or returned"
                     ret[output_name] = output
             return ret
 
-        def step(self):
+        def step(self, saved_for_bw, outputs):
             if not (hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')):
                 raise NotImplementedError("This compiled stage doesn't contain step_gm")
             kwargs = {}
@@ -631,17 +639,17 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     kwargs[arg_name] = self.step_gm.injected_states[arg_name]
                 elif arg_name in self.fw_gm.inputs_spec:
                     kwargs[arg_name] = self.fw_gm.injected_states[arg_name]
-                elif arg_name in self.saved_for_bw:
-                    kwargs[arg_name] = self.saved_for_bw[arg_name]
-                elif arg_name in self.outputs:
-                    kwargs[arg_name] = self.outputs[arg_name]
+                elif arg_name in saved_for_bw:
+                    kwargs[arg_name] = saved_for_bw[arg_name]
+                elif arg_name in outputs:
+                    kwargs[arg_name] = outputs[arg_name]
                 else:
                     raise RuntimeError(f"arg {arg_name} not found")
             rets = self.step_gm(**kwargs)
 
             for output, ret in zip(self.step_gm.outputs_spec, rets):
                 if output in global_outputs_spec:
-                    self.outputs[output] = ret
+                    outputs[output] = ret
                 if output in self.step_outputs_spec_to_states_spec:
                     state_name = self.step_outputs_spec_to_states_spec[output]
                     self.fw_gm.injected_states[state_name] = ret

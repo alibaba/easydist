@@ -63,7 +63,7 @@ def train_step(input, label, model, opt):
     return loss
 
 
-def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
+def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func, num_chunks=2):
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
@@ -130,12 +130,21 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
+    from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
+    args_split, kwargs_split = split_args_kwargs_into_chunks(
+        args,
+        kwargs,
+        num_chunks,
+        None, #self.pipe.args_chunk_spec,
+        None, #self.pipe.kwargs_chunk_spec,
+    )
+
     with _enable_compile(), SplitPatcher(module, opt):
         traced_graph = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
-                                                                args, kwargs)
+                                                                args_split[0], kwargs_split[0])
 
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
@@ -173,7 +182,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         gm,
         compiled_stages,
         num_stages=2,
-        num_chunks=1,
+        num_chunks=num_chunks,
         stage_index=rank,
         device=device
     )
@@ -184,7 +193,6 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     else:
         pipe()
 
-    print(pipe.stage.outputs.keys())
     exit()
 
     seed()
