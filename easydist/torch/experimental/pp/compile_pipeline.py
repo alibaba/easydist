@@ -8,7 +8,6 @@ import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
 import torch.utils._pytree as pytree
-from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -555,7 +554,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     for output, state in zip(global_outputs_spec, states_spec_flatten)
                 }
 
-        def forward(self, saved_for_bw, outputs, **kwargs):
+        def forward(self, saved_for_bw=None, outputs=None, **kwargs):
             '''
             inputs:
                 kwargs: activations from previous stages
@@ -576,6 +575,14 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                         1. save for backward if it appears in self.bw_gm.inputs_spec (intermediate values for example)
                         2. save for output if it appears in global_outputs_spec (original model outputs for example)
             '''
+            if saved_for_bw is None or outputs is None:
+                if not hasattr(self, 'saved_for_bw'):
+                    self.saved_for_bw = {}
+                if not hasattr(self, 'outputs'):
+                    self.outputs = {}
+                saved_for_bw = self.saved_for_bw
+                outputs = self.outputs
+
             assert set(kwargs.keys(
             )) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
             kwargs4gm = {}
@@ -605,7 +612,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
             return ret
 
-        def backward(self, saved_for_bw, outputs, **kwargs):
+        def backward(self, saved_for_bw=None, outputs=None, **kwargs):
+            if saved_for_bw is None or outputs is None:
+                saved_for_bw = self.saved_for_bw
+                outputs = self.outputs
+
             assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
             kwargs4gm = {}
             for arg_name in self.bw_gm.inputs_spec:
@@ -630,9 +641,12 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     ret[output_name] = output
             return ret
 
-        def step(self, saved_for_bw, outputs):
+        def step(self, saved_for_bw=None, outputs=None):
             if not (hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')):
                 raise NotImplementedError("This compiled stage doesn't contain step_gm")
+            if saved_for_bw is None or outputs is None:
+                saved_for_bw = self.saved_for_bw
+                outputs = self.outputs
             kwargs = {}
             for arg_name in self.step_gm_args:
                 if arg_name in self.step_gm.injected_states:
