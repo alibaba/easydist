@@ -488,8 +488,11 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
 
     def all_gather_outputs(self, rank):
         outputs = [None for _ in range(self.nstages)]
+        output_dict = self.merge_output_chunks()
+        inv = self.stage.outputs_to_torch_name
+        output_dict = {(inv[k] if k in inv else k): v for k, v in output_dict.items()}
         dist.gather_object(
-            self.merge_output_chunks(),
+            output_dict,
             outputs if self.group_rank == rank else None,
             dst=rank
         )

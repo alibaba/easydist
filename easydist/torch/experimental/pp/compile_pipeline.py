@@ -540,6 +540,9 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
             self.global_outputs_spec = global_outputs_spec
+
+            self.outputs_to_torch_name = inv_params
+
             if full_step_gm is not None:  # TODO @botbw: simplify this
                 params = list(self.fw_gm_injected_states & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
@@ -554,6 +557,9 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     output: state
                     for output, state in zip(global_outputs_spec, states_spec_flatten)
                 }
+                for updated_state, ori_state in self.step_outputs_spec_to_states_spec.items():
+                    if ori_state in self.outputs_to_torch_name:
+                        self.outputs_to_torch_name[updated_state] = self.outputs_to_torch_name[ori_state]
 
         def forward(self, saved_for_bw=None, outputs=None, **kwargs):
             '''
