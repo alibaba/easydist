@@ -5,6 +5,7 @@ from functools import partial
 from typing import cast
 
 import numpy as np
+from sympy import N
 
 import torch
 import torch.utils._pytree as pytree
@@ -183,6 +184,9 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         compiled_stages,
         num_stages=2,
         num_chunks=num_chunks,
+        args_chunk_spec=None,
+        kwargs_chunk_spec=None,
+        outputs_chunk_spec=None,
         stage_index=rank,
         device=device
     )
@@ -193,8 +197,13 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     else:
         pipe()
 
-    exit()
+    outputs = pipe.all_gather_outputs(0)
 
+    for stage_output in outputs:
+        if stage_output is not None:
+            print(list(stage_output.keys()))
+
+    exit()
     seed()
     with torch.no_grad():
         gm(**{idx2phname[id_rand_input]: rand_input})

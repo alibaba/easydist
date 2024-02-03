@@ -318,7 +318,7 @@ def merge_chunks(chunks, chunk_spec):
     for arg_idx, arg in enumerate(spec_flattened):
         if isinstance(arg, TensorChunkSpec):
             partial_values = [
-                chunks_flattened[chunk_idx][arg_idx]
+                chunks_flattened[chunk_idx][arg_idx] if chunks_flattened[chunk_idx][arg_idx].dim() > 0 else chunks_flattened[chunk_idx][arg_idx].unsqueeze(0)
                 for chunk_idx in range(len(chunks_flattened))
             ]
 
@@ -350,6 +350,8 @@ def merge_chunks(chunks, chunk_spec):
                         chunk_start_idx, chunk_end_idx
                     )
                     sliced = partial_value[slice_indices]
+                    if sliced.dim() == 0:
+                        sliced = sliced.unsqueeze(0)
                     values_to_cat.append(sliced)
 
                     chunk_start_idx = chunk_end_idx

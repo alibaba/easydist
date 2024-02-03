@@ -58,6 +58,9 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         compiled_stages,
         num_stages,
         num_chunks,
+        args_chunk_spec,
+        kwargs_chunk_spec,
+        outputs_chunk_spec,
         stage_index: int,
         device: torch.device,
         group: dist.ProcessGroup = None,
@@ -68,8 +71,12 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         self.stage_index = stage_index
         self.nstages = num_stages
         self.chunks = num_chunks
+        self.args_chunk_spec = args_chunk_spec
+        self.kwargs_chunk_spec = kwargs_chunk_spec
+        self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
         self.group = group
+
         if dist.get_world_size(self.group) > self.nstages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused"
@@ -443,8 +450,11 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
             self.saved_for_bw_chunks.append({})
             self.outputs_chunks.append({})
 
-    def merge_output_chunks(self):
-        return self.stage.outputs
+    def merge_output_chunks(self) -> Dict[str, Any]:
+        return merge_chunks(
+            self.outputs_chunks,
+            self.outputs_chunk_spec,
+        )
 
     @torch.no_grad
     def __call__(self, *args, **kwargs):
@@ -476,7 +486,14 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
 
         logger.debug(f"[{self.group_rank}] All sends finished")
 
-
+    def all_gather_outputs(self, rank):
+        outputs = [None for _ in range(self.nstages)]
+        dist.gather_object(
+            self.merge_output_chunks(),
+            outputs if self.group_rank == rank else None,
+            dst=rank
+        )
+        return outputs
 
 # class PipelineStage1F1B(PipelineStage):
 #     def __init__(

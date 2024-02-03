@@ -539,6 +539,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
                 self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
+            self.global_outputs_spec = global_outputs_spec
             if full_step_gm is not None:  # TODO @botbw: simplify this
                 params = list(self.fw_gm_injected_states & set(full_step_gm.inputs_spec))
                 param_names = set(inv_params[name] for name in params)
