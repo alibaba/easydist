@@ -46,7 +46,8 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
-from easydist.torch.schedule.memory_scheduler import MemoryScheduler
+from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
+from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -440,26 +441,15 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         if rank == 0:
             logging.info("finish profiling fx module's memory")
 
-            mem_scheduler = MemoryScheduler(sharded_graph,
-                                            graph_mem_info)
-
-            if mdconfig.enable_reschedule:
-                required_memory, schedules, ordered_schedules, mem_locations = \
-                                        mem_scheduler.create_min_mem_plan()
+            if mdconfig.mem_opt_by_solver:
+                mem_sched = ILPMemoryScheduler(
+                                    sharded_graph, graph_mem_info, 1024*128)
             else:
-                pre_scheded_nodes = {}
-                step = 0
-                for node in sharded_graph.graph.nodes:
-                    if (
-                        node.op != 'placeholder'
-                        and node.op != 'get_attr'
-                        and node.op != 'output'
-                    ):
-                        pre_scheded_nodes[node] = step
-                        step += 1
-                required_memory, schedules, ordered_schedules, mem_locations = \
-                                        mem_scheduler.create_min_mem_plan(
-                                            pre_scheded_nodes=pre_scheded_nodes)
+                mem_sched = EfficientMemoryScheduler(
+                                    sharded_graph, graph_mem_info)
+
+            required_memory, schedules, ordered_schedules, mem_locations = \
+                                                mem_sched.gen_mem_addresses()
 
     class EDCompiledFunc:
 

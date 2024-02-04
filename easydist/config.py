@@ -93,3 +93,9 @@ enable_memory_opt = os.environ.get("ENABLE_MEMORY_OPT", "False").upper() in ["1"
 # reschedule ops
 enable_reschedule = os.environ.get("ENABLE_RESCHEDULE", "False").upper() in ["1", "TRUE"]
 
+# memory usage optimization by solver
+mem_opt_by_solver = os.environ.get("MEM_OPT_BY_SOLVER", "False").upper() in ["1", "TRUE"]
+
+# dump memory usage graph
+dump_mem_usage_graph = os.environ.get("DUMP_MEM_USAGE_GRAPH", "False").upper() in ["1", "TRUE"]
+

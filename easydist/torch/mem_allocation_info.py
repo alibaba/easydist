@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 
-class OutTensorMemInfo:
+class OutVar:
     def __init__(
         self,
         out_index,
@@ -56,18 +56,22 @@ class OutTensorMemInfo:
 
 class NodeMemInfo:
     def __init__(self):
-        self.out_tensor_infos = []  # list of OutTensorMemInfo
+        self.out_vars = []  # list of OutVar
 
-    def add_out_tensor_mem_info(self, out_index, mem_size, mem_index,
-                                is_reference, arg_index=-1, tensor_index=-1):
-        out_tensor_mem_info = OutTensorMemInfo(
-                                  out_index, mem_size, mem_index, is_reference,
-                                  arg_index, tensor_index)
-        self.out_tensor_infos.append(out_tensor_mem_info)
+    def add_out_var(self, out_index, mem_size, mem_index,
+                    is_reference, arg_index=-1, tensor_index=-1):
+        out_var = OutVar(out_index, mem_size, mem_index, is_reference,
+                         arg_index, tensor_index)
+        self.out_vars.append(out_var)
+
+    def get_out_var(self, out_idx):
+        var = self.out_vars[out_idx]
+        assert var.out_index == out_idx
+        return var
 
     def __str__(self) -> str:
         mem_info_str = ""
-        for tensor_mem_info in self.out_tensor_infos:
+        for tensor_mem_info in self.out_vars:
             mem_info_str += str(tensor_mem_info) + "\n"
         return mem_info_str
 
@@ -80,7 +84,13 @@ class GraphMemInfo:
 
     def get_out_vars(self, node):
         node_mem_info = self.get_node_mem_info(node.name)
-        return node_mem_info.out_tensor_infos
+        return node_mem_info.out_vars
+
+    def get_out_var(self, node, out_idx):
+        node_mem_info = self.get_node_mem_info(node.name)
+        var = node_mem_info[out_idx]
+        assert var.out_index == out_idx
+        return var
 
     def __str__(self) -> str:
         graph_mem_info_str = ""

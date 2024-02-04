@@ -13,6 +13,7 @@
 # ==============================================================================
 
 from typing import Any, List, Dict, Tuple
+import logging
 
 import __main__
 import torch.utils._pytree as pytree
@@ -28,7 +29,7 @@ from easydist.torch.utils import to_meta
 from easydist.torch.mem_allocation_info import GraphMemInfo
 
 __all__ = ['AllocatorProfiler']
-
+logger = logging.getLogger(__name__)
 
 class NodeProfilingInfo:
     def __init__(self, name) -> None:
@@ -124,6 +125,7 @@ class ModuleProfilingInfo:
         graph_mem_info = GraphMemInfo()
 
         for node_name in self.node_names:
+            #print(f"record memory info in graph mem info for node {node_name}")
             node_mem_info = graph_mem_info.get_node_mem_info(node_name)
             node_profiling_info = self.get_node_profiling_info(node_name)
 
@@ -132,8 +134,11 @@ class ModuleProfilingInfo:
                 for alloc_idx, alloc_addr in enumerate(node_profiling_info.allocator_address):
                     if out_addr == alloc_addr:
                         alloc_size = node_profiling_info.allocator_size[alloc_idx]
-                        node_mem_info.add_out_tensor_mem_info(
+                        node_mem_info.add_out_var(
                                           out_idx, alloc_size, alloc_idx, False)
+                        if alloc_size==0:
+                            logger.info(f"The allocated buffer size of tensor {node_name}:{out_idx} is zero")
+
                         is_allocated = True
                         break;
 
@@ -143,9 +148,12 @@ class ModuleProfilingInfo:
                             input_size = node_profiling_info.input_size[in_idx]
                             arg_index = node_profiling_info.input_arg_index[in_idx]
                             tensor_index = node_profiling_info.input_tensor_index[in_idx]
-                            node_mem_info.add_out_tensor_mem_info(
+                            node_mem_info.add_out_var(
                                               out_idx, input_size, in_idx, \
-                                                True, arg_index, tensor_index)
+                                              True, arg_index, tensor_index)
+                            if input_size==0:
+                                logger.info(f"The referenced buffer size of tensor {node_name}:{out_idx} is zero")
+
                             break;
 
         return graph_mem_info
