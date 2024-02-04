@@ -21,7 +21,11 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
                                                              PipeSplitWrapper,
                                                              compile_stateful_stages,
-                                                             split_into_equal_size)
+                                                             split_into_equal_size,
+                                                             before_split_register,
+                                                             after_split_register,
+                                                             tuple_after_split,
+                                                             tuple_before_split)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -323,12 +327,27 @@ if __name__ == '__main__':
     #     'layers.16',
     #     'layers.24',
     # }, factory_gen_rand_input_ids(LlamaConfig().vocab_size),
-    #           train_step_gpt)  # overflow? OOM on my machine
+    #           train_step_gpt)  # OOM
 
-    # test_main(
-    #     T5ForConditionalGeneration.from_pretrained("t5-small"), {
-    #         'encoder.block.2',
-    #         'encoder',
-    #         'decoder.block.2',
-    #     }, factory_gen_rand_input_ids(32128),
-    #     train_step_t5)  # module not outputting tensors or list/tuple of tensors but python class
+    # from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+    # @before_split_register(BaseModelOutputWithPastAndCrossAttentions)
+    # def before_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
+    #     ctx['ori_model_output'] = input
+    #     tup = (input.attentions, input.cross_attentions, input.hidden_states, input.last_hidden_state,
+    #            input.past_key_values, input['last_hidden_state'])
+    #     return tuple_before_split(ctx, tup)
+    
+    # @after_split_register(BaseModelOutputWithPastAndCrossAttentions)
+    # def after_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
+    #     tup = tuple_after_split(ctx, input)
+    #     ori_model_output = ctx['ori_model_output']
+    #     ori_model_output.attentions, ori_model_output.cross_attentions, ori_model_output.hidden_states, ori_model_output.last_hidden_state, ori_model_output.past_key_values, ori_model_output['last_hidden_state'] = tup
+    #     return ori_model_output
+
+    # test_main(T5ForConditionalGeneration.from_pretrained("t5-small"), {
+    #     'encoder.block.2',
+    #     'encoder',
+    #     'decoder.block.2',
+    # }, factory_gen_rand_input_ids(32128), train_step_t5)
+
+    print("All tests passed!")

@@ -2,7 +2,7 @@ import imp
 import logging
 import operator
 from enum import Enum
-from typing import (Callable, Dict, List, Tuple)
+from typing import (Callable, Dict, List, Sequence, Tuple, Any, Union)
 from collections import defaultdict
 from numpy import isin
 
@@ -44,6 +44,30 @@ def step_split_point():
     if tracer_current is not None and hasattr(tracer_current, "graph"):
         tracer_current.graph.call_function(step_split_point, (), {})
 
+_before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
+_after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
+
+def before_split_register(*classes):
+    def _register(func: Callable):
+        for cls in classes:
+            assert cls not in _before_split, f"split function for {cls} already registered"
+            _before_split[cls] = func
+        return func
+    return _register
+
+def after_split_register(*classes):
+    def _register(func: Callable):
+        for cls in classes:
+            assert cls not in _after_split, f"split function for {cls} already registered"
+            _after_split[cls] = func
+        return func
+    return _register
+
+def get_registered_by_mro(registered, obj: Any) -> type:
+    for cls in obj.__class__.mro():
+        if cls in registered:
+            return registered[cls]
+    raise RuntimeError(f"no registered split function for {obj.__class__}")
 
 # ================================= section end ========================================
 
@@ -53,35 +77,8 @@ def _to_tuple(x):
         return x
     return (x, )
 
+from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func, fw_bw_param_type, fw_bw_ret_type
 
-# # see https://pytorch.org/docs/stable/notes/extending.html#how-to-use
-# class _FWBWSplitFunc(torch.autograd.Function):
-
-#     @staticmethod
-#     def forward(
-#             ctx,
-#             *args):  # TODO @botbw: support kwargs: https://github.com/pytorch/pytorch/issues/96337
-#         fw_bw_split_point()
-#         need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
-#         args = tuple(
-#             arg.clone() if need_clone(arg) else arg
-#             for arg in args)  # TODO @botbw: have to clone? (in case the following op is in-place)
-#         return args
-
-#     @staticmethod
-#     def backward(ctx, *grad_output):
-#         fw_bw_split_point()
-#         return grad_output
-
-
-# def fw_bw_split_func(*args, **kwargs):
-#     if len(kwargs):
-#         raise TypeError(
-#             "fw_bw_split_func() got an unexpected keyword argument '%s', autograd.Function haven't support kwargs yet, try SplitPoint.END to solve this"
-#             % list(kwargs.keys()))
-#     return _FWBWSplitFunc.apply(*args)
-
-from easydist.torch.experimental.pp.split_op import fw_bw_split_func
 # ================================= section start ========================================
 # The idea of functions in this section are borrowed from
 # https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L1206
@@ -93,13 +90,10 @@ class PipeSplitWrapper(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         ret = self.mod(*args, **kwargs)
-        if isinstance(ret, torch.Tensor):  # tensor, tuple/list
-            ret = fw_bw_split_func(ret)[0]
-            assert isinstance(ret, torch.Tensor)
-        else:
-            assert isinstance(ret, (tuple, list))
-            ret = fw_bw_split_func(*ret)
-            assert isinstance(ret, tuple)
+        ctx = {}
+        tensor_tuple: Tuple[torch.Tensor] = get_registered_by_mro(_before_split,ret)(ctx, ret)
+        tensor_tuple: Tuple[torch.Tensor] = fw_bw_split_func(tensor_tuple)
+        ret = get_registered_by_mro(_after_split,ret)(ctx, tensor_tuple)
         return ret
 
     def __getattr__(self, name: str):
@@ -328,7 +322,7 @@ class SplitPatcher(_Patcher):
 
         # TODO @botbw: register_module_full_backward_pre_hook
         def backward_wrapper(tensor, *args, **kwargs):
-            tensor = fw_bw_split_func(tensor)
+            tensor = before_bw_split_func(tensor)
             orig_backward(tensor, *args, **kwargs)
 
         patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
@@ -373,10 +367,21 @@ def split_by(mod: torch.nn.Module, traced: torch.fx.GraphModule, split_point: Ca
         if isinstance(submodule, torch.fx.GraphModule):
             for node in submodule.graph.nodes:
                 if (node.op, node.target) == ("call_function", split_point):
+                    try:
+                        submodule.graph.erase_node(node) # nodes that can be removed directly (i.e. not connected in graph)
+                    except Exception as e: # nodes which are in graph
+                        assert len(node.args) == 1, "split_point should have only one argument (list) or None"
+                        args_prev = node.args[0]
+                        to_erase = []
+                        for gi in node.users:
+                            assert gi.op == "call_function" and gi.target == operator.getitem
+                            gi_index = gi.args[1]
+                            gi.replace_all_uses_with(args_prev[gi_index])
+                            to_erase.append(gi)
+                        for gi in to_erase:
+                            submodule.graph.erase_node(gi)
+                        submodule.graph.erase_node(node)
 
-                    submodule.graph.erase_node(node)
-                    if split_point == step_split_point:
-                        submodule.__ed_step_gm = None  # set flag for step submodule
             submodule.recompile()
 
     split.graph.eliminate_dead_code()
@@ -384,7 +389,7 @@ def split_by(mod: torch.nn.Module, traced: torch.fx.GraphModule, split_point: Ca
     split.graph.lint()
     split.recompile()
 
-    return split
+    return split, part_idx + 1
 
 
 def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: List[str]):
@@ -501,7 +506,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
         phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
     inv_params = {arg: param_name for param_name, arg in phs_spec_unflatten[0].items()}
 
-    splited_global = split_by(model, traced_gm, step_split_point)
+    splited_global, part_cnt = split_by(model, traced_gm, step_split_point)
+    assert part_cnt == 2, f"part_cnt should be 2 (fw_bw + step), but found {part_cnt}"
 
     class CompiledStage:
 
@@ -650,7 +656,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}
 
-    def gen_stateful_submod(node, submod):
+    def gen_stateful_submod(node, submod, is_bw=False):
         # process input
         inputs_spec = []
         inputs_users = []
@@ -658,8 +664,10 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
         for arg in node.args:
             inputs_spec.append(arg.name)
             inputs_users.append({user.name for user in arg.users})
-            if arg.name in states_spec_flatten and arg.name in name2state:  # inject states to the first submod
-                injected_states[arg.name] = name2state.pop(arg.name)
+            if (not is_bw) and arg.name in states_spec_flatten:  # inject states to the first submod 
+                # assert arg.name in name2state, f"{arg.name} not found in name2state or has been injected"
+                if arg.name in name2state: # TODO @botbw: seperate params, buffers, and named_states in order to know whether there is params sharing
+                    injected_states[arg.name] = name2state.pop(arg.name)
 
         # process output
         outputs_spec = []
@@ -695,11 +703,30 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     current_stateful_fw_bw = None
     compiled_stages = []
+    submod_cnt = 0
     for node in splited_global.graph.nodes:
         if node.op == 'call_module':
+            submod_cnt += 1
             submod_global_name = node.target
             submod_global = getattr(splited_global, submod_global_name)
-            if hasattr(submod_global, '__ed_step_gm'):  # optimizer gm
+            if submod_cnt % 2 :  # fw bw gm
+                splited_fw_bw_gm, part_cnt = split_by(submod_global, submod_global, torch.ops.easydist.fw_bw_split.default)
+
+                stateful_fw_bw = []
+                for n in splited_fw_bw_gm.graph.nodes:
+                    if n.op == 'call_module':  # extrace submods
+                        assert 'submod_' == n.target[:7] and len(
+                            n.kwargs) == 0, "splited_model should have no kwargs"
+                        idx = int(n.target[7:])
+                        submod = getattr(splited_fw_bw_gm, n.target)
+                        stateful_fw_bw.append(gen_stateful_submod(n, submod, is_bw = idx >= part_cnt // 2))
+
+                assert len(stateful_fw_bw) % 2 == 0, "each fw_gm should have a corresponding bw_gm"
+                num_stage = len(stateful_fw_bw) // 2
+
+                assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
+                current_stateful_fw_bw = stateful_fw_bw
+            else:  # optimizer gm
                 step_gm_global = gen_stateful_submod(node, submod_global)
 
                 assert current_stateful_fw_bw is not None, "There should be a stateful_bw_fw before optimizer step"
@@ -713,25 +740,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     step_gm_global.injected_states
                 ) == 0, "All states of step_gm_global should have been injected to step_gm"
                 current_stateful_fw_bw = None
-            else:  # fw bw gm
-                splited_fw_bw_gm = split_by(submod_global, submod_global, torch.ops.easydist.fw_bw_split.default)
 
-                stateful_fw_bw = []
-                for n in splited_fw_bw_gm.graph.nodes:
-                    if n.op == 'call_module':  # extrace submods
-                        assert 'submod_' == n.target[:7] and len(
-                            n.kwargs) == 0, "splited_model should have no kwargs"
-                        submod = getattr(splited_fw_bw_gm, n.target)
-                        stateful_fw_bw.append(gen_stateful_submod(n, submod))
-
-                assert len(stateful_fw_bw) % 2 == 0, "each fw_gm should have a corresponding bw_gm"
-                num_stage = len(stateful_fw_bw) // 2
-
-                assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
-                current_stateful_fw_bw = stateful_fw_bw
-
-    if False:
-        assert len(name2state) == 0, "All states should have been injected"
+    assert len(name2state) == 0, "All states should have been injected"
 
     if current_stateful_fw_bw is not None:  # forward and backward followed by no step
         num_stage = len(current_stateful_fw_bw) // 2
@@ -779,3 +789,46 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     out2idx = {name: i for i, name in enumerate(global_outputs_spec)}
     return global_phs_spec, out2idx, compiled_stages, gm
+
+@before_split_register(torch.Tensor)
+def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
+    return tuple([input])
+
+@after_split_register(torch.Tensor)
+def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
+    return output[0]
+
+@before_split_register(list)
+def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
+    ctx['is_tensor'] = []
+    ctx['non_tensor_vals'] = []
+    tup = []
+    for x in input:
+        ctx['is_tensor'].append(isinstance(x, torch.Tensor))
+        if ctx['is_tensor'][-1]:
+            tup.append(x)
+        else:
+            ctx['non_tensor_vals'].append(x)
+
+    return tuple(tup)
+
+@after_split_register(list)
+def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
+    ret = []
+    output = list(output)
+    for is_tensor in ctx['is_tensor']:
+        if is_tensor:
+            ret.append(output.pop(0))
+        else:
+            ret.append(ctx['non_tensor_vals'].pop(0))
+    return ret
+
+@before_split_register(tuple)
+def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
+    return list_before_split(ctx, list(input))
+
+@after_split_register(tuple)
+def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
+    return tuple(list_after_split(ctx, output))
+
+# TODO @botbw: how to deal with dict?
