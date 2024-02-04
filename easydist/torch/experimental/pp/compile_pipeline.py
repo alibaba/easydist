@@ -521,7 +521,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     node_metas = {node.name: node.meta for node in traced_gm.graph.nodes}
     
     splited_global, part_cnt = split_by(model, traced_gm, step_split_point)
-    assert part_cnt == 2, f"part_cnt should be 2 (fw_bw + step), but found {part_cnt}"
+    assert part_cnt <= 2, f"part_cnt should be 1 (fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
 
     class CompiledStage(CompiledStageBase):
 
