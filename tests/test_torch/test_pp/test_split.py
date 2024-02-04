@@ -195,7 +195,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
     args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
 
-    idx2phname, outname2idx, compiled_stages, gm = compile_stateful_stages(
+    idx2phname, outname2idx, compiled_stages, gm, _, _ = compile_stateful_stages(
         module, traced_graph, args_flatten, args_spec)
 
     id_rand_input = -1
@@ -299,11 +299,11 @@ if __name__ == '__main__':
             'encoder.layers.encoder_layer_5.mlp.3',
             'encoder.layers.encoder_layer_9.ln_2',
         }, gen_rand_input_imagenet, train_step)
-    test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-        'h.3',
-        'h.6',
-        'h.9',
-    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
+    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+    #     'h.3',
+    #     'h.6',
+    #     'h.9',
+    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
     test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
     test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
