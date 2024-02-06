@@ -210,11 +210,12 @@ class AllocatorProfiler(Interpreter):
             Any: The result of executing ``n``
         """
 
-        if n.op == "placeholder":
-            return None
-
         if n.op == "output":
             qualified_name = "output"
+        elif n.op == "placeholder":
+            if 'val' not in n.meta:
+                return None
+            qualified_name = n.name
         else:
             qualified_name = _get_qualified_name(n.target)
 
@@ -247,7 +248,11 @@ class AllocatorProfiler(Interpreter):
             # tell profiling_allocator to start profiling
             __main__.start_recording = True
 
-            output = getattr(self, n.op)(n.target, materialized_inputs, n.kwargs)
+            if n.op == "placeholder":
+                out_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'], n)
+                output = pytree.tree_map_only(torch.Tensor, materialize_random, out_signature)
+            else:
+                output = getattr(self, n.op)(n.target, materialized_inputs, n.kwargs)
 
             # flatten to handle possible tuples
             flat_outputs, _ = pytree.tree_flatten(output)
