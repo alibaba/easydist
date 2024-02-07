@@ -35,6 +35,13 @@ class MemSharedTensorGroup:
         self.core_tensor_size = 0
         self.core_tensor = None  # Tuple[torch.fx.Node, int]
 
+    def __str__(self) -> str:
+        ret = f"core_tensor_size: {self.core_tensor_size}, core_tensor: {self.core_tensor}\n"
+        for tensor,mem_size in self.tensors.items():
+            ret += f"  node: {tensor[0].name}, out idx: {tensor[1]}, mem size: {mem_size}\n"
+
+        return ret
+
     def add_core_tensor(self, tensor: Tuple[torch.fx.Node, int], tensor_size):
         assert self.core_tensor_size == 0
         assert not self.core_tensor
@@ -195,11 +202,9 @@ class LifetimeInfo:
                                 self.mem_share_info[out_set_item] = pre_shared_group
                     else:
                         pre_shared_group.add_ref_tensor(out_tensor_key, out_var.mem_size)
-                        #print(f"ref: {pre_node}, out_tensor_key: {out_tensor_key}, out_var.mem_size: {out_var.mem_size}")
                         self.mem_share_info[out_tensor_key] = pre_shared_group
                 else:
                     out_shared_group = self.mem_share_info[out_tensor_key]
-                    #print(f"node: {node}, core out_tensor_key: {out_tensor_key}, out_var.mem_size: {out_var.mem_size}")
                     out_shared_group.add_core_tensor(out_tensor_key, out_var.mem_size)
 
         visited_group_set = set()
@@ -208,22 +213,10 @@ class LifetimeInfo:
                 continue
 
             visited_group_set.add(id(tensor_group))
-            if tensor_group.core_tensor_size == 0:
-                # Lansong(TODO):
-                #   A workaround to set core_tensor_size if it is not set yet.
-                #   If core tensor is placeholder, we need the workaround because
-                #   placeholder's memory usage is missed in profiler.
-                max_mem_size = 0
-                for _, mem_size in tensor_group.tensors.items():
-                    if max_mem_size < mem_size:
-                        max_mem_size = mem_size
-                tensor_group.core_tensor_size = max_mem_size
+            assert tensor_group.core_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
 
             # debug: dump memory-shared tensor group
-            #print(("share set id: {}").format(id(tensor_group)))
-            #print(f"  core_tensor_size: {tensor_group.core_tensor_size}, core_tensor: {tensor_group.core_tensor}")
-            #for tensor,mem_size in tensor_group.tensors.items():
-            #    print(("  node: {}, out idx: {}, mem size: {}").format(tensor[0].name, tensor[1], mem_size))
+            #print(str(tensor_group))
 
     def get_group(self, node: torch.fx.Node, out_idx: int):
         assert (node, out_idx) in self.mem_share_info

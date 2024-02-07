@@ -46,22 +46,6 @@ class ILPMemoryScheduler(MemoryScheduler):
         self.abs_stop = abs_stop
         self.one_step_one_op = one_step_one_op
 
-        # Lansong(TODO):
-        # refresh nodes_to_schedule and node_set by dropping out placeholder
-        # It is a workaround because currently placeholder memory information
-        # is missed. Once placeholder memory information is fixed, the refresh
-        # should be removed.
-        self.nodes_to_schedule = []
-        for node in fx_module.graph.nodes:
-            if node.op == 'placeholder' or node.op == 'get_attr':
-                self.args.append(node)
-            elif node.op == 'output':
-                self.outputs.append(node)
-            else:
-                self.nodes_to_schedule.append(node)
-
-        self.node_set = set(self.nodes_to_schedule)
-
     def total_tensor_size(self):
         total_size = 0
         total_align_scaled_size = 0
@@ -616,28 +600,4 @@ class ILPMemoryScheduler(MemoryScheduler):
 
         return (required_memory, schedules, ordered_schedules, mem_locations)
 
-    # Lansong(TODO): override implementation of base class
-    # The difference in this function is that it drop out placeholder.
-    # It is a workaround because currently placeholder memory information
-    # is missed. Once placeholder memory information is fixed, following
-    # function should be removed and reuse the implementation of base class.
-    def gen_mem_addresses(self):
-        pre_scheded_nodes = None
-        if not mdconfig.enable_reschedule:
-            pre_scheded_nodes = {}
-            step = 0
-            for node in self.fx_module.graph.nodes:
-                if (
-                    node.op != 'output'
-                    and node.op != 'placeholder'
-                    and node.op != 'get_attr'
-                ):
-                    pre_scheded_nodes[node] = step
-                    step += 1
-
-        required_memory, schedules, ordered_schedules, mem_locations = \
-                                      self.create_min_mem_plan(
-                                          pre_scheded_nodes=pre_scheded_nodes)
-
-        return (required_memory, schedules, ordered_schedules, mem_locations)
 

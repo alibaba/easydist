@@ -19,23 +19,23 @@ class OutVar:
         self,
         out_index,
         mem_size,
-        mem_index,
         is_reference,
+        alloc_index,
         arg_index,
         tensor_index
     ):
         self.out_index = out_index
         self.mem_size = mem_size
 
-        # when self.is_reference is True, it is the input tensor index it refer to
-        # otherwise, it is the allocation index of all allocations of its owner node
-        self.mem_index = mem_index
-
         # bool
         # True: it is a reference of an input tensor
         # False: it is new allocated memory
         self.is_reference = is_reference
 
+        # allocation info:
+        self.alloc_index = alloc_index
+
+        # reference info:
         self.arg_index = arg_index
         self.tensor_index = tensor_index
 
@@ -46,21 +46,22 @@ class OutVar:
         mem_info_str = ""
         if self.is_reference:
             mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
-                           str(self.mem_size) + ", input idx: " + \
-                           str(self.mem_index)
+                           str(self.mem_size) + ", arg idx: " + \
+                           str(self.arg_index) + ", tensor idx: " + \
+                           str(self.tensor_index)
         else:
             mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", alloc idx: " + \
-                           str(self.mem_index)
+                           str(self.alloc_index)
         return mem_info_str
 
 class NodeMemInfo:
     def __init__(self):
         self.out_vars = []  # list of OutVar
 
-    def add_out_var(self, out_index, mem_size, mem_index,
-                    is_reference, arg_index=-1, tensor_index=-1):
-        out_var = OutVar(out_index, mem_size, mem_index, is_reference,
+    def add_out_var(self, out_index, mem_size, is_reference, alloc_index=-1,
+                    arg_index=-1, tensor_index=-1):
+        out_var = OutVar(out_index, mem_size, is_reference, alloc_index,
                          arg_index, tensor_index)
         self.out_vars.append(out_var)
 

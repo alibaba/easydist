@@ -135,7 +135,8 @@ class ModuleProfilingInfo:
                     if out_addr == alloc_addr:
                         alloc_size = node_profiling_info.allocator_size[alloc_idx]
                         node_mem_info.add_out_var(
-                                          out_idx, alloc_size, alloc_idx, False)
+                                          out_idx, alloc_size, False, \
+                                          alloc_index=alloc_idx)
                         if alloc_size==0:
                             logger.info(f"The allocated buffer size of tensor {node_name}:{out_idx} is zero")
 
@@ -149,8 +150,9 @@ class ModuleProfilingInfo:
                             arg_index = node_profiling_info.input_arg_index[in_idx]
                             tensor_index = node_profiling_info.input_tensor_index[in_idx]
                             node_mem_info.add_out_var(
-                                              out_idx, input_size, in_idx, \
-                                              True, arg_index, tensor_index)
+                                              out_idx, input_size, True, \
+                                              arg_index=arg_index, \
+                                              tensor_index=tensor_index)
                             if input_size==0:
                                 logger.info(f"The referenced buffer size of tensor {node_name}:{out_idx} is zero")
 
@@ -234,9 +236,11 @@ class AllocatorProfiler(Interpreter):
             # TODO(wuhao): use customized tree_flatten, avoid flatten of non-tensors
             constant_types = [type(None), bool, int, float, torch.dtype, str]
             for arg_index, materialized_input in enumerate(materialized_inputs):
-                for tensor_index, flat_input in enumerate(pytree.tree_flatten(materialized_input)[0]):
+                tensor_index = 0
+                for flat_input in pytree.tree_flatten(materialized_input)[0]:
                     if isinstance(flat_input, torch.Tensor):
                         node_profiling_info.add_input_info(flat_input, arg_index, tensor_index)
+                        tensor_index += 1
                     elif type(flat_input) in constant_types:
                         continue
                     else:
