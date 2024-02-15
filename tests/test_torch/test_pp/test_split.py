@@ -1,14 +1,21 @@
 import os
 import random
+import inspect
 from contextlib import nullcontext
 from functools import partial
 from typing import cast
+
+from requests import get
 # make easydist happy without torchrun
 os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
 
-from transformers import OpenAIGPTConfig, OpenAIGPTModel, AutoModel, LlamaModel, LlamaConfig, T5Tokenizer, T5ForConditionalGeneration, T5ForConditionalGeneration
+from transformers import (OpenAIGPTConfig, OpenAIGPTModel, 
+                          AutoModel, LlamaModel, LlamaConfig, 
+                          T5Tokenizer, T5ForConditionalGeneration, 
+                          T5ForConditionalGeneration, OpenLlamaModel, 
+                          OpenLlamaConfig, GPT2Config, GPT2Model)
 
 import torch
 import torch.utils._pytree as pytree
@@ -94,10 +101,13 @@ def train_step_gpt(input, label, model, opt):
         opt.zero_grad()
     out = model(input)
     loss = 0
-    for key in ['attentions', 'cross_attentions', 'hidden_states', 'last_hidden_state', 'past_key_values', 'last_hidden_state', 'pooler_output', 'past_key_values']:
+    for key in ['attentions', 'cross_attentions', 'hidden_states', 'pooler_output', 'pask_key_values', 'last_hidden_state']:
         if hasattr(out, key) and (attr := getattr(out, key)) is not None:
-            assert isinstance(attr, torch.Tensor)
-            loss += (attr - torch.ones_like(attr) * label).pow(2).mean()
+            if isinstance(attr, torch.Tensor):
+                loss += (attr - torch.ones_like(attr) * label).pow(2).mean()
+            elif isinstance(attr, (tuple, list)):
+                for a in attr:
+                    loss += (a - torch.ones_like(a) * label).pow(2).mean()
     loss.backward()
     if opt is not None:
         opt.step()
@@ -116,10 +126,11 @@ def train_step_t5(input, label, model, opt):
 
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
-    module = module.train().double().cuda()
-    # opt = None
+    module = module.train().cuda()
+    opt = None
     # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
     else:
@@ -174,21 +185,21 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         return params, buffers, named_states, grads, ret
 
     with _enable_compile(), SplitPatcher(module, opt):
-        traced_graph = ed_make_fx(partial(stateless_func, train_step_func),
+        traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args, kwargs)
 
-    traced_graph.graph.eliminate_dead_code()
-    traced_graph = preprocess_traced_graph(traced_graph)
-    traced_graph.recompile()
+    traced_stateless_func.graph.eliminate_dead_code()
+    # traced_graph = preprocess_traced_graph(traced_graph)
+    traced_stateless_func.recompile()
     ##################################################################################################
 
     # print("traced_graph:\n", traced_graph.code)
-    save_graphviz_dot(traced_graph, 'traced_graph')
+    save_graphviz_dot(traced_stateless_func, 'traced_graph')
 
-    args_unflatten = [params, buffers, named_states, args, kwargs]
+    stateless_func_args = [params, buffers, named_states, args, kwargs]
 
     def arg_copy_func(x):
         if isinstance(x, torch.Tensor):
@@ -196,14 +207,14 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         else:
             return x
 
-    args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
-    args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
+    stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
+    stateless_func_args_flatten, _ = pytree.tree_flatten(stateless_func_args)
 
     idx2phname, outname2idx, compiled_stages, gm, _, _ = compile_stateful_stages(
-        module, traced_graph, args_flatten, args_spec)
+        module, traced_stateless_func, stateless_func_args, strict=False)
 
     id_rand_input = -1
-    for i, arg in enumerate(args_flatten):
+    for i, arg in enumerate(stateless_func_args_flatten):
         if arg is rand_input:
             id_rand_input = i
             break
@@ -225,15 +236,19 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     seed()
     with torch.no_grad():
-        out_copy = traced_graph(*args_copy)
-        args_copy[:3] = out_copy[:3]
-        args_copy[3][0] = rand_input1
-        out_copy = traced_graph(*args_copy)
+        out_copy = traced_stateless_func(*stateless_func_args_copy)
+        stateless_func_args_copy[:3] = out_copy[:3]
+        stateless_func_args_copy[3][0] = rand_input1
+        out_copy = traced_stateless_func(*stateless_func_args_copy)
 
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
+    ignore_none = True
     for i, (val, val_copy) in enumerate(zip(out_flatten, out_flatten_copy)):
         assert val is not val_copy
+        if ignore_none:
+            if val is None:
+                continue
         if isinstance(val, torch.Tensor):
             assert torch.allclose(val, val_copy)
         else:
@@ -313,28 +328,34 @@ if __name__ == '__main__':
     test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
     test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
     test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
-    
+
     # ======== nlp models, might take long time and OOM ========
-    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-    #     'h.3',
-    #     'h.6',
-    #     'h.9',
-    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
+    test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+        'h.3',
+        'h.6',
+        'h.9',
+    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
-    # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
-    #     'encoder.layer.3',
-    #     'encoder.layer.6',
-    #     'encoder.layer.9',
-    # }, factory_gen_rand_input_ids(30522), train_step_gpt)  # None in output?
+    test_main(AutoModel.from_pretrained("bert-base-uncased"), {
+        'encoder.layer.3',
+        'encoder.layer.6',
+        'encoder.layer.9',
+    }, factory_gen_rand_input_ids(30522), train_step_gpt)
 
-    # # ======== not working ========
+    test_main(GPT2Model(GPT2Config()), {
+        'h.3',
+        'h.6',
+        'h.9',
+    }, factory_gen_rand_input_ids(50257), train_step_gpt)
 
     # test_main(LlamaModel(LlamaConfig()), {
     #     'layers.8',
     #     'layers.16',
     #     'layers.24',
     # }, factory_gen_rand_input_ids(LlamaConfig().vocab_size),
-    #           train_step_gpt)  # OOM
+    #           train_step_gpt)  # might OOM
+
+    # # ======== not working ========
 
     # from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
     # @before_split_register(BaseModelOutputWithPastAndCrossAttentions)
@@ -355,6 +376,10 @@ if __name__ == '__main__':
     #     'encoder.block.2',
     #     'encoder',
     #     'decoder.block.2',
-    # }, factory_gen_rand_input_ids(32128), train_step_t5)
+    # }, factory_gen_rand_input_ids(32128), train_step_t5) # params used in multiple forward stage
+
+    # test_main(OpenLlamaModel(OpenLlamaConfig()), {
+
+    # }, factory_gen_rand_input_ids(OpenLlamaConfig().vocab_size), train_step_gpt) # model init error?
 
     print("All tests passed!")

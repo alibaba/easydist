@@ -811,11 +811,12 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
         debugging_info = ""
         for name in name2tensor:
             typ, src_name = source_name(name)
-            debugging_info += f"{name}({typ}:{src_name}) "
+            debugging_info += f"{typ}: {name}({src_name}) "
+        debugging_info = f"Some states were erased, if this is as intended, set strict=False\nErased: {debugging_info}"
         if strict:
-            raise RuntimeError(f"All states should have been injected, but found {debugging_info}")
+            raise RuntimeError(debugging_info)
         else:
-            logging.warning(f"All states should have been injected, but found {debugging_info}")
+            logging.warning(debugging_info)
 
     if current_stateful_fw_bw is not None:  # forward and backward followed by no step
         num_stage = len(current_stateful_fw_bw) // 2
