@@ -141,21 +141,22 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     )
 
     with _enable_compile(), SplitPatcher(module, opt):
-        traced_graph = ed_make_fx(partial(stateless_func, train_step_func),
+        traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
                                   _allow_non_fake_inputs=False)(params, buffers, named_states,
                                                                 args_split[0], kwargs_split[0])
 
-    traced_graph.graph.eliminate_dead_code()
-    traced_graph = preprocess_traced_graph(traced_graph)
-    traced_graph.recompile()
+    traced_stateless_func.graph.eliminate_dead_code()
+    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
+    traced_stateless_func.recompile()
     ##################################################################################################
 
+    traced_stateless_func_node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
     # print("traced_graph:\n", traced_graph.code)
-    save_graphviz_dot(traced_graph, 'traced_graph')
+    save_graphviz_dot(traced_stateless_func, 'traced_graph')
 
-    args_unflatten = [params, buffers, named_states, args, kwargs]
+    stateless_func_args = [params, buffers, named_states, args, kwargs]
 
     def arg_copy_func(x):
         if isinstance(x, torch.Tensor):
@@ -163,11 +164,11 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         else:
             return x
 
-    args_copy = pytree.tree_map(arg_copy_func, args_unflatten)
-    args_flatten, args_spec = pytree.tree_flatten(args_unflatten)
+    args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
+    args_flatten, _ = pytree.tree_flatten(stateless_func_args)
 
-    idx2phname, outname2idx, compiled_stages, gm, node_metas, node_to_stage = compile_stateful_stages(
-        module, traced_graph, args_flatten, args_spec)
+    idx2phname, outname2idx, compiled_stages, gm, node_to_stage = compile_stateful_stages(
+        module, traced_stateless_func, stateless_func_args)
 
     id_rand_input = -1
     for i, arg in enumerate(args_flatten):
@@ -179,7 +180,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     pipe = PipelineStage(
         node_to_stage,
-        node_metas,
+        traced_stateless_func_node_metas,
         gm,
         compiled_stages,
         num_stages=2,
@@ -202,6 +203,8 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     for stage_output in outputs:
         if stage_output is not None:
             print(list(stage_output.keys()))
+    
+    state_dict = pipe.stage.state_dict()
 
     exit()
     seed()
@@ -219,10 +222,10 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     seed()
     with torch.no_grad():
-        out_copy = traced_graph(*args_copy)
+        out_copy = traced_stateless_func(*args_copy)
         args_copy[:3] = out_copy[:3]
         args_copy[3][0] = rand_input1
-        out_copy = traced_graph(*args_copy)
+        out_copy = traced_stateless_func(*args_copy)
 
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 

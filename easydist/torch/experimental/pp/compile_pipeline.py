@@ -505,6 +505,8 @@ class CompiledStageBase(ABC):
     @abstractmethod
     def has_step(self):...
 
+    @abstractmethod
+    def state_dict(self):...
 
 # TODO @botbw: simplify
 def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, strict=True):
@@ -527,22 +529,19 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
 
     def source_name(name):
         if name in inv_params:
-            return "param", inv_params[name]
+            return "params", inv_params[name]
         elif name in inv_buffers:
-            return "buffer", inv_buffers[name]
+            return "buffers", inv_buffers[name]
         elif name in inv_optimstates:
-            return "optimstate", inv_optimstates[name]
+            return "optimstates", inv_optimstates[name]
         else:
             raise RuntimeError(f"unknown name {name}")
 
-    params_names_flatten, _ = pytree.tree_flatten(params_names_unflatten)
-    buffers_names_flatten, _ = pytree.tree_flatten(buffers_names_unflatten)
-    optimstates_nums_flatten, _ = pytree.tree_flatten(optimstates_nums_unflatten)
-
+    # params_names_flatten, _ = pytree.tree_flatten(params_names_unflatten)
+    # buffers_names_flatten, _ = pytree.tree_flatten(buffers_names_unflatten)
+    # optimstates_nums_flatten, _ = pytree.tree_flatten(optimstates_nums_unflatten)
     all_tensor_names_flatten, _ = pytree.tree_flatten(global_ph_names_unflatten[:3])
 
-    node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
-    
     splited_global, part_cnt = split_by(model, traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
 
@@ -713,6 +712,20 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
         def has_step(self):
             return hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')
 
+        def state_dict(self):
+            ret = {
+                "params": {},
+                "buffers": {},
+                # "optimstates": {}
+            }
+            for name, tensor in self.fw_gm.injected_states.items():
+                typ, src_name = source_name(name)
+                ret[typ][src_name] = tensor
+            # for name, tensor in self.step_gm.injected_states.items():
+            #     typ, src_name = source_name(name)
+            #     ret[typ][src_name] = tensor
+            return ret
+
     name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
     states_used_by = defaultdict(list)
 
@@ -731,7 +744,7 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
                     injected_states[arg.name] = name2tensor.pop(arg.name)
                 except KeyError:
                     typ, name = source_name(arg.name)
-                    if typ == 'param' and submod_type == 'step':
+                    if typ == 'params' and submod_type == 'step':
                         pass
                     else:
                         raise RuntimeError(f"{typ}:{name}({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}")
@@ -890,7 +903,7 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
 
     save_graphviz_dot(gm, 'gm')
     out2idx = {name: i for i, name in enumerate(global_outputs_names)}
-    return global_phs_names_flatten, out2idx, compiled_stages, gm, node_metas, node_to_stage
+    return global_phs_names_flatten, out2idx, compiled_stages, gm, node_to_stage
 
 @before_split_register(torch.Tensor)
 def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
