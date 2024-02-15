@@ -1,8 +1,6 @@
-import imp
 import logging
 import operator
-from enum import Enum
-from typing import (Callable, Dict, List, Sequence, Tuple, Any, Union)
+from typing import (Callable, Dict, List, Tuple, Any, Union)
 from abc import ABC, abstractmethod
 from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
@@ -509,18 +507,43 @@ class CompiledStageBase(ABC):
 
 
 # TODO @botbw: simplify
-def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
-    global_phs_spec = [ph.name for ph in traced_gm.graph.nodes if ph.op == 'placeholder']
-    global_outputs_spec = [
-        node.name if node else None for node in list(traced_gm.graph.nodes)[-1].args[0]
+def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, strict=True):
+    stateless_func_args_flatten, stateless_func_args_spec = pytree.tree_flatten(stateless_func_args)
+
+    global_phs_names_flatten = [ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder']
+    global_outputs_names = [
+        node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]
     ]
-    phs_spec_unflatten = pytree.tree_unflatten(global_phs_spec, args_spec)
-    states_spec_flatten, _ = pytree.tree_flatten(
-        phs_spec_unflatten[:3])  # flatten (params, buffers, named_states)
-    inv_params = {arg: param_name for param_name, arg in phs_spec_unflatten[0].items()}
-    node_metas = {node.name: node.meta for node in traced_gm.graph.nodes}
+
+    global_ph_names_unflatten = pytree.tree_unflatten(global_phs_names_flatten, stateless_func_args_spec)
+    params_names_unflatten, buffers_names_unflatten, optimstates_nums_unflatten = \
+        global_ph_names_unflatten[0], global_ph_names_unflatten[1], global_ph_names_unflatten[2]
+    inv_params = {arg: param_name for param_name, arg in params_names_unflatten.items()}
+    inv_buffers = {arg: buffer_name for buffer_name, arg in buffers_names_unflatten.items()}
+    inv_optimstates = {}
+    for param_key, state in optimstates_nums_unflatten.items():
+        for state_type, ph_name in state.items():
+            inv_optimstates[ph_name] = param_key
+
+    def source_name(name):
+        if name in inv_params:
+            return "param", inv_params[name]
+        elif name in inv_buffers:
+            return "buffer", inv_buffers[name]
+        elif name in inv_optimstates:
+            return "optimstate", inv_optimstates[name]
+        else:
+            raise RuntimeError(f"unknown name {name}")
+
+    params_names_flatten, _ = pytree.tree_flatten(params_names_unflatten)
+    buffers_names_flatten, _ = pytree.tree_flatten(buffers_names_unflatten)
+    optimstates_nums_flatten, _ = pytree.tree_flatten(optimstates_nums_unflatten)
+
+    all_tensor_names_flatten, _ = pytree.tree_flatten(global_ph_names_unflatten[:3])
+
+    node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
     
-    splited_global, part_cnt = split_by(model, traced_gm, step_split_point)
+    splited_global, part_cnt = split_by(model, traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
 
     class CompiledStage(CompiledStageBase):
@@ -549,7 +572,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
                 self.fw_gm_outputs_saved_for_bw)  # args for self.backward
 
-            self.global_outputs_spec = global_outputs_spec
+            self.global_outputs_spec = global_outputs_names
 
             self.outputs_to_torch_name = inv_params
 
@@ -558,14 +581,14 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 param_names = set(inv_params[name] for name in params)
                 grad_inputs = list(set(bw_gm.outputs_spec) & set(full_step_gm.inputs_spec))
                 input_optim_states, _ = pytree.tree_flatten([
-                    phs_spec_unflatten[2][param_name] for param_name in param_names
-                    if param_name in phs_spec_unflatten[2]
+                    global_ph_names_unflatten[2][param_name] for param_name in param_names
+                    if param_name in global_ph_names_unflatten[2]
                 ])
                 self.step_gm_args = params + grad_inputs + input_optim_states
                 self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
                 self.step_outputs_spec_to_states_spec = {
                     output: state
-                    for output, state in zip(global_outputs_spec, states_spec_flatten)
+                    for output, state in zip(global_outputs_names, all_tensor_names_flatten)
                 }
                 for updated_state, ori_state in self.step_outputs_spec_to_states_spec.items():
                     if ori_state in self.outputs_to_torch_name:
@@ -608,7 +631,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                     kwargs4gm[arg_name] = kwargs[arg_name]
                 else:
                     kwargs4gm[arg_name] = self.fw_gm.injected_states[arg_name]
-                    if arg_name in global_outputs_spec:  # params need to be returned directly if there is no opt_gm TODO botbw: seperate params and buffers?
+                    if arg_name in global_outputs_names:  # params need to be returned directly if there is no opt_gm TODO botbw: seperate params and buffers?
                         outputs[arg_name] = kwargs4gm[arg_name]
 
                 if arg_name in self.fw_gm_args_saved_for_bw:
@@ -624,7 +647,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 if output_name in self.fw_gm_outputs_saved_for_bw:
                     saved_for_bw[output_name] = output
 
-                if output_name in global_outputs_spec:
+                if output_name in global_outputs_names:
                     outputs[output_name] = output
 
             return ret
@@ -651,7 +674,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
             ret = {}
             for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
-                if output_name in global_outputs_spec:
+                if output_name in global_outputs_names:
                     outputs[output_name] = output
                 else:
                     assert output_name in self.bw_gm.call_module_users, "for bw_gm, output should be neither output or returned"
@@ -679,7 +702,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
             rets = self.step_gm(**kwargs)
 
             for output, ret in zip(self.step_gm.outputs_spec, rets):
-                if output in global_outputs_spec:
+                if output in global_outputs_names:
                     outputs[output] = ret
                 if output in self.step_outputs_spec_to_states_spec:
                     state_name = self.step_outputs_spec_to_states_spec[output]
@@ -690,9 +713,11 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
         def has_step(self):
             return hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')
 
-    name2state = {name: state for name, state in zip(states_spec_flatten, args_flatten)}
+    name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
+    states_used_by = defaultdict(list)
 
-    def gen_stateful_submod(node, submod, is_bw=False):
+    def gen_stateful_submod(node, submod, submod_type='fw'):
+        assert submod_type in ('fw', 'bw', 'step')
         # process input
         inputs_spec = []
         inputs_users = []
@@ -700,10 +725,16 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
         for arg in node.args:
             inputs_spec.append(arg.name)
             inputs_users.append({user.name for user in arg.users})
-            if (not is_bw) and arg.name in states_spec_flatten:  # inject states to the first submod 
-                # assert arg.name in name2state, f"{arg.name} not found in name2state or has been injected"
-                if arg.name in name2state: # TODO @botbw: seperate params, buffers, and named_states in order to know whether there is params sharing
-                    injected_states[arg.name] = name2state.pop(arg.name)
+            states_used_by[arg.name].append(node.name)
+            if submod_type != 'bw' and arg.name in all_tensor_names_flatten:  # inject states to the first submod (might be fw_gm or step_gm but not bw_gm)
+                try:
+                    injected_states[arg.name] = name2tensor.pop(arg.name)
+                except KeyError:
+                    typ, name = source_name(arg.name)
+                    if typ == 'param' and submod_type == 'step':
+                        pass
+                    else:
+                        raise RuntimeError(f"{typ}:{name}({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}")
 
         # process output
         outputs_spec = []
@@ -725,7 +756,6 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 if user.op == 'call_module':
                     call_module_users[node.name].add(user.name)
 
-        # TODO @botbw: move this to meta
         assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
                     or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
                     or hasattr(submod, 'name'))
@@ -755,7 +785,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                             n.kwargs) == 0, "splited_model should have no kwargs"
                         idx = int(n.target[7:])
                         submod = getattr(splited_fw_bw_gm, n.target)
-                        stateful_fw_bw.append(gen_stateful_submod(n, submod, is_bw = idx >= part_cnt // 2))
+                        stateful_fw_bw.append(gen_stateful_submod(n, submod, 'fw' if idx < part_cnt // 2 else 'bw'))
 
                 assert len(stateful_fw_bw) % 2 == 0, "each fw_gm should have a corresponding bw_gm"
                 num_stage = len(stateful_fw_bw) // 2
@@ -763,7 +793,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
                 current_stateful_fw_bw = stateful_fw_bw
             else:  # optimizer gm
-                step_gm_global = gen_stateful_submod(node, submod_global)
+                step_gm_global = gen_stateful_submod(node, submod_global, 'step')
 
                 assert current_stateful_fw_bw is not None, "There should be a stateful_bw_fw before optimizer step"
                 num_stage = len(current_stateful_fw_bw) // 2
@@ -777,7 +807,15 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                 ) == 0, "All states of step_gm_global should have been injected to step_gm"
                 current_stateful_fw_bw = None
 
-    assert len(name2state) == 0, "All states should have been injected"
+    if not len(name2tensor) == 0:
+        debugging_info = ""
+        for name in name2tensor:
+            typ, src_name = source_name(name)
+            debugging_info += f"{name}({typ}:{src_name}) "
+        if strict:
+            raise RuntimeError(f"All states should have been injected, but found {debugging_info}")
+        else:
+            logging.warning(f"All states should have been injected, but found {debugging_info}")
 
     if current_stateful_fw_bw is not None:  # forward and backward followed by no step
         num_stage = len(current_stateful_fw_bw) // 2
@@ -794,7 +832,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
 
     for node in splited_fw_bw_gm.graph.nodes:
         if node.op == 'placeholder':
-            if node.name not in states_spec_flatten and len(node.users) > 0:
+            if node.name not in all_tensor_names_flatten and len(node.users) > 0:
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
             if submod_idx < num_stage:  # forward
@@ -828,7 +866,7 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
                             for arg_name in stage.bw_func_args})
                 node_to_stage[node_name] = stage_idx
                 for output in stage.bw_gm.outputs_spec:
-                    if not output in global_outputs_spec:
+                    if not output in global_outputs_names:
                         env[output] = g.create_node(
                             name=output,
                             op='call_function',
@@ -850,8 +888,8 @@ def compile_stateful_stages(model, traced_gm, args_flatten, args_spec):
     gm = fx.GraphModule({}, g)
 
     save_graphviz_dot(gm, 'gm')
-    out2idx = {name: i for i, name in enumerate(global_outputs_spec)}
-    return global_phs_spec, out2idx, compiled_stages, gm, node_metas, node_to_stage
+    out2idx = {name: i for i, name in enumerate(global_outputs_names)}
+    return global_phs_names_flatten, out2idx, compiled_stages, gm, node_metas, node_to_stage
 
 @before_split_register(torch.Tensor)
 def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:

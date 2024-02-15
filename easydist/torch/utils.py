@@ -182,10 +182,12 @@ def _enable_compile():
 
     orig_is_compiling_code = torch._utils.is_compiling.__code__
     torch._utils.is_compiling.__code__ = f_true.__code__
+    torch._dynamo.is_compiling.__code__ = f_true.__code__
     try:
         yield
     finally:
         torch._utils.is_compiling.__code__ = orig_is_compiling_code
+        torch._dynamo.is_compiling.__code__ = orig_is_compiling_code
 
 
 def get_input_signature(*args, **kwargs):
