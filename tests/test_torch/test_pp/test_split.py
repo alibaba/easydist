@@ -92,8 +92,12 @@ def train_step(input, label, model, opt):
 def train_step_gpt(input, label, model, opt):
     if opt is not None:
         opt.zero_grad()
-    out = model(input).last_hidden_state
-    loss = (out - torch.ones_like(out) * label).pow(2).mean()
+    out = model(input)
+    loss = 0
+    for key in ['attentions', 'cross_attentions', 'hidden_states', 'last_hidden_state', 'past_key_values', 'last_hidden_state', 'pooler_output', 'past_key_values']:
+        if hasattr(out, key) and (attr := getattr(out, key)) is not None:
+            assert isinstance(attr, torch.Tensor)
+            loss += (attr - torch.ones_like(attr) * label).pow(2).mean()
     loss.backward()
     if opt is not None:
         opt.step()
@@ -299,11 +303,6 @@ if __name__ == '__main__':
             'encoder.layers.encoder_layer_5.mlp.3',
             'encoder.layers.encoder_layer_9.ln_2',
         }, gen_rand_input_imagenet, train_step)
-    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-    #     'h.3',
-    #     'h.6',
-    #     'h.9',
-    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
     test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
     test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
@@ -314,13 +313,21 @@ if __name__ == '__main__':
     test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
     test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
     test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    
+    # ======== nlp models, might take long time and OOM ========
+    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+    #     'h.3',
+    #     'h.6',
+    #     'h.9',
+    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
-    # # ======== not working ========
     # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
     #     'encoder.layer.3',
     #     'encoder.layer.6',
     #     'encoder.layer.9',
     # }, factory_gen_rand_input_ids(30522), train_step_gpt)  # None in output?
+
+    # # ======== not working ========
 
     # test_main(LlamaModel(LlamaConfig()), {
     #     'layers.8',
