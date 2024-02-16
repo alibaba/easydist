@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 sharding_sol = None
 sol_rdy_cond = threading.Condition()
 
+mem_sol = None
+mem_addr_rdy_cond = threading.Condition()
+
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     fx_module = fix_meta_device(fx_module)
@@ -176,12 +179,17 @@ def dtensor_to_tensor(leaf):
         return replicate_leaf.to_local()
     return leaf
 
-
 def fetch_strategy():
     with sol_rdy_cond:
         sol_rdy_cond.wait()
 
     return sharding_sol
+
+def fetch_mem_sol():
+    with mem_addr_rdy_cond:
+        mem_addr_rdy_cond.wait()
+
+    return mem_sol
 
 
 def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
@@ -417,6 +425,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
     if mdconfig.enable_memory_opt:
+        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
         if rank == 0:
             logging.info("profiling fx module's memory...")
 
@@ -450,6 +459,21 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             required_memory, schedules, ordered_schedules, mem_locations = \
                                                 mem_sched.gen_mem_addresses()
+            #print(f"master proposes required_memory: {required_memory}")
+            #print(f"master creates mem locations:\n{mem_locations}")
+
+            with mem_addr_rdy_cond:
+                global mem_sol
+                mem_sol = [
+                    required_memory, mem_locations
+                ]
+                mem_addr_rdy_cond.notify_all()
+        else:
+            required_memory, mem_locations = rpc.rpc_sync(
+                "ed_worker0", fetch_mem_sol, args=(), timeout=0)
+            #print(f"worker {rank} receives required_memory: {required_memory}")
+            #print(f"worker {rank} receives mem locations:\n{mem_locations}")
+        rpc.shutdown()
 
     class EDCompiledFunc:
 

@@ -140,15 +140,15 @@ class ModuleProfilingInfo:
                 if not is_allocated:
                     for in_info in node_profiling_info.input_tensor_info:
                         if out_addr_size[0] >= in_info.addr and out_addr_size[0] < in_info.addr + in_info.size:
-                            input_size = in_info.size
+                            output_size = out_addr_size[1]
                             arg_index = in_info.arg_idx
                             tensor_index = in_info.tensor_idx
                             node_mem_info.add_out_var(
-                                              out_idx, input_size, True,
+                                              out_idx, output_size, True,
                                               arg_index=arg_index,
                                               tensor_index=tensor_index,
                                               offset=out_addr_size[0]-in_info.addr)
-                            if input_size==0:
+                            if output_size==0:
                                 logger.info(f"The referenced buffer size of tensor {node_name}:{out_idx} is zero")
 
                             break;

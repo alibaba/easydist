@@ -125,11 +125,11 @@ class EfficientMemoryScheduler(MemoryScheduler):
             group_addresses[fixed_ten_group] = (min_max_addr, scaled_size)
             tensor_groups.remove(fixed_ten_group)
 
-        mem_locations = defaultdict(lambda: [])
+        mem_locations = {}
         for node in self.nodes_to_schedule:
             out_vars = self.graph_mem_info.get_out_vars(node)
             mem_addrs = [None]*len(out_vars)
-            mem_locations[node] = mem_addrs
+            mem_locations[node.name] = mem_addrs
 
         max_end_addr = 0
 
@@ -140,7 +140,7 @@ class EfficientMemoryScheduler(MemoryScheduler):
             for tensor in group.tensors:
                 node = tensor[0]
                 out_idx = tensor[1]
-                mem_addrs = mem_locations[node]
+                mem_addrs = mem_locations[node.name]
                 mem_addrs[out_idx] = (addr_size[0]*self.gcd, addr_size[1]*self.gcd)
 
         required_memory = max_end_addr*self.gcd
@@ -151,7 +151,7 @@ class EfficientMemoryScheduler(MemoryScheduler):
         if mdconfig.dump_mem_usage_graph:
             # dump memory addresses
             graph_mem_addr_str = "graph memory addresses:\n"
-            for node,mem_addrs in mem_locations.items():
+            for node_name, mem_addrs in mem_locations.items():
                 node_mem_str = node.name + ": "
                 for mem_addr_size in mem_addrs:
                     node_mem_str += "([" + str(mem_addr_size[0]) + "~" + \
@@ -163,10 +163,15 @@ class EfficientMemoryScheduler(MemoryScheduler):
             logger.info(graph_mem_addr_str)
 
             # dump memory usage in graph
+            node_map = {}
+            for node in self.nodes_to_schedule:
+                node_map[node.name] = node
+
             _, ax = plt.subplots()
             ax.axis([0,num_steps,0,required_memory])
             dumped_group = set()
-            for node,mem_addrs in mem_locations.items():
+            for node_name, mem_addrs in mem_locations.items():
+                node = node_map[node_name]
                 for out_idx,mem_addr_size in enumerate(mem_addrs):
                     group = lifetime_info.get_group(node, out_idx)
                     if group in dumped_group:

@@ -554,7 +554,7 @@ class ILPMemoryScheduler(MemoryScheduler):
                 ordered_schedules.append(nd)
         assert len(ordered_schedules) == len(self.nodes_to_schedule)
 
-        mem_locations = defaultdict(lambda: [])
+        mem_locations = {}
         for node,addrs in addresses.items():
             mem_addrs = []
             out_vars = self.graph_mem_info.get_out_vars(node)
@@ -572,7 +572,7 @@ class ILPMemoryScheduler(MemoryScheduler):
                 logger.info(f"{node}:{out_vars[idx].out_index}: addr: {addr.x}-{addr.x-1+(mem_size+self.gcd-1)//self.gcd}, orig size: {mem_size}")
                 mem_addr = int(addr.x + 0.5)*self.gcd
                 mem_addrs.append((mem_addr, mem_size))
-            mem_locations[node] = mem_addrs
+            mem_locations[node.name] = mem_addrs
 
         required_memory = int(peak_mem_usage.x + 0.5)*self.gcd
 
@@ -581,8 +581,8 @@ class ILPMemoryScheduler(MemoryScheduler):
 
         # dump memory addresses
         graph_mem_addr_str = "graph memory addresses:\n"
-        for node,mem_addrs in mem_locations.items():
-            node_mem_str = node.name + ": "
+        for node_name, mem_addrs in mem_locations.items():
+            node_mem_str = node_name + ": "
             for mem_addr_size in mem_addrs:
                 node_mem_str += "([" + str(mem_addr_size[0]) + "~" + \
                                 str(mem_addr_size[0]+mem_addr_size[1]-1) + "], " + \
