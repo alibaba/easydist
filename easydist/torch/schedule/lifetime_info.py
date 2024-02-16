@@ -186,6 +186,7 @@ class LifetimeInfo:
         for node in self.nodes_to_schedule:
             out_vars = graph_mem_info.get_out_vars(node)
             for out_var in out_vars:
+                #print(f"node: {node}, var: {out_var}")
                 out_tensor_key = (node, out_var.out_index)
                 if out_var.is_reference:
                     arg_idx = out_var.arg_index
@@ -213,10 +214,11 @@ class LifetimeInfo:
                 continue
 
             visited_group_set.add(id(tensor_group))
-            assert tensor_group.core_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
 
             # debug: dump memory-shared tensor group
             #print(str(tensor_group))
+
+            assert tensor_group.core_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
 
     def get_group(self, node: torch.fx.Node, out_idx: int):
         assert (node, out_idx) in self.mem_share_info

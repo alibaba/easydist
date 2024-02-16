@@ -22,7 +22,8 @@ class OutVar:
         is_reference,
         alloc_index,
         arg_index,
-        tensor_index
+        tensor_index,
+        offset
     ):
         self.out_index = out_index
         self.mem_size = mem_size
@@ -38,6 +39,7 @@ class OutVar:
         # reference info:
         self.arg_index = arg_index
         self.tensor_index = tensor_index
+        self.offset = offset
 
     def size(self) -> int:
         return self.mem_size
@@ -48,7 +50,8 @@ class OutVar:
             mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", arg idx: " + \
                            str(self.arg_index) + ", tensor idx: " + \
-                           str(self.tensor_index)
+                           str(self.tensor_index) + ", offset: " + \
+                           str(self.offset)
         else:
             mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", alloc idx: " + \
@@ -60,9 +63,9 @@ class NodeMemInfo:
         self.out_vars = []  # list of OutVar
 
     def add_out_var(self, out_index, mem_size, is_reference, alloc_index=-1,
-                    arg_index=-1, tensor_index=-1):
+                    arg_index=-1, tensor_index=-1, offset=0):
         out_var = OutVar(out_index, mem_size, is_reference, alloc_index,
-                         arg_index, tensor_index)
+                         arg_index, tensor_index, offset)
         self.out_vars.append(out_var)
 
     def get_out_var(self, out_idx):

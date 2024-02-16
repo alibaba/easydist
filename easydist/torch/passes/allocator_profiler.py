@@ -31,85 +31,77 @@ from easydist.torch.mem_allocation_info import GraphMemInfo
 __all__ = ['AllocatorProfiler']
 logger = logging.getLogger(__name__)
 
+class InputTensorInfo:
+    def __init__(self, addr: int, size: int, arg_idx: int, tensor_idx: int):
+        self.addr = addr
+        self.size = size
+        self.arg_idx = arg_idx
+        self.tensor_idx = tensor_idx
+
+    def __str__(self) -> str:
+        return_str = "(addr: " + str(self.addr) + ", size: " + str(self.size)
+        return_str += ", arg_idx: " + str(self.arg_idx) + ", tensor_idx: "
+        return_str += str(self.tensor_idx) + ")"
+
+        return return_str
+
+    def __repr__(self) -> str:
+        return_str = "(addr: " + str(self.addr) + ", size: " + str(self.size)
+        return_str += ", arg_idx: " + str(self.arg_idx) + ", tensor_idx: "
+        return_str += str(self.tensor_idx) + ")"
+
+        return return_str
+
 class NodeProfilingInfo:
     def __init__(self, name) -> None:
         self.name = name
         self.qualified_name: str = ""
 
         # input info
-        self.input_address: List[int] = []
-        self.input_size: List[int] = []
-        self.input_arg_index: List[int] = []
-        self.input_tensor_index: List[int] = []
+        self.input_tensor_info: List[InputTensorInfo] = []
 
         # output info
-        self.output_address: List[int] = []
-        self.output_size: List[int] = []
+        self.output_addr_size: List[(int,int)] = []
 
         # allocator info
-        self.allocator_address: List[int] = []
-        self.allocator_size: List[int] = []
+        self.alloc_addr_size: List[(int,int)] = []
 
     def set_qualified_name(self, qualified_name: str) -> None:
         self.qualified_name = qualified_name
 
-    def add_input_address(self, input_address: int) -> None:
-        self.input_address.append(input_address)
+    def record_input_tensor_info(self, input_tensor: torch.Tensor, arg_index: int,
+                              tensor_index: int) -> None:
+        in_ten_info = InputTensorInfo(
+                            input_tensor.data_ptr(),
+                            input_tensor.element_size() * input_tensor.numel(),
+                            arg_index,
+                            tensor_index)
+        self.input_tensor_info.append(in_ten_info)
 
-    def add_input_size(self, input_size: int) -> None:
-        self.input_size.append(input_size)
+    def record_output_info(self, output_tensor: torch.Tensor) -> None:
+        self.output_addr_size.append(
+                        (output_tensor.data_ptr(),
+                        output_tensor.element_size() * output_tensor.numel()))
 
-    def add_input_arg_index(self, arg_index: int) -> None:
-        self.input_arg_index.append(arg_index)
-
-    def add_input_tensor_index(self, tensor_index: int) -> None:
-        self.input_tensor_index.append(tensor_index)
-
-    def add_input_info(self, input_tensor: torch.Tensor, arg_index: int, tensor_index: int) -> None:
-        self.add_input_address(input_tensor.data_ptr())
-        self.add_input_size(input_tensor.element_size() * input_tensor.numel())
-        self.add_input_arg_index(arg_index)
-        self.add_input_tensor_index(tensor_index)
-
-    def add_output_address(self, output_address: int) -> None:
-        self.output_address.append(output_address)
-
-    def add_output_size(self, output_size: int) -> None:
-        self.output_size.append(output_size)
-
-    def add_output_info(self, output_tensor: torch.Tensor) -> None:
-        self.add_output_address(output_tensor.data_ptr())
-        self.add_output_size(output_tensor.element_size() * output_tensor.numel())
-
-    def add_allocator_address(self, allocator_address: int) -> None:
-        self.allocator_address.append(allocator_address)
-
-    def add_allocator_size(self, allocator_size: int) -> None:
-        self.allocator_size.append(allocator_size)
-
-    def add_allocator_info(self, allocator_info: List[Any]) -> None:
+    def record_alloc_info(self, allocator_info: List[Any]) -> None:
         address, size, *_ = allocator_info
-        self.add_allocator_address(address)
-        self.add_allocator_size(size)
+        self.alloc_addr_size.append((address,size))
 
     def __str__(self) -> str:
         return_str = self.name + "\n"
         return_str += "qualified_name: " + self.qualified_name + "\n"
-        return_str += "input_address: " + ",".join([str(addr) for addr in self.input_address]) + "\n"
-        return_str += "input_size: " + ','.join([str(size) for size in self.input_size]) + "\n"
-        return_str += "output_address: " + ",".join([str(addr) for addr in self.output_address]) + "\n"
-        return_str += "output_size: " + ','.join([str(size) for size in self.output_size]) + "\n"
-        return_str += "allocator_address: " + ",".join([str(addr) for addr in self.allocator_address]) + "\n"
-        return_str += "allocator_size: " + ','.join([str(size) for size in self.allocator_size]) + "\n"
+        return_str += "input_info: " + str(self.input_tensor_info) + "\n"
+        return_str += "output_addr_size: " + str(self.output_addr_size) + "\n"
+        return_str += "alloc_addr_size: " + str(self.alloc_addr_size) + "\n"
 
         return return_str
 
     def __repr__(self) -> str:
         return f'NodeProfilingInfo(name={repr(self.name)}, ' + \
             f'qualified_name={repr(self.qualified_name)}, ' \
-            f'input_address={repr(self.input_address)}, ' + \
-            f'output_address={repr(self.output_address)}, ' + \
-            f'allocator_address={repr(self.allocator_address)})'
+            f'input_info={repr(self.input_tensor_info)}, ' + \
+            f'output_addr_size={repr(self.output_addr_size)}, ' + \
+            f'alloc_addr_size={repr(self.alloc_addr_size)})'
 
 class ModuleProfilingInfo:
     def __init__(self) -> None:
@@ -124,18 +116,20 @@ class ModuleProfilingInfo:
     def create_graph_mem_info(self) -> GraphMemInfo:
         graph_mem_info = GraphMemInfo()
 
+        #str_info = ""
         for node_name in self.node_names:
-            #print(f"record memory info in graph mem info for node {node_name}")
+            #str_info += f"record memory info in graph mem info for node {node_name}\n"
             node_mem_info = graph_mem_info.get_node_mem_info(node_name)
             node_profiling_info = self.get_node_profiling_info(node_name)
 
-            for out_idx, out_addr in enumerate(node_profiling_info.output_address):
+            #str_info += str(node_profiling_info) + "\n"
+            for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
                 is_allocated = False
-                for alloc_idx, alloc_addr in enumerate(node_profiling_info.allocator_address):
-                    if out_addr == alloc_addr:
-                        alloc_size = node_profiling_info.allocator_size[alloc_idx]
+                for alloc_idx, addr_size in enumerate(node_profiling_info.alloc_addr_size):
+                    if out_addr_size[0] == addr_size[0]:
+                        alloc_size = addr_size[1]
                         node_mem_info.add_out_var(
-                                          out_idx, alloc_size, False, \
+                                          out_idx, alloc_size, False,
                                           alloc_index=alloc_idx)
                         if alloc_size==0:
                             logger.info(f"The allocated buffer size of tensor {node_name}:{out_idx} is zero")
@@ -144,20 +138,22 @@ class ModuleProfilingInfo:
                         break;
 
                 if not is_allocated:
-                    for in_idx, in_addr in enumerate(node_profiling_info.input_address):
-                        if out_addr == in_addr:
-                            input_size = node_profiling_info.input_size[in_idx]
-                            arg_index = node_profiling_info.input_arg_index[in_idx]
-                            tensor_index = node_profiling_info.input_tensor_index[in_idx]
+                    for in_info in node_profiling_info.input_tensor_info:
+                        if out_addr_size[0] >= in_info.addr and out_addr_size[0] < in_info.addr + in_info.size:
+                            input_size = in_info.size
+                            arg_index = in_info.arg_idx
+                            tensor_index = in_info.tensor_idx
                             node_mem_info.add_out_var(
-                                              out_idx, input_size, True, \
-                                              arg_index=arg_index, \
-                                              tensor_index=tensor_index)
+                                              out_idx, input_size, True,
+                                              arg_index=arg_index,
+                                              tensor_index=tensor_index,
+                                              offset=out_addr_size[0]-in_info.addr)
                             if input_size==0:
                                 logger.info(f"The referenced buffer size of tensor {node_name}:{out_idx} is zero")
 
                             break;
 
+        #print(str_info)
         return graph_mem_info
 
     def set_node_profiling_info(self, node_name: str, node_info: NodeProfilingInfo):
@@ -239,7 +235,9 @@ class AllocatorProfiler(Interpreter):
                 tensor_index = 0
                 for flat_input in pytree.tree_flatten(materialized_input)[0]:
                     if isinstance(flat_input, torch.Tensor):
-                        node_profiling_info.add_input_info(flat_input, arg_index, tensor_index)
+                        node_profiling_info.record_input_tensor_info(flat_input,
+                                                                  arg_index,
+                                                                  tensor_index)
                         tensor_index += 1
                     elif type(flat_input) in constant_types:
                         continue
@@ -264,7 +262,7 @@ class AllocatorProfiler(Interpreter):
             # record output addresses
             for flat_output in flat_outputs:
                 if isinstance(flat_output, torch.Tensor):
-                    node_profiling_info.add_output_info(flat_output)
+                    node_profiling_info.record_output_info(flat_output)
                 elif flat_output is None:
                     continue
                 else:
@@ -281,7 +279,7 @@ class AllocatorProfiler(Interpreter):
         for allocator_info in __main__.allocator_profiling_info:
             node_name, *info = allocator_info
             node_info = self.profiling_info.get_node_profiling_info(node_name)
-            node_info.add_allocator_info(info)
+            node_info.record_alloc_info(info)
 
         graph_mem_info = self.profiling_info.create_graph_mem_info()
 
