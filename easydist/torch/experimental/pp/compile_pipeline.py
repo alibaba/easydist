@@ -506,6 +506,15 @@ class CompiledStageBase(ABC):
     def has_step(self):...
 
     @abstractmethod
+    def named_parameters(self):...
+
+    @abstractmethod
+    def named_buffers(self):...
+
+    @abstractmethod
+    def optimizer_state_dict(self):...
+
+    @abstractmethod
     def state_dict(self):...
 
 # TODO @botbw: simplify
@@ -523,9 +532,11 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
     inv_params = {arg: param_name for param_name, arg in params_names_unflatten.items()}
     inv_buffers = {arg: buffer_name for buffer_name, arg in buffers_names_unflatten.items()}
     inv_optimstates = {}
+    ph_name_to_optimstates_type = {}
     for param_key, state in optimstates_nums_unflatten.items():
-        for state_type, ph_name in state.items():
+        for typ, ph_name in state.items():
             inv_optimstates[ph_name] = param_key
+            ph_name_to_optimstates_type[ph_name] = typ
 
     def source_name(name):
         if name in inv_params:
@@ -537,9 +548,6 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
         else:
             raise RuntimeError(f"unknown name {name}")
 
-    # params_names_flatten, _ = pytree.tree_flatten(params_names_unflatten)
-    # buffers_names_flatten, _ = pytree.tree_flatten(buffers_names_unflatten)
-    # optimstates_nums_flatten, _ = pytree.tree_flatten(optimstates_nums_unflatten)
     all_tensor_names_flatten, _ = pytree.tree_flatten(global_ph_names_unflatten[:3])
 
     splited_global, part_cnt = split_by(model, traced_stateless_func, step_split_point)
@@ -713,18 +721,35 @@ def compile_stateful_stages(model, traced_stateless_func, stateless_func_args, s
             return hasattr(self, 'step_gm_args') and hasattr(self, 'step_gm')
 
         def state_dict(self):
-            ret = {
-                "params": {},
-                "buffers": {},
-                # "optimstates": {}
-            }
+            state_dict = {}
+            state_dict.update(self.named_parameters())
+            state_dict.update(self.named_buffers())
+            return state_dict
+
+        def named_parameters(self):
+            named_params = {}
             for name, tensor in self.fw_gm.injected_states.items():
                 typ, src_name = source_name(name)
-                ret[typ][src_name] = tensor
-            # for name, tensor in self.step_gm.injected_states.items():
-            #     typ, src_name = source_name(name)
-            #     ret[typ][src_name] = tensor
-            return ret
+                if typ == 'params':
+                    named_params[src_name] = tensor
+            return named_params
+
+        def named_buffers(self):
+            named_buffers = {}
+            for name, tensor in self.fw_gm.injected_states.items():
+                typ, src_name = source_name(name)
+                if typ == 'buffers':
+                    named_buffers[src_name] = tensor
+            return named_buffers
+
+        def optimizer_state_dict(self):
+            optim_state = defaultdict(dict)
+            for name, tensor in self.fw_gm.injected_states.items():
+                typ, src_name = source_name(name)
+                if typ == 'optimstates':
+                    state_type = ph_name_to_optimstates_type[name]
+                    optim_state[state_type][src_name] = tensor
+            return dict(optim_state)
 
     name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
     states_used_by = defaultdict(list)

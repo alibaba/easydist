@@ -205,6 +205,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             print(list(stage_output.keys()))
     
     state_dict = pipe.stage.state_dict()
+    optim_state = pipe.stage.optimizer_state_dict()
 
     exit()
     seed()
