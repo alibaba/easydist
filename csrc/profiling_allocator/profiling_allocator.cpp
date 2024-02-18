@@ -17,6 +17,7 @@ PyObject *main_module = nullptr;
 PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
 
+void* reserved_space_for_memory_plan = nullptr;
 std::unordered_set<void*> profiling_ptrs;
 std::unordered_set<void*> assigned_ptrs;
 bool memory_plan_initialized = false;
@@ -245,6 +246,11 @@ void init_memory_plan(int device) {
    memory_plan_initialized = true;
 }
 
+void init_reserved_space() {
+   ssize_t size = PyLong_AsUnsignedLong(PyDict_GetItemString(global_dict, "reserved_memory_size"));
+   cudaMalloc(&reserved_space_for_memory_plan, size);
+}
+
 void init_allocator(int device_count) {
    // initialize Python interpreter
    Py_Initialize();
@@ -376,6 +382,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
    } else if (allocator_mode_string == "runtime") {
       runtime_shortcut = true;
       init_memory_plan(device);
+      init_reserved_space();
       return runtime_malloc(size, device, stream);
    } else {
       std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;

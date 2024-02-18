@@ -294,3 +294,4 @@ class AllocatorProfiler(Interpreter):
         __main__.memory_plan = memory_plan
         graph_execution_order = ['bar', 'foo']
         __main__.graph_execution_order = graph_execution_order
+        __main__.reserved_memory_size = 1024 * 1024
