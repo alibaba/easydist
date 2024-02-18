@@ -104,7 +104,8 @@ class NodeProfilingInfo:
             f'alloc_addr_size={repr(self.alloc_addr_size)})'
 
 class ModuleProfilingInfo:
-    def __init__(self) -> None:
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
         self.node_profiling_info: Dict[str, NodeProfilingInfo] = dict()
         self._local_indexes: Dict[str, int] = None
         self._inplace_mapping: Dict[str, Tuple[int, int]] = None
@@ -121,11 +122,14 @@ class ModuleProfilingInfo:
             #str_info += f"record memory info in graph mem info for node {node_name}\n"
             node_mem_info = graph_mem_info.get_node_mem_info(node_name)
             node_profiling_info = self.get_node_profiling_info(node_name)
+            node_mem_info.alloc_num = len(node_profiling_info.alloc_addr_size)
+            #print(f"rank {self.rank}: {node_name}: node_profiling_info alloc_addr_size: {node_profiling_info.alloc_addr_size}")
 
             #str_info += str(node_profiling_info) + "\n"
-            for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
-                is_allocated = False
-                for alloc_idx, addr_size in enumerate(node_profiling_info.alloc_addr_size):
+            alloced_out_idx_set = set()
+            for alloc_idx, addr_size in enumerate(node_profiling_info.alloc_addr_size):
+                alloc_for_out = False
+                for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
                     if out_addr_size[0] == addr_size[0]:
                         alloc_size = addr_size[1]
                         node_mem_info.add_out_var(
@@ -134,10 +138,19 @@ class ModuleProfilingInfo:
                         if alloc_size==0:
                             logger.info(f"The allocated buffer size of tensor {node_name}:{out_idx} is zero")
 
-                        is_allocated = True
+                        alloced_out_idx_set.add(out_idx)
+                        alloc_for_out = True
                         break;
 
-                if not is_allocated:
+                if not alloc_for_out:
+                    alloc_size = addr_size[1]
+                    node_mem_info.add_temp_var(alloc_size, alloc_idx)
+                    if alloc_size==0:
+                        logger.info(f"The allocated temp buffer size of tensor {node_name} is zero")
+
+            for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
+                if out_idx not in alloced_out_idx_set:
+                    is_ref = False
                     for in_info in node_profiling_info.input_tensor_info:
                         if out_addr_size[0] >= in_info.addr and out_addr_size[0] < in_info.addr + in_info.size:
                             output_size = out_addr_size[1]
@@ -151,7 +164,10 @@ class ModuleProfilingInfo:
                             if output_size==0:
                                 logger.info(f"The referenced buffer size of tensor {node_name}:{out_idx} is zero")
 
+                            is_ref = True
                             break;
+
+                    assert is_ref, f"rank {self.rank}, {node_name}:{out_idx} is neither allocated nor a reference"
 
         #print(str_info)
         return graph_mem_info

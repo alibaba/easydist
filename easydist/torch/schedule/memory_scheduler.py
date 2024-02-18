@@ -69,9 +69,9 @@ class MemoryScheduler:
                     pre_scheded_nodes[node] = step
                     step += 1
 
-        required_memory, schedules, ordered_schedules, mem_locations = \
+        required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations = \
                                       self.create_min_mem_plan(
                                           pre_scheded_nodes=pre_scheded_nodes)
 
-        return (required_memory, schedules, ordered_schedules, mem_locations)
+        return (required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations)
 

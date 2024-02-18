@@ -48,6 +48,7 @@ from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
 from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
+from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -434,21 +435,17 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         __main__.allocator_mode = 'profile'
 
         # save all profiling information in this dict
-        profiling_info = ModuleProfilingInfo()
+        profiling_info = ModuleProfilingInfo(rank)
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
         _ = alloc_profiler.run([])
-        graph_mem_info = alloc_profiler.create_graph_mem_info()
 
         # print profiling results on rank 0
         #if rank == 0:
         #    print(graph_mem_info)
 
-        # setting allocator back to runtime mode
-        alloc_profiler.load_memory_plan()
-        __main__.allocator_mode = 'runtime'
-
         if rank == 0:
             logging.info("finish profiling fx module's memory")
+            graph_mem_info = alloc_profiler.create_graph_mem_info()
 
             if mdconfig.mem_opt_by_solver:
                 mem_sched = ILPMemoryScheduler(
@@ -457,7 +454,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
                 mem_sched = EfficientMemoryScheduler(
                                     sharded_graph, graph_mem_info)
 
-            required_memory, schedules, ordered_schedules, mem_locations = \
+            required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations = \
                                                 mem_sched.gen_mem_addresses()
             #print(f"master proposes required_memory: {required_memory}")
             #print(f"master creates mem locations:\n{mem_locations}")
@@ -465,15 +462,42 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
             with mem_addr_rdy_cond:
                 global mem_sol
                 mem_sol = [
-                    required_memory, mem_locations
+                    required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations
                 ]
                 mem_addr_rdy_cond.notify_all()
+
+            assert len(ordered_schedules) == len(mem_sched.nodes_to_schedule), \
+                f"schedule {len(ordered_schedules)} nodes, but totally {len(mem_sched.nodes_to_schedule)} nodes"
         else:
-            required_memory, mem_locations = rpc.rpc_sync(
-                "ed_worker0", fetch_mem_sol, args=(), timeout=0)
+            required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations = rpc.rpc_sync(
+                                "ed_worker0", fetch_mem_sol, args=(), timeout=0)
             #print(f"worker {rank} receives required_memory: {required_memory}")
             #print(f"worker {rank} receives mem locations:\n{mem_locations}")
+
         rpc.shutdown()
+
+        graph_mem_plan = GraphMemPlan(required_memory, temp_memory)
+
+        for name in ordered_schedules:
+            if name in mem_alloc_info:
+                alloc_list = mem_alloc_info[name]
+                for alloc_info in alloc_list:
+                    addr = alloc_info[1]
+                    size = alloc_info[2]
+                    if alloc_info[3] == 0:
+                        is_temp_mem = True
+                    else:
+                        is_temp_mem = False
+
+                    graph_mem_plan.append_addr_size(addr, size, is_temp_mem, name)
+
+        #print("graph memory plan:")
+        #print(str(graph_mem_plan))
+
+
+        # setting allocator back to runtime mode
+        alloc_profiler.load_memory_plan()
+        __main__.allocator_mode = 'runtime'
 
     class EDCompiledFunc:
 

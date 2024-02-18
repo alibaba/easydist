@@ -126,10 +126,24 @@ class EfficientMemoryScheduler(MemoryScheduler):
             tensor_groups.remove(fixed_ten_group)
 
         mem_locations = {}
+        mem_alloc_info = {}
+
+        max_temp_size = 0
         for node in self.nodes_to_schedule:
             out_vars = self.graph_mem_info.get_out_vars(node)
             mem_addrs = [None]*len(out_vars)
             mem_locations[node.name] = mem_addrs
+
+            temp_vars = self.graph_mem_info.get_temp_vars(node)
+            node_temp_addr = 0
+            for temp_var in temp_vars:
+                if node.name not in mem_alloc_info:
+                    mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
+                else:
+                    mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
+                node_temp_addr += temp_var.mem_size
+            if node_temp_addr > max_temp_size:
+                max_temp_size = node_temp_addr
 
         max_end_addr = 0
 
@@ -137,13 +151,29 @@ class EfficientMemoryScheduler(MemoryScheduler):
             if max_end_addr < addr_size[0]+addr_size[1]:
                 max_end_addr = addr_size[0]+addr_size[1]
 
+            group_addr = addr_size[0]*self.gcd
+            group_end = group_addr + addr_size[1]*self.gcd
             for tensor in group.tensors:
                 node = tensor[0]
                 out_idx = tensor[1]
+                out_var = self.graph_mem_info.get_out_var(node, out_idx)
+                addr = group_addr + out_var.offset
                 mem_addrs = mem_locations[node.name]
-                mem_addrs[out_idx] = (addr_size[0]*self.gcd, addr_size[1]*self.gcd)
+                mem_addrs[out_idx] = (addr, out_var.mem_size)
+                if not out_var.is_reference:
+                    if node.name not in mem_alloc_info:
+                        mem_alloc_info[node.name] = [(out_var.alloc_index, addr, out_var.mem_size, 1)]
+                    else:
+                        mem_alloc_info[node.name].append((out_var.alloc_index, addr, out_var.mem_size, 1))
+
+                assert addr + out_var.mem_size <= group_end
 
         required_memory = max_end_addr*self.gcd
+
+        for nd_name, alloc_list in mem_alloc_info.items():
+            alloc_list.sort(key=lambda x:x[0])
+            for idx, alloc_info in enumerate(alloc_list):
+                assert idx == alloc_info[0], f"Invalid allocation index in node {nd_name}"
 
         # dump peak memory
         logger.info(f"required memory: {required_memory/1024/1024/1024}GB")
@@ -186,5 +216,9 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
             plt.savefig("./tmp/mem_fig.pdf")
 
-        return (required_memory, None, None, mem_locations)
+        ordered_schedules = []
+        for node in self.nodes_to_schedule:
+            ordered_schedules.append(node.name)
+
+        return (required_memory, max_temp_size, None, ordered_schedules, mem_alloc_info, mem_locations)
 

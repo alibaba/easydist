@@ -23,7 +23,7 @@ class OutVar:
         alloc_index,
         arg_index,
         tensor_index,
-        offset
+        offset = 0
     ):
         self.out_index = out_index
         self.mem_size = mem_size
@@ -45,7 +45,6 @@ class OutVar:
         return self.mem_size
 
     def __str__(self) -> str:
-        mem_info_str = ""
         if self.is_reference:
             mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", arg idx: " + \
@@ -58,9 +57,27 @@ class OutVar:
                            str(self.alloc_index)
         return mem_info_str
 
+class TempVar:
+    def __init__(
+        self,
+        mem_size,
+        alloc_index
+    ):
+        self.mem_size = mem_size
+
+        # allocation info:
+        self.alloc_index = alloc_index
+
+    def __str__(self) -> str:
+        mem_info_str = "size: " + str(self.mem_size) + ", alloc idx: " + \
+                       str(self.alloc_index)
+        return mem_info_str
+
 class NodeMemInfo:
     def __init__(self):
         self.out_vars = []  # list of OutVar
+        self.temp_vars = []  # list of TempVar
+        self.alloc_num = 0
 
     def add_out_var(self, out_index, mem_size, is_reference, alloc_index=-1,
                     arg_index=-1, tensor_index=-1, offset=0):
@@ -72,6 +89,10 @@ class NodeMemInfo:
         var = self.out_vars[out_idx]
         assert var.out_index == out_idx
         return var
+
+    def add_temp_var(self, mem_size, alloc_index):
+        temp_var = TempVar(mem_size, alloc_index)
+        self.temp_vars.append(temp_var)
 
     def __str__(self) -> str:
         mem_info_str = ""
@@ -92,9 +113,12 @@ class GraphMemInfo:
 
     def get_out_var(self, node, out_idx):
         node_mem_info = self.get_node_mem_info(node.name)
-        var = node_mem_info[out_idx]
-        assert var.out_index == out_idx
+        var = node_mem_info.get_out_var(out_idx)
         return var
+
+    def get_temp_vars(self, node):
+        node_mem_info = self.get_node_mem_info(node.name)
+        return node_mem_info.temp_vars
 
     def __str__(self) -> str:
         graph_mem_info_str = ""

@@ -551,9 +551,10 @@ class ILPMemoryScheduler(MemoryScheduler):
             print("step: %d" % step)
             for nd in nodes_in_step:
                 print(("  node: {}").format(nd))
-                ordered_schedules.append(nd)
+                ordered_schedules.append(nd.name)
         assert len(ordered_schedules) == len(self.nodes_to_schedule)
 
+        mem_alloc_info = {}
         mem_locations = {}
         for node,addrs in addresses.items():
             mem_addrs = []
@@ -572,9 +573,20 @@ class ILPMemoryScheduler(MemoryScheduler):
                 logger.info(f"{node}:{out_vars[idx].out_index}: addr: {addr.x}-{addr.x-1+(mem_size+self.gcd-1)//self.gcd}, orig size: {mem_size}")
                 mem_addr = int(addr.x + 0.5)*self.gcd
                 mem_addrs.append((mem_addr, mem_size))
+                if not out_vars[idx].is_reference:
+                    if node.name not in mem_alloc_info:
+                        mem_alloc_info[node.name] = [(out_vars[idx].alloc_index, mem_addr, mem_size)]
+                    else:
+                        mem_alloc_info[node.name].append((out_vars[idx].alloc_index, mem_addr, mem_size))
+
             mem_locations[node.name] = mem_addrs
 
         required_memory = int(peak_mem_usage.x + 0.5)*self.gcd
+
+        for alloc_list in mem_alloc_info.values():
+            alloc_list.sort(key=lambda x:x[0])
+            for idx, alloc_info in enumerate(alloc_list):
+                assert idx == alloc_info[0]
 
         # dump peak memory
         logger.info(f"required memory: {required_memory/1024/1024/1024}GB")
@@ -593,11 +605,10 @@ class ILPMemoryScheduler(MemoryScheduler):
 
         # dump ordered schedules
         ordered_nodes_str = "ordered nodes:\n"
-        for idx,nd in enumerate(ordered_schedules):
-            assert nd
-            ordered_nodes_str += str(idx) + ": " + nd.name + "\n"
+        for idx,nd_name in enumerate(ordered_schedules):
+            ordered_nodes_str += str(idx) + ": " + nd_name + "\n"
         logger.info(ordered_nodes_str)
 
-        return (required_memory, schedules, ordered_schedules, mem_locations)
+        return (required_memory, None, schedules, ordered_schedules, mem_alloc_info, mem_locations)
 
 
