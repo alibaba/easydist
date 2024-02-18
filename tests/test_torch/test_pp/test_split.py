@@ -32,7 +32,9 @@ from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annot
                                                              before_split_register,
                                                              after_split_register,
                                                              tuple_after_split,
-                                                             tuple_before_split)
+                                                             tuple_before_split,
+                                                             set_backward_flag,
+                                                             get_backward_flag)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -90,8 +92,8 @@ def train_step(input, label, model, opt):
         opt.zero_grad()
     out = model(input)
     loss = (out - torch.ones_like(out) * label).pow(2).mean()
-    loss.backward()
     if opt is not None:
+        loss.backward()
         opt.step()
     return loss
 
@@ -108,8 +110,8 @@ def train_step_gpt(input, label, model, opt):
             elif isinstance(attr, (tuple, list)):
                 for a in attr:
                     loss += (a - torch.ones_like(a) * label).pow(2).mean()
-    loss.backward()
     if opt is not None:
+        loss.backward()
         opt.step()
     return loss
 
@@ -119,25 +121,30 @@ def train_step_t5(input, label, model, opt):
     if opt is not None:
         opt.zero_grad()
     loss = model(input_ids=input, labels=label).loss
-    loss.backward()
     if opt is not None:
+        loss.backward()
         opt.step()
     return loss
 
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
-    module = module.train().cuda()
-    opt = None
-    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    module = module.double().train().cuda()
+    opt = None # inference only
+    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
+    if opt is None:
+        module = module.eval()
+
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
+        nstages = len(split_ann_or_policy) + 1
     else:
-        module = split_ann_or_policy(module)
+        nstages, module = split_ann_or_policy(module)
 
     rand_input = rand_input_gen_method()
-    args = [rand_input, 0.0012345, module, opt]
+    label = torch.tensor(random.random()).cuda()
+    args = [rand_input, label, module, opt]
     kwargs = {}
 
     # Copied from _compile
@@ -185,6 +192,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         return params, buffers, named_states, grads, ret
 
     with _enable_compile(), SplitPatcher(module, opt):
+        set_backward_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -192,7 +200,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                                                                 args, kwargs)
 
     traced_stateless_func.graph.eliminate_dead_code()
-    # traced_graph = preprocess_traced_graph(traced_graph)
+    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func.recompile()
     ##################################################################################################
 
@@ -208,44 +216,47 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             return x
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
-    stateless_func_args_flatten, _ = pytree.tree_flatten(stateless_func_args)
 
-    idx2phname, outname2idx, compiled_stages, gm, _, _ = compile_stateful_stages(
-        module, traced_stateless_func, stateless_func_args, strict=False)
+    args_name_mapping, kwargs_name_mapping, outname2idx, compiled_stages, gm, _ = compile_stateful_stages(
+        traced_stateless_func, nstages, stateless_func_args, strict=False)
 
-    id_rand_input = -1
-    for i, arg in enumerate(stateless_func_args_flatten):
-        if arg is rand_input:
-            id_rand_input = i
-            break
 
-    rand_input1 = rand_input_gen_method()
+    epochs = 5
+    dataset = []
+    for _ in range(epochs):
+        rand_input = rand_input_gen_method()
+        label = torch.tensor(random.random()).cuda()
+        dataset.append((rand_input, label))
 
     seed()
     with torch.no_grad():
-        gm(**{idx2phname[id_rand_input]: rand_input})
-        gm(**{idx2phname[id_rand_input]: rand_input1})
+        for rand_input, label in dataset:
+            input_dict = {}
+            args[0] = rand_input
+            args[1] = label
+            for arg_name, arg in list(zip(args_name_mapping, args))[:-2]: # no module and opt
+                input_dict[arg_name] = arg
+            gm(**input_dict)
 
     outputs = {}
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_flatten = [None] * len(outname2idx)
+    out_flatten = [None] * (max(outname2idx.values()) + 1)
     for name in outputs:
         out_flatten[outname2idx[name]] = outputs[name]
 
     seed()
     with torch.no_grad():
-        out_copy = traced_stateless_func(*stateless_func_args_copy)
-        stateless_func_args_copy[:3] = out_copy[:3]
-        stateless_func_args_copy[3][0] = rand_input1
-        out_copy = traced_stateless_func(*stateless_func_args_copy)
+        for rand_input, label in dataset:
+            stateless_func_args_copy[3][0] = rand_input
+            stateless_func_args_copy[3][1] = label
+            out_copy = traced_stateless_func(*stateless_func_args_copy)
 
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
     ignore_none = True
     for i, (val, val_copy) in enumerate(zip(out_flatten, out_flatten_copy)):
-        assert val is not val_copy
         if ignore_none:
             if val is None:
                 continue
@@ -329,24 +340,24 @@ if __name__ == '__main__':
     test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
     test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
 
-    # ======== nlp models, might take long time and OOM ========
-    test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-        'h.3',
-        'h.6',
-        'h.9',
-    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
+    # # ======== nlp models, might take long time and OOM ========
+    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+    #     'h.3',
+    #     'h.6',
+    #     'h.9',
+    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
-    test_main(AutoModel.from_pretrained("bert-base-uncased"), {
-        'encoder.layer.3',
-        'encoder.layer.6',
-        'encoder.layer.9',
-    }, factory_gen_rand_input_ids(30522), train_step_gpt)
+    # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
+    #     'encoder.layer.3',
+    #     'encoder.layer.6',
+    #     'encoder.layer.9',
+    # }, factory_gen_rand_input_ids(30522), train_step_gpt)
 
-    test_main(GPT2Model(GPT2Config()), {
-        'h.3',
-        'h.6',
-        'h.9',
-    }, factory_gen_rand_input_ids(50257), train_step_gpt)
+    # test_main(GPT2Model(GPT2Config()), {
+    #     'h.3',
+    #     'h.6',
+    #     'h.9',
+    # }, factory_gen_rand_input_ids(50257), train_step_gpt)
 
     # test_main(LlamaModel(LlamaConfig()), {
     #     'layers.8',

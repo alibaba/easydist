@@ -134,7 +134,6 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
             peer_rank = i % pg_world_size
             self.stage_index_to_group_rank.setdefault(i, peer_rank)
 
-        # Prepar
         # Prepare send/recv infrastructure
         self._prepare_send_recv_infra()
         # Cast submodule to device
@@ -457,7 +456,7 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
         )
 
     @torch.no_grad
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> None:
         # Clean per iteration
         self.clear_runtime_states()
 

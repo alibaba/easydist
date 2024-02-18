@@ -75,9 +75,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         device = torch.device("cpu")
 
     module = module.train().double().to(device)
-    # opt = None
-    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
+    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
     else:
