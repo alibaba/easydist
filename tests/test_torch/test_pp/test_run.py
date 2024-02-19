@@ -1,3 +1,4 @@
+from multiprocessing import process
 import os
 import random
 from contextlib import nullcontext
@@ -9,14 +10,19 @@ from sympy import N
 
 import torch
 import torch.utils._pytree as pytree
+from torchvision import datasets, transforms
+from torchvision.models import resnet18
+from torch.nn.functional import cross_entropy
+
 from torch.nn.utils import stateless
 from torch._subclasses.fake_tensor import FakeTensor
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
                                                              PipeSplitWrapper,
-                                                             compile_stateful_stages,
-                                                             split_into_equal_size)
+                                                             compile_pipeline,
+                                                             split_into_equal_size,
+                                                             set_backward_flag)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -38,29 +44,12 @@ def seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-class Foo(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.LayerNorm(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x = self.linear(x)
-        return x.relu()
-
-
-
 def train_step(input, label, model, opt):
-    if opt is not None:
-        opt.zero_grad()
+    opt.zero_grad()
     out = model(input)
-    loss = (out - torch.ones_like(out) * label).pow(2).mean()
+    loss = cross_entropy(out, label)
     loss.backward()
-    if opt is not None:
-        opt.step()
+    opt.step()
     return loss
 
 
@@ -74,18 +63,29 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     else:
         device = torch.device("cpu")
 
-    module = module.train().double().to(device)
+    module = module.train().to(device)
     opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
+        nstages = len(split_ann_or_policy) + 1
     else:
-        module = split_ann_or_policy(module)
+        nstages, module = split_ann_or_policy(module)
 
-    rand_input = rand_input_gen_method().to(device)
-    args = [rand_input, 0.0012345, module, opt]
+    batch_size = 64
+    transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+    train_data = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+    valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
+    valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
+
+    x, y = next(iter(train_dataloader))
+    
+    args = [x.to(device), y.to(device), module, opt]
     kwargs = {}
 
-    # Copied from _compile
     ##################################################################################################
     params = dict(module.named_parameters())
     buffers = dict(module.named_buffers())
@@ -139,6 +139,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     )
 
     with _enable_compile(), SplitPatcher(module, opt):
+        set_backward_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
                                   tracing_mode='fake',
                                   decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -149,30 +150,14 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func.recompile()
     ##################################################################################################
-
-    traced_stateless_func_node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
-    # print("traced_graph:\n", traced_graph.code)
     save_graphviz_dot(traced_stateless_func, 'traced_graph')
 
+    traced_stateless_func_node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
     stateless_func_args = [params, buffers, named_states, args, kwargs]
 
-    def arg_copy_func(x):
-        if isinstance(x, torch.Tensor):
-            return x.clone().detach()
-        else:
-            return x
 
-    args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
-    args_flatten, _ = pytree.tree_flatten(stateless_func_args)
-
-    idx2phname, outname2idx, compiled_stages, gm, node_to_stage = compile_stateful_stages(
-        module, traced_stateless_func, stateless_func_args)
-
-    id_rand_input = -1
-    for i, arg in enumerate(args_flatten):
-        if arg is rand_input:
-            id_rand_input = i
-            break
+    process_args_kwargs, process_outputs, compiled_stages, gm, node_to_stage = compile_pipeline(
+        traced_stateless_func, nstages, stateless_func_args, strict=False)
 
     rand_input1 = rand_input_gen_method()
 
@@ -181,7 +166,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         traced_stateless_func_node_metas,
         gm,
         compiled_stages,
-        num_stages=2,
+        num_stages=nstages,
         num_chunks=num_chunks,
         args_chunk_spec=None,
         kwargs_chunk_spec=None,
@@ -190,54 +175,44 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         device=device
     )
 
+    epochs = 10
 
-    if rank == 0:
-        pipe(**{idx2phname[id_rand_input]: 3*torch.ones_like(rand_input, device='cuda')})
-    else:
-        pipe()
+    for _ in range(epochs):
+        for x_batch, y_batch in train_dataloader:
+            args = (x_batch, y_batch, module, opt)
+            kwargs = {}
+            stage_kwargs = process_args_kwargs(*args, **kwargs, move_to_device=True)
+            if rank == 0:
+                pipe(**stage_kwargs[rank])    
+            else:
+                pipe(**stage_kwargs[rank])
 
-    outputs = pipe.all_gather_outputs(0)
+            state_dicts = pipe.all_gather_state_dict(0)
 
-    for stage_output in outputs:
-        if stage_output is not None:
-            print(list(stage_output.keys()))
-    
-    state_dict = pipe.stage.state_dict()
-    optim_state = pipe.stage.optimizer_state_dict()
-
-    exit()
-    seed()
-    with torch.no_grad():
-        gm(**{idx2phname[id_rand_input]: rand_input})
-        gm(**{idx2phname[id_rand_input]: rand_input1})
-
-    outputs = {}
-    for stage in compiled_stages:
-        outputs.update(stage.outputs)
-
-    out_flatten = [None] * len(outname2idx)
-    for name in outputs:
-        out_flatten[outname2idx[name]] = outputs[name]
-
-    seed()
-    with torch.no_grad():
-        out_copy = traced_stateless_func(*args_copy)
-        args_copy[:3] = out_copy[:3]
-        args_copy[3][0] = rand_input1
-        out_copy = traced_stateless_func(*args_copy)
-
-    out_flatten_copy, _ = pytree.tree_flatten(out_copy)
-
-    for i, (val, val_copy) in enumerate(zip(out_flatten, out_flatten_copy)):
-        assert val is not val_copy
-        if isinstance(val, torch.Tensor):
-            assert torch.allclose(val, val_copy)
-        else:
-            assert val == val_copy
+            if rank == 0:
+                state_dict = {}
+                for d in state_dicts:
+                    state_dict.update(d)
+                # print(list(state_dict.keys()))
+                module.load_state_dict(state_dict)
+                module.eval()
+                correct_cnt = 0
+                all_cnt = 0
+                for x_batch, y_batch in valid_dataloader:
+                    x_batch = x_batch.to(device)
+                    y_batch = y_batch.to(device)
+                    out = module(x_batch)
+                    preds = out.argmax(-1)
+                    correct_cnt = (preds == y_batch).sum()
+                    all_cnt = len(y_batch)
+                    correct_cnt += correct_cnt.item()
+                    all_cnt += all_cnt
+                print(f'accuracy: {correct_cnt / all_cnt}')
 
 
-def gen_rand_input_foo():
-    return torch.rand(16, 1024).cuda().double()
+def gen_rand_input_imagenet():
+    return None
+
 
 if __name__ == '__main__':
     # Initialize distributed environment
@@ -245,4 +220,4 @@ if __name__ == '__main__':
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group(rank=rank, world_size=world_size)
     
-    test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
+    test_main(resnet18(), split_into_equal_size(world_size), gen_rand_input_imagenet, train_step)

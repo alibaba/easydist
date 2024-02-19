@@ -1,4 +1,6 @@
+import glob
 import logging
+from multiprocessing import process
 import operator
 from typing import (Callable, Dict, List, Tuple, Any, Union)
 from abc import ABC, abstractmethod
@@ -530,7 +532,7 @@ class CompiledStageBase(ABC):
     def state_dict(self):...
 
 # TODO @botbw: simplify
-def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args, strict=True):
+def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_inplace=False, strict=True):
     is_backward_called = get_backward_flag()
     stateless_func_args_flatten, stateless_func_args_spec = pytree.tree_flatten(stateless_func_args)
 
@@ -770,7 +772,13 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                     optim_state[state_type][src_name] = tensor
             return dict(optim_state)
 
-    name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
+    if init_inplace:
+        fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True,
+                                                  allow_non_fake_inputs=False)
+        name2tensor = {name: fake_tensor_mode.from_tensor(tensor) for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
+    else:
+        name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
+
     states_used_by = defaultdict(list)
 
     def gen_stateful_submod(node, submod, submod_type='fw'):
@@ -884,7 +892,7 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
     g = fx.Graph()
     env = {}
     submod_idx = 0
-    node_to_stage = {}
+    name_to_stage_idx = {}
 
     for node in splited_fw_bw_gm.graph.nodes:
         if node.op == 'placeholder':
@@ -902,7 +910,10 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                         target=stage.forward,
                         kwargs={arg_name: env[arg_name]
                                 for arg_name in stage.fw_func_args})
-                    node_to_stage[node_name] = stage_idx
+                    name_to_stage_idx[node_name] = stage_idx
+                    for arg_name in stage.fw_func_args:
+                        if env[arg_name].op == 'placeholder':
+                            name_to_stage_idx[arg_name] = stage_idx
                     for output in stage.fw_func_returns:
                         env[output] = g.create_node(
                             name=output,
@@ -910,7 +921,7 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                             target=operator.getitem,
                             args=(out_maybe_tuple, output)
                         )
-                        node_to_stage[output] = stage_idx
+                        name_to_stage_idx[output] = stage_idx
                 else:  # backward
                     stage_idx = 2 * nstages - submod_idx - 1
                     stage = compiled_stages[stage_idx]
@@ -921,7 +932,7 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                         target=stage.backward,
                         kwargs={arg_name: env[arg_name]
                                 for arg_name in stage.bw_func_args})
-                    node_to_stage[node_name] = stage_idx
+                    name_to_stage_idx[node_name] = stage_idx
                     for output in stage.bw_gm.outputs_spec:
                         if not output in global_outputs_names:
                             env[output] = g.create_node(
@@ -929,14 +940,14 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                                 op='call_function',
                                 target=operator.getitem, 
                                 args=(out_maybe_tuple, output))
-                            node_to_stage[output] = stage_idx
+                            name_to_stage_idx[output] = stage_idx
                     if hasattr(stage, 'step_gm'):
                         g.create_node(
                             name=f'stage_{stage_idx}_step',
                             op='call_function',
                             target=stage.step
                             )
-                        node_to_stage[f'stage_{stage_idx}_step'] = stage_idx
+                        name_to_stage_idx[f'stage_{stage_idx}_step'] = stage_idx
             else:  # fw
                 stage_idx = submod_idx
                 stage = compiled_stages[submod_idx]
@@ -947,7 +958,10 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                     target=stage.forward,
                     kwargs={arg_name: env[arg_name]
                             for arg_name in stage.fw_func_args})
-                node_to_stage[node_name] = stage_idx
+                name_to_stage_idx[node_name] = stage_idx
+                for arg_name in stage.fw_func_args:
+                    if env[arg_name].op == 'placeholder':
+                        name_to_stage_idx[arg_name] = stage_idx
                 for output in stage.fw_func_returns:
                     env[output] = g.create_node(
                         name=output,
@@ -955,7 +969,7 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
                         target=operator.getitem,
                         args=(out_maybe_tuple, output)
                     )
-                    node_to_stage[output] = stage_idx
+                    name_to_stage_idx[output] = stage_idx
             submod_idx += 1
 
     def eliminate_dead_node():
@@ -964,8 +978,35 @@ def compile_stateful_stages(traced_stateless_func, nstages, stateless_func_args,
     gm = fx.GraphModule({}, g)
 
     save_graphviz_dot(gm, 'gm')
+    def process_args_kwargs(*args, move_to_device=False, **kwargs):
+        args_names, kwargs_names = global_ph_names_unflatten[-2:]
+        stage_kwargs = [{} for _ in range(nstages)]
+        assert len(args) == len(args_names), "args should have the same length as args_names"
+        for arg_name, arg_val in zip(args_names, args):
+            if not arg_name in name_to_stage_idx:
+                continue
+            stage_idx = name_to_stage_idx[arg_name]
+            if move_to_device:
+                arg_val = arg_val.to(f'cuda:{stage_idx}') # TODO @botbw: improve this
+            stage_kwargs[stage_idx][arg_name] = arg_val
+        
+        assert set(kwargs.keys()) == set(kwargs_names.keys()), "kwargs should have the same keys as kwargs_names"
+        for k, v in kwargs.items():
+            if not k in name_to_stage_idx:
+                continue
+            stage_idx = name_to_stage_idx[k]
+            stage_kwargs[stage_idx][kwargs_names[k]] = v
+        return stage_kwargs
+
     out2idx = {name: i for i, name in enumerate(global_outputs_names)}
-    return global_ph_names_unflatten[-2], global_ph_names_unflatten[-1], out2idx, compiled_stages, gm, node_to_stage
+
+    def process_outputs(outputs):
+        out_flatten = [None] * (max(out2idx.values()) + 1)
+        for name in outputs:
+            out_flatten[out2idx[name]] = outputs[name]
+        return out_flatten
+
+    return process_args_kwargs, process_outputs, compiled_stages, gm, name_to_stage_idx
 
 @before_split_register(torch.Tensor)
 def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:

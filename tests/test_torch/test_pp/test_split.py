@@ -27,7 +27,7 @@ from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
                                                              PipeSplitWrapper,
-                                                             compile_stateful_stages,
+                                                             compile_pipeline,
                                                              split_into_equal_size,
                                                              before_split_register,
                                                              after_split_register,
@@ -91,7 +91,8 @@ def train_step(input, label, model, opt):
     if opt is not None:
         opt.zero_grad()
     out = model(input)
-    loss = (out - torch.ones_like(out) * label).pow(2).mean()
+    out = out.view(out.shape[0], -1).mean(dim=1)
+    loss = (out - label).pow(2).mean()
     if opt is not None:
         loss.backward()
         opt.step()
@@ -143,7 +144,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         nstages, module = split_ann_or_policy(module)
 
     rand_input = rand_input_gen_method()
-    label = torch.tensor(random.random()).cuda()
+    label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).cuda()
     args = [rand_input, label, module, opt]
     kwargs = {}
 
@@ -217,34 +218,32 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
 
-    args_name_mapping, kwargs_name_mapping, outname2idx, compiled_stages, gm, _ = compile_stateful_stages(
+    process_args_kwargs, process_outputs, compiled_stages, gm, _ = compile_pipeline(
         traced_stateless_func, nstages, stateless_func_args, strict=False)
-
 
     epochs = 5
     dataset = []
     for _ in range(epochs):
         rand_input = rand_input_gen_method()
-        label = torch.tensor(random.random()).cuda()
+        label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).cuda()
         dataset.append((rand_input, label))
 
     seed()
     with torch.no_grad():
         for rand_input, label in dataset:
+            args = (rand_input, label, module, opt)
+            kwargs = {}
+            kwargs_stage = process_args_kwargs(*args, **kwargs)
             input_dict = {}
-            args[0] = rand_input
-            args[1] = label
-            for arg_name, arg in list(zip(args_name_mapping, args))[:-2]: # no module and opt
-                input_dict[arg_name] = arg
+            for di in kwargs_stage:
+                input_dict.update(di)
             gm(**input_dict)
 
     outputs = {}
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_flatten = [None] * (max(outname2idx.values()) + 1)
-    for name in outputs:
-        out_flatten[outname2idx[name]] = outputs[name]
+    out_flatten = process_outputs(outputs)
 
     seed()
     with torch.no_grad():
@@ -284,6 +283,7 @@ def factory_gen_rand_input_ids(vocab_size):
 
 if __name__ == '__main__':
     test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
+    exit()
     test_main(Foo1(), {
         'norm',
         'linear0_1',

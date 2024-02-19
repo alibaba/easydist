@@ -49,7 +49,7 @@ class StageKwargPlaceholder:
     pass
 
 
-class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
+class PipelineStage:
     def __init__(
         self,
         node_to_stage,
@@ -136,6 +136,7 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
 
         # Prepare send/recv infrastructure
         self._prepare_send_recv_infra()
+        del self.node_metas
         # Cast submodule to device
         self._move_inject_states_to_device()
         # Move ops argument to device
@@ -496,6 +497,16 @@ class PipelineStage: #(torch.nn.Module, QualnameMapMixin):
             dst=rank
         )
         return outputs
+
+    def all_gather_state_dict(self, rank):
+        state_dicts = [None for _ in range(self.nstages)]
+        state_dict = self.stage.state_dict()
+        dist.gather_object(
+            state_dict,
+            state_dicts if self.group_rank == rank else None,
+            dst=rank
+        )
+        return state_dicts
 
 # class PipelineStage1F1B(PipelineStage):
 #     def __init__(

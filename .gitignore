@@ -140,3 +140,6 @@ build/
 
 # graphviz output
 *.dot
+
+# torchvision dataset
+data
