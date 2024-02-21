@@ -131,9 +131,9 @@ def train_step_t5(input, label, model, opt):
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
     module = module.double().train().cuda()
     opt = None # inference only
-    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     if opt is None:
         module = module.eval()
 
@@ -218,7 +218,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
 
-    process_args_kwargs, process_outputs, compiled_stages, gm, _ = compile_pipeline(
+    process_inputs, process_outputs, compiled_stages, gm, _ = compile_pipeline(
         traced_stateless_func, nstages, stateless_func_args, strict=False)
 
     epochs = 5
@@ -233,7 +233,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         for rand_input, label in dataset:
             args = (rand_input, label, module, opt)
             kwargs = {}
-            kwargs_stage = process_args_kwargs(*args, **kwargs)
+            kwargs_stage = process_inputs(*args, **kwargs)
             input_dict = {}
             for di in kwargs_stage:
                 input_dict.update(di)
@@ -243,7 +243,8 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_flatten = process_outputs(outputs)
+    out_unflatten = process_outputs(outputs)
+    out_flatten, _ = pytree.tree_flatten(out_unflatten)
 
     seed()
     with torch.no_grad():
@@ -251,6 +252,9 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             stateless_func_args_copy[3][0] = rand_input
             stateless_func_args_copy[3][1] = label
             out_copy = traced_stateless_func(*stateless_func_args_copy)
+            stateless_func_args_copy[0] = out_copy[0] # will update inplace?
+            stateless_func_args_copy[1] = out_copy[1]
+            stateless_func_args_copy[2] = out_copy[2]
 
     out_flatten_copy, _ = pytree.tree_flatten(out_copy)
 
@@ -283,7 +287,6 @@ def factory_gen_rand_input_ids(vocab_size):
 
 if __name__ == '__main__':
     test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
-    exit()
     test_main(Foo1(), {
         'norm',
         'linear0_1',
