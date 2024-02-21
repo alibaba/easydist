@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+from heapq import merge
 import logging
 import operator
 from platform import node
@@ -435,8 +436,17 @@ class PipelineStage:
         grad_send_reqs = self._send_output_dict(self.bw_act_send_info, grads_input)
         self.all_bw_send_reqs += grad_send_reqs
 
+    def merge_saved_for_bw(self) -> Dict[str, Any]:
+        return merge_chunks(
+            self.saved_for_bw_chunks,
+            self.outputs_chunk_spec,
+        )
+
+    def step(self):
         if self.step_node is not None:
-            self.stage.step(self.saved_for_bw_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk])
+            saved_for_bw = self.merge_saved_for_bw()
+            outputs = self.merge_output_chunks()
+            self.stage.step(saved_for_bw, outputs)
 
     def clear_runtime_states(self):
         # Activation send requests of all chunk
@@ -450,11 +460,18 @@ class PipelineStage:
             self.saved_for_bw_chunks.append({})
             self.outputs_chunks.append({})
 
-    def merge_output_chunks(self) -> Dict[str, Any]:
-        return merge_chunks(
-            self.outputs_chunks,
+    def merge_output_chunks(self) -> Dict[str, Any]: # todo output的param被当作minibatch给merge了
+        output_chunks_without_injected_states = [
+            {k: v for k, v in chunk.items() if k not in self.stage.fw_gm.injected_states and k not in self.stage.step_gm.injected_states}
+            for chunk in self.outputs_chunks
+        ]
+        outputs = merge_chunks(
+            output_chunks_without_injected_states,
             self.outputs_chunk_spec,
         )
+        outputs.update(self.stage.fw_gm.injected_states)
+        outputs.update(self.stage.step_gm.injected_states)
+        return outputs
 
     @torch.no_grad
     def __call__(self, *args, **kwargs) -> None:
@@ -484,6 +501,7 @@ class PipelineStage:
         for work in self.all_bw_send_reqs:
             work.wait()
 
+        self.step()
         logger.debug(f"[{self.group_rank}] All sends finished")
 
     def all_gather_outputs(self, rank):
@@ -507,6 +525,16 @@ class PipelineStage:
             dst=rank
         )
         return state_dicts
+    
+    def all_gather_optimizer_state_dict(self, rank):
+        optimizer_state_dicts = [None for _ in range(self.nstages)]
+        optimizer_state_dict = self.stage.optimizer_state_dict()
+        dist.gather_object(
+            optimizer_state_dict,
+            optimizer_state_dicts if self.group_rank == rank else None,
+            dst=rank
+        )
+        return optimizer_state_dicts
 
 # class PipelineStage1F1B(PipelineStage):
 #     def __init__(

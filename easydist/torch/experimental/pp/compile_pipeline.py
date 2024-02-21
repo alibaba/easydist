@@ -1,12 +1,13 @@
-import glob
 import logging
-from multiprocessing import process
 import operator
+from sre_parse import State
+import textwrap
 from typing import (Callable, Dict, List, Tuple, Any, Union)
 from abc import ABC, abstractmethod
 from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
-
+from enum import Enum
+from regex import E
 import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
@@ -402,7 +403,7 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
     return split, part_idx + 1
 
 
-def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: List[str]):
+def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: set[str]):
     new_graph = fx.Graph()
     env = {}
     outputs = []
@@ -488,14 +489,16 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: List
 
     new_gm = fx.GraphModule(gm, new_graph)
 
-    injected_states = {}
+    injected_states = {
+        StateType.OPTIMSTATES: {},
+    }
     to_pop = []
-    for name, val in gm.injected_states.items():
+    for name, val in gm.injected_states[StateType.OPTIMSTATES].items():
         if name in inputs_spec:
-            injected_states[name] = val
+            injected_states[StateType.OPTIMSTATES][name] = val
             to_pop.append(name)
     for name in to_pop:
-        gm.injected_states.pop(name)
+        gm.injected_states[StateType.OPTIMSTATES].pop(name)
 
     new_gm.inputs_spec = inputs_spec
     new_gm.injected_states = injected_states  # TODO @botbw: move this to meta
@@ -531,209 +534,239 @@ class CompiledStageBase(ABC):
     @abstractmethod
     def state_dict(self):...
 
+class StateType(Enum):
+    PARAMS = "params"
+    BUFFERS = "buffers"
+    OPTIMSTATES = "optimstates"
+
+class SubmodType(Enum):
+    FW = "fw"
+    BW = "bw"
+    STEP = "step"
+
 # TODO @botbw: simplify
-def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_inplace=False, strict=True):
+def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delayed_init=False, strict=True):
     is_backward_called = get_backward_flag()
-    stateless_func_args_flatten, stateless_func_args_spec = pytree.tree_flatten(stateless_func_args)
+    stateless_func_args_flatten, _ = pytree.tree_flatten(stateless_func_args)
 
-    global_phs_names_flatten = [ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder']
-    global_outputs_names = [
-        node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]
-    ]
+    phs_names_flatten = [ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder']
+    phs_names_unflatten = pytree.tree_unflatten(phs_names_flatten, traced_stateless_func._in_spec)
 
-    global_ph_names_unflatten = pytree.tree_unflatten(global_phs_names_flatten, stateless_func_args_spec)
-    params_names_unflatten, buffers_names_unflatten, optimstates_nums_unflatten = \
-        global_ph_names_unflatten[0], global_ph_names_unflatten[1], global_ph_names_unflatten[2]
+    outputs_names_flatten = [node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]]
+    outputs_names_unflatten = pytree.tree_unflatten(outputs_names_flatten, traced_stateless_func._out_spec)
+
+    # defined in stateless_func
+    params, buffers, optimstates, args, kwargs = stateless_func_args
+
+    if delayed_init:
+        fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True,
+                                                  allow_non_fake_inputs=False)
+        arg_count = 0
+        def wrap_fake(x):
+            nonlocal arg_count
+            if isinstance(x, torch.Tensor):
+                # TODO: it would be nice to line these up with the names
+                # FX will choose for the placeholders, but we don't
+                # actually know what the names will be at this point yet
+                # NB: the Source here is actually meaningless
+                from torch._dynamo.source import ConstantSource
+                source = ConstantSource(f"input{arg_count}")
+                arg_count += 1
+                # type: ignore[attr-defined]
+                return fake_tensor_mode.from_tensor(x, source=source)
+            return x
+        params, buffers, optimstates = pytree.tree_map(wrap_fake, [params, buffers, optimstates])
+    
+    params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten, args_names_unflatten, kwargs_names_unflatten = phs_names_unflatten
+    maybe_updated_params_names_unflatten, maybe_updated_buffers_names_unflatten, updated_optimstates_names_unflatten, nones_or_grads_names_unflatten, returns_names_unflatten = outputs_names_unflatten
+    updated_optimstates_names_flatten, _ = pytree.tree_flatten(updated_optimstates_names_unflatten)
+    returns_names_unflatten = _to_tuple(returns_names_unflatten) # returns might be value or tuple
+    all_states_names_flatten, _ = pytree.tree_flatten([params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten])
     inv_params = {arg: param_name for param_name, arg in params_names_unflatten.items()}
     inv_buffers = {arg: buffer_name for buffer_name, arg in buffers_names_unflatten.items()}
     inv_optimstates = {}
     ph_name_to_optimstates_type = {}
-    for param_key, state in optimstates_nums_unflatten.items():
+    for param_key, state in optimstates_names_unflatten.items():
         for typ, ph_name in state.items():
             inv_optimstates[ph_name] = param_key
             ph_name_to_optimstates_type[ph_name] = typ
 
-    def source_name(name):
-        if name in inv_params:
-            return "params", inv_params[name]
-        elif name in inv_buffers:
-            return "buffers", inv_buffers[name]
-        elif name in inv_optimstates:
-            return "optimstates", inv_optimstates[name]
-        else:
-            raise RuntimeError(f"unknown name {name}")
-
-    all_tensor_names_flatten, _ = pytree.tree_flatten(global_ph_names_unflatten[:3])
-
     splited_global, part_cnt = split_by(traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
 
-    class CompiledStage(CompiledStageBase):
+    class CompiledStage(CompiledStageBase): # TODO @botbw: make this picklable
 
         def __init__(self, fw_gm, bw_gm, full_step_gm):
             self.fw_gm = fw_gm
-            self.fw_gm_injected_states = set(fw_gm.injected_states.keys())  # injected states
-
-            self.fw_func_args = set(fw_gm.inputs_spec) - set(
-                self.fw_gm_injected_states)  # args for self.forward
-
-            # TODO @botbw: better way of doing this
-            self.fw_func_returns = set({
+            params_and_buffers = (set(fw_gm.injected_states[StateType.PARAMS].keys()) | set(fw_gm.injected_states[StateType.BUFFERS].keys()))
+            self.fw_func_args = set(fw_gm.inputs_spec) - params_and_buffers  # args for self.forward
+            self.fw_func_returns = set( # TODO @botbw: better way of doing this
                 output
                 for output, users in self.fw_gm.call_module_users.items()
-                if not (len(users) == 1 and (bw_gm and next(iter(users)) == bw_gm.name))
-            })  # not only used by bw
-
-            self.global_outputs_spec = global_outputs_names
-            self.outputs_to_torch_name = inv_params
+                if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name))
+            )  # not just used by bw, need to pass to next stage
 
             if bw_gm is not None:
                 self.bw_gm = bw_gm
-                self.fw_gm_args_saved_for_bw = set(fw_gm.inputs_spec) & set(
-                    bw_gm.inputs_spec)  # saved args for self.bw_gm
-                self.fw_gm_outputs_saved_for_bw = set(fw_gm.outputs_spec) & set(
-                    bw_gm.inputs_spec)  # saved self.forward returns for self.bw_gm
-                self.bw_func_args = set(bw_gm.inputs_spec) - set(self.fw_gm_args_saved_for_bw) - set(
-                    self.fw_gm_outputs_saved_for_bw)  # args for self.backward
+                args_activations = set(fw_gm.inputs_spec) & set(bw_gm.inputs_spec) - params_and_buffers
+                outputs_activations = set(fw_gm.outputs_spec) & set(bw_gm.inputs_spec)
+                self.activation_nodes = args_activations | outputs_activations
+                self.bw_func_args = set(bw_gm.inputs_spec) - set(self.activation_nodes) - params_and_buffers  # args for self.backward
 
             if full_step_gm is not None:  # TODO @botbw: simplify this
-                params = list(self.fw_gm_injected_states & set(full_step_gm.inputs_spec))
-                param_names = set(inv_params[name] for name in params)
-                grad_inputs = list(set(bw_gm.outputs_spec) & set(full_step_gm.inputs_spec))
-                input_optim_states, _ = pytree.tree_flatten([
-                    global_ph_names_unflatten[2][param_name] for param_name in param_names
-                    if param_name in global_ph_names_unflatten[2]
-                ])
-                self.step_gm_args = params + grad_inputs + input_optim_states
+                stage_params_inputs = set(self.fw_gm.injected_states[StateType.PARAMS]) & set(full_step_gm.inputs_spec)
+                inv_stage_params_inputs = set(inv_params[name] for name in stage_params_inputs)
+                stage_grad_inputs = set({nones_or_grads_names_unflatten[k] for k in inv_stage_params_inputs})
+                stage_optimstates_inputs, _ = pytree.tree_flatten([optimstates_names_unflatten[k] for k in inv_stage_params_inputs])
+                stage_optimstates_inputs = set(stage_optimstates_inputs)
+                self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
                 self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
-                self.step_outputs_spec_to_states_spec = {
-                    output: state
-                    for output, state in zip(global_outputs_names, all_tensor_names_flatten)
-                }
-                for updated_state, ori_state in self.step_outputs_spec_to_states_spec.items():
-                    if ori_state in self.outputs_to_torch_name:
-                        self.outputs_to_torch_name[updated_state] = self.outputs_to_torch_name[ori_state]
 
-        def forward(self, saved_for_bw=None, outputs=None, **kwargs):
-            '''
-            inputs:
-                kwargs: activations from previous stages
-                
-                kwargs4gm: arguments for self.fw_gm
-                    a. prepare arguments for self.fw_gm which is neighter
-                        1. activations from previous stages (i.e. kwargs)
-                        2. params and buffers of this stage (i.e. self.fw_gm.injected_states)
-                    
-                    b. save arguments for self.bw_gm and output
-                        1. save kwargs4gm for backward if it appears in self.bw_gm.inputs_spec (activations, params for example)
-                        2. save kwargs4gm for output if it appears in global_outputs_spec (buffers for example)
-                
-            outputs:
-                output_from_gm: outputs of self.fw_gm
-                    a. filter outputs that are required in following stages TODO @botbw
-                    b. save arguments for self.bw_gm and output
-                        1. save for backward if it appears in self.bw_gm.inputs_spec (intermediate values for example)
-                        2. save for output if it appears in global_outputs_spec (original model outputs for example)
-            '''
-            if saved_for_bw is None or outputs is None:
-                if not hasattr(self, 'saved_for_bw'):
-                    self.saved_for_bw = {}
+        def process_input(self, params, buffers, optimstates, args, kwargs):
+            input_kwargs = {}
+            for torch_name, tensor in params.items():
+                input_kwargs[params_names_unflatten[torch_name]] = tensor
+            for torch_name, tensor in buffers.items():
+                input_kwargs[buffers_names_unflatten[torch_name]] = tensor
+            for torch_name, state_dict in optimstates.items():
+                for typ, tensor in state_dict.items():
+                    input_kwargs[optimstates_names_unflatten[torch_name][typ]] = tensor
+            for torch_name, tensor in args.items():
+                input_kwargs[args_names_unflatten[torch_name]] = tensor
+            for torch_name, tensor in kwargs.items():
+                input_kwargs[kwargs_names_unflatten[torch_name]] = tensor
+            return input_kwargs
+
+        def forward(self, activations_batch=None, outputs_batch=None, **kwargs):
+            assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
+
+            if activations_batch is None or outputs_batch is None: # for local run
+                if not hasattr(self, 'activations'):
+                    self.activations = {}
                 if not hasattr(self, 'outputs'):
                     self.outputs = {}
-                saved_for_bw = self.saved_for_bw
-                outputs = self.outputs
+                activations_batch = self.activations
+                outputs_batch = self.outputs
 
-            assert set(kwargs.keys(
-            )) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
             kwargs4gm = {}
             for arg_name in self.fw_gm.inputs_spec:
                 if arg_name in kwargs:
                     kwargs4gm[arg_name] = kwargs[arg_name]
+                elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
+                    kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+                    if arg_name in maybe_updated_params_names_unflatten.values():  # params need to be returned directly if there is no opt_gm
+                        outputs_batch[arg_name] = kwargs4gm[arg_name]
+                elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
+                    kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
+                    if arg_name in maybe_updated_buffers_names_unflatten.values():  # buffers need to be returned directly
+                        outputs_batch[arg_name] = kwargs4gm[arg_name]
                 else:
-                    kwargs4gm[arg_name] = self.fw_gm.injected_states[arg_name]
-                    if arg_name in global_outputs_names:  # params need to be returned directly if there is no opt_gm TODO botbw: seperate params and buffers?
-                        outputs[arg_name] = kwargs4gm[arg_name]
+                    raise RuntimeError(f"arg {arg_name} not found")
 
-                if self.has_bw() and  arg_name in self.fw_gm_args_saved_for_bw:
-                    saved_for_bw[arg_name] = kwargs4gm[arg_name]
+                if self.has_bw() and arg_name in self.activation_nodes:
+                    activations_batch[arg_name] = kwargs4gm[arg_name]
 
             output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
 
             ret = {}
             assert len(output_from_gm) == len(self.fw_gm.outputs_spec), "output_from_gm should have the same length as self.fw_gm.outputs_spec"
             for output_name, output in zip(self.fw_gm.outputs_spec, output_from_gm):
-                if output_name in self.fw_func_returns:
-                    ret[output_name] = output
-
-                if self.has_bw() and output_name in self.fw_gm_outputs_saved_for_bw:
-                    saved_for_bw[output_name] = output
-
-                if output_name in global_outputs_names:
-                    outputs[output_name] = output
+                if (output_name in self.fw_func_returns) \
+                    or (self.has_bw() and output_name in self.activation_nodes) \
+                        or (output_name in maybe_updated_buffers_names_unflatten.values() or output_name in returns_names_unflatten):
+                    if output_name in self.fw_func_returns:
+                        ret[output_name] = output
+                    if self.has_bw() and output_name in self.activation_nodes:
+                        activations_batch[output_name] = output
+                    if (output_name in maybe_updated_buffers_names_unflatten.values() or output_name in returns_names_unflatten):
+                        outputs_batch[output_name] = output
+                else:
+                    raise RuntimeError(f"output {output_name} not sure where to go")
 
             return ret
 
-        def backward(self, saved_for_bw=None, outputs=None, **kwargs):
+        def backward(self, activations_batch=None, outputs_batch=None, **kwargs):
             if not self.has_bw():
                 raise NotImplementedError("This compiled stage doesn't contain bw_gm")
 
-            if saved_for_bw is None or outputs is None:
-                saved_for_bw = self.saved_for_bw
-                outputs = self.outputs
-
             assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
+
+            if activations_batch is None or outputs_batch is None: # for local run
+                activations_batch = self.activations
+                outputs_batch = self.outputs
+
             kwargs4gm = {}
-            for arg_name in self.bw_gm.inputs_spec:
+            for arg_name in self.bw_gm.inputs_spec: 
                 if arg_name in kwargs:
                     kwargs4gm[arg_name] = kwargs[arg_name]
+                elif arg_name in activations_batch:
+                    kwargs4gm[arg_name] = activations_batch[arg_name]
+                    activations_batch.pop(arg_name)
+                elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
+                    kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+                elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
+                    kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
                 else:
-                    kwargs4gm[arg_name] = saved_for_bw[arg_name]
-                    saved_for_bw.pop(arg_name)
+                    raise RuntimeError(f"arg {arg_name} not found")
 
-                # if arg_name in global_outputs_spec:
-                #     outputs[arg_name] = kwargs4gm[arg_name]
-
-            assert len(saved_for_bw) == 0, "all backward args should be used"
+            assert len(activations_batch) == 0, "all backward args should be used"
             output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
 
             ret = {}
             assert len(output_from_gm) == len(self.bw_gm.outputs_spec), "output_from_gm should have the same length as self.bw_gm.outputs_spec"
+            
             for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
-                if output_name in global_outputs_names:
-                    outputs[output_name] = output
-                else:
-                    assert output_name in self.bw_gm.call_module_users, "for bw_gm, output should be neither output or returned"
+                if output_name in nones_or_grads_names_unflatten.values():
+                    outputs_batch[output_name] = output
+                elif output_name in self.bw_gm.call_module_users:
                     ret[output_name] = output
+                else:
+                    raise RuntimeError(f"output {output_name} not sure where to go")
             return ret
 
-        def step(self, saved_for_bw=None, outputs=None):
+        def step(self, activations=None, outputs=None):
             if not self.has_step():
                 raise NotImplementedError("This compiled stage doesn't contain step_gm")
-            if saved_for_bw is None or outputs is None:
-                saved_for_bw = self.saved_for_bw
+
+            if activations is None or outputs is None:
+                activations = self.activation_nodes
                 outputs = self.outputs
+
             kwargs = {}
             for arg_name in self.step_gm_args:
-                if arg_name in self.step_gm.injected_states:
-                    kwargs[arg_name] = self.step_gm.injected_states[arg_name]
-                elif arg_name in self.fw_gm.inputs_spec:
-                    kwargs[arg_name] = self.fw_gm.injected_states[arg_name]
-                elif arg_name in saved_for_bw:
-                    kwargs[arg_name] = saved_for_bw[arg_name]
-                elif arg_name in outputs:
+                if arg_name in self.step_gm.injected_states[StateType.OPTIMSTATES]: # optimstates
+                    kwargs[arg_name] = self.step_gm.injected_states[StateType.OPTIMSTATES][arg_name]
+                elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
+                    kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+                elif arg_name in nones_or_grads_names_unflatten.values(): # grads
                     kwargs[arg_name] = outputs[arg_name]
                 else:
-                    raise RuntimeError(f"arg {arg_name} not found")
+                    raise RuntimeError(f"arg {arg_name} not sure where to go")
+            
             rets = _to_tuple(self.step_gm(**kwargs))
 
             for output, ret in zip(self.step_gm.outputs_spec, rets):
-                if output in global_outputs_names:
+                if output in maybe_updated_params_names_unflatten.values():
                     outputs[output] = ret
-                if output in self.step_outputs_spec_to_states_spec:
-                    state_name = self.step_outputs_spec_to_states_spec[output]
-                    self.fw_gm.injected_states[state_name] = ret
+                elif output in updated_optimstates_names_flatten:
+                    outputs[output] = ret
+                else:
+                    raise RuntimeError(f"output {output} not sure where to go")
 
             return None  # step should always return None
+
+        def process_output(self, outputs_dict):
+            ret = []
+            ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_params_names_unflatten})
+            ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_buffers_names_unflatten})
+            optimstates = defaultdict(dict)
+            for torch_name, state_dict in updated_optimstates_names_unflatten.items():
+                for typ, ph_name in state_dict.items():
+                    optimstates[torch_name][typ] = outputs_dict[ph_name]
+            ret.append(dict(optimstates))
+            ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in nones_or_grads_names_unflatten})
+            ret.append(tuple(outputs_dict[node_name] for node_name in returns_names_unflatten))
+            return ret
 
         def has_step(self):
             return hasattr(self, 'step_gm')
@@ -748,59 +781,20 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
             return state_dict
 
         def named_parameters(self):
-            named_params = {}
-            for name, tensor in self.fw_gm.injected_states.items():
-                typ, src_name = source_name(name)
-                if typ == 'params':
-                    named_params[src_name] = tensor
-            return named_params
+            return {inv_params[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()}
 
         def named_buffers(self):
-            named_buffers = {}
-            for name, tensor in self.fw_gm.injected_states.items():
-                typ, src_name = source_name(name)
-                if typ == 'buffers':
-                    named_buffers[src_name] = tensor
-            return named_buffers
+            return {inv_buffers[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()}
 
         def optimizer_state_dict(self):
             optim_state = defaultdict(dict)
-            for name, tensor in self.fw_gm.injected_states.items():
-                typ, src_name = source_name(name)
-                if typ == 'optimstates':
-                    state_type = ph_name_to_optimstates_type[name]
-                    optim_state[state_type][src_name] = tensor
+            for name, tensor in self.fw_gm.injected_states[StateType.OPTIMSTATES].items():
+                optim_state[inv_optimstates[name]][ph_name_to_optimstates_type[name]] = tensor
             return dict(optim_state)
-
-    if init_inplace:
-        fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True,
-                                                  allow_non_fake_inputs=False)
-        name2tensor = {name: fake_tensor_mode.from_tensor(tensor) for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
-    else:
-        name2tensor = {name: tensor for name, tensor in zip(all_tensor_names_flatten, stateless_func_args_flatten)}
 
     states_used_by = defaultdict(list)
 
-    def gen_stateful_submod(node, submod, submod_type='fw'):
-        assert submod_type in ('fw', 'bw', 'step')
-        # process input
-        inputs_spec = []
-        inputs_users = []
-        injected_states = {}
-        for arg in node.args:
-            inputs_spec.append(arg.name)
-            inputs_users.append({user.name for user in arg.users})
-            states_used_by[arg.name].append(node.name)
-            if submod_type != 'bw' and arg.name in all_tensor_names_flatten:  # inject states to the first submod (might be fw_gm or step_gm but not bw_gm)
-                try:
-                    injected_states[arg.name] = name2tensor.pop(arg.name)
-                except KeyError:
-                    typ, name = source_name(arg.name)
-                    if typ == 'params' and submod_type == 'step':
-                        pass
-                    else:
-                        raise RuntimeError(f"{typ}:{name}({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}")
-
+    def extract_output(node):
         # process output
         outputs_spec = []
         call_module_users = defaultdict(set)
@@ -809,21 +803,110 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
         ]
         if any(getitem_users):  # output is tuple
             assert all(getitem_users), "determined by ed_split_module"
-            for output in node.users:
-                outputs_spec.append(output.name)
-                for user in output.users:
-                    if user.op == 'call_module':
-                        call_module_users[output.name].add(user.name)
+            for gi in node.users:
+                outputs_spec.append(gi.name)
+                for gi_user in gi.users:
+                    if gi_user.op == 'call_module':
+                        call_module_users[gi.name].add(gi_user.name)
         else:  # output is value
             assert not any(getitem_users)
             outputs_spec.append(node.name)
             for user in node.users:
                 if user.op == 'call_module':
                     call_module_users[node.name].add(user.name)
+        return outputs_spec, call_module_users
+
+    def extract_fw_submod(node, submod):
+        # process input
+        inputs_spec = []
+        inputs_users = []
+        injected_states = {
+            StateType.PARAMS: {},
+            StateType.BUFFERS: {},
+        }
+
+        for arg in node.args:
+            inputs_spec.append(arg.name)
+            inputs_users.append({user.name for user in arg.users})
+            states_used_by[arg.name].append(node.name)
+            try:
+                if arg.name in inv_params:
+                    injected_states[StateType.PARAMS][arg.name] = params.pop(inv_params[arg.name])
+                elif arg.name in inv_buffers:  # inject states to the first submod
+                    injected_states[StateType.BUFFERS][arg.name] = buffers.pop(inv_buffers[arg.name])
+            except KeyError:
+                name = inv_params[arg.name] if arg.name in inv_params else inv_buffers[arg.name]
+                typ = StateType.PARAMS if arg.name in inv_params else StateType.BUFFERS
+                raise RuntimeError(f"{typ}:{name}({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}")
+
+        # process output
+        outputs_spec, call_module_users = extract_output(node)
 
         assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
                     or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
-                    or hasattr(submod, 'name'))
+                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
+
+        submod.submod_type = SubmodType.FW
+        submod.inputs_spec = inputs_spec
+        submod.injected_states = injected_states
+        submod.outputs_spec = outputs_spec
+        submod.call_module_users = call_module_users
+        submod.name = node.target
+
+        return submod
+
+    def extract_bw_submod(node, submod):
+        # process input
+        inputs_spec = []
+        inputs_users = []
+        for arg in node.args:
+            inputs_spec.append(arg.name)
+            inputs_users.append({user.name for user in arg.users})
+            states_used_by[arg.name].append(node.name)
+
+        # process output
+        outputs_spec, call_module_users = extract_output(node)
+        assert not (hasattr(submod, 'inputs_spec')
+                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
+                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
+
+        submod.submod_type = SubmodType.BW
+        submod.inputs_spec = inputs_spec
+        submod.outputs_spec = outputs_spec
+        submod.call_module_users = call_module_users
+        submod.name = node.target
+
+        return submod
+
+    def extract_step_submod(node, submod):
+        # process input
+        inputs_spec = []
+        inputs_users = []
+
+        injected_states = {
+            StateType.OPTIMSTATES: {},
+        }
+        for arg in node.args:
+            inputs_spec.append(arg.name)
+            inputs_users.append({user.name for user in arg.users})
+            states_used_by[arg.name].append(node.name)
+            if arg.name in inv_optimstates:  # inject states to the first submod (might be fw_gm or step_gm but not bw_gm)
+                try:
+                    torch_state_name = inv_optimstates[arg.name]
+                    injected_states[StateType.OPTIMSTATES][arg.name] = optimstates[torch_state_name].pop(ph_name_to_optimstates_type[arg.name])
+                except KeyError:
+                    name = inv_optimstates[arg.name]
+                    typ = StateType.OPTIMSTATES
+                    assert False, f"Please report this, {typ}:{name}({arg.name}) is found used by multiple step submods {states_used_by[arg.name]}"
+
+        # process output
+            outputs_spec, call_module_users = extract_output(node)
+
+        assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
+                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
+                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
+        
+        submod.submod_type = SubmodType.STEP
         submod.inputs_spec = inputs_spec
         submod.injected_states = injected_states
         submod.outputs_spec = outputs_spec
@@ -834,44 +917,54 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
 
     current_stateful_fw_bw = None
     compiled_stages = []
-    submod_cnt = 0
+    submod_idx = 0
     for node in splited_global.graph.nodes:
         if node.op == 'call_module':
-            submod_cnt += 1
-            submod_global_name = node.target
-            submod_global = getattr(splited_global, submod_global_name)
-            if submod_cnt % 2 :  # fw bw gm
-                splited_fw_bw_gm, part_cnt = split_by(submod_global, torch.ops.easydist.fw_bw_split.default)
+            assert len(node.kwargs) == 0, "splited_model should have no kwargs"
+            submod = getattr(splited_global, node.target)
+            if submod_idx % 2 == 0:  # fw or fw_bw gm
+                splited_fw_bw_gm, part_cnt = split_by(submod, torch.ops.easydist.fw_bw_split.default)
+                save_graphviz_dot(splited_fw_bw_gm, f"fw_bw.dot")
                 assert part_cnt == nstages * 2 if is_backward_called else nstages, "part_cnt should be nstages * 2 if backward is called"
                 stateful_fw_bw = []
+                fw_bw_submod_idx = 0
                 for n in splited_fw_bw_gm.graph.nodes:
-                    if n.op == 'call_module':  # extrace submods
-                        assert 'submod_' == n.target[:7] and len(
-                            n.kwargs) == 0, "splited_model should have no kwargs"
-                        idx = int(n.target[7:])
-                        submod = getattr(splited_fw_bw_gm, n.target)
-                        stateful_fw_bw.append(gen_stateful_submod(n, submod, 'fw' if (not is_backward_called or idx < part_cnt // 2) else 'bw'))
+                    if n.op == 'call_module':  # extract submods
+                        assert len(n.kwargs) == 0, "splited_model should have no kwargs"
+                        fw_or_bw_submod = getattr(splited_fw_bw_gm, n.target)
+                        stateful_fw_bw.append(
+                            extract_fw_submod(n, fw_or_bw_submod) if (not is_backward_called or fw_bw_submod_idx < part_cnt // 2)
+                            else extract_bw_submod(n, fw_or_bw_submod)
+                        )
+                        fw_bw_submod_idx += 1
                 assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
                 current_stateful_fw_bw = stateful_fw_bw
             else:  # optimizer gm
                 assert is_backward_called and current_stateful_fw_bw is not None, "There should be a stateful_bw_fw before optimizer step"
-                step_gm_global = gen_stateful_submod(node, submod_global, 'step')
+                step_gm_global = extract_step_submod(node, submod)
                 for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                         reversed(current_stateful_fw_bw[nstages:])):
                     compiled_stage = CompiledStage(fw_gm, bw_gm, step_gm_global)
                     compiled_stages.append(compiled_stage)
 
                 assert len(
-                    step_gm_global.injected_states
+                    step_gm_global.injected_states[StateType.OPTIMSTATES]
                 ) == 0, "All states of step_gm_global should have been injected to step_gm"
                 current_stateful_fw_bw = None
+            submod_idx += 1
 
-    if not len(name2tensor) == 0:
-        debugging_info = ""
-        for name in name2tensor:
-            typ, src_name = source_name(name)
-            debugging_info += f"{typ}: {name}({src_name}) "
-        debugging_info = f"Some states were erased, if this is as intended, set strict=False\nErased: {debugging_info}"
+
+    if params or buffers or any(optimstates.values()):
+        debugging_info = textwrap.dedent(f"""
+            Some states were erased, if this is as intended, set strict=False
+            Erased: 
+                Params: 
+                    {' '.join(params)}
+                Buffers: 
+                    {' '.join(buffers)}
+                Optimstates: 
+                    {' '.join(optimstates)}
+            """)
         if strict:
             raise RuntimeError(debugging_info)
         else:
@@ -896,7 +989,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
 
     for node in splited_fw_bw_gm.graph.nodes:
         if node.op == 'placeholder':
-            if node.name not in all_tensor_names_flatten and len(node.users) > 0:
+            if len(node.users) > 0 and node.name not in all_states_names_flatten:
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
             if is_backward_called: # fw_bw
@@ -934,7 +1027,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
                                 for arg_name in stage.bw_func_args})
                     name_to_stage_idx[node_name] = stage_idx
                     for output in stage.bw_gm.outputs_spec:
-                        if not output in global_outputs_names:
+                        if not output in outputs_names_flatten:
                             env[output] = g.create_node(
                                 name=output,
                                 op='call_function',
@@ -979,7 +1072,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
 
     save_graphviz_dot(gm, 'gm')
     def process_args_kwargs(*args, move_to_device=False, **kwargs):
-        args_names, kwargs_names = global_ph_names_unflatten[-2:]
+        args_names, kwargs_names = phs_names_unflatten[-2:]
         stage_kwargs = [{} for _ in range(nstages)]
         assert len(args) == len(args_names), "args should have the same length as args_names"
         for arg_name, arg_val in zip(args_names, args):
@@ -998,7 +1091,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, init_i
             stage_kwargs[stage_idx][kwargs_names[k]] = v
         return stage_kwargs
 
-    out2idx = {name: i for i, name in enumerate(global_outputs_names)}
+    out2idx = {name: i for i, name in enumerate(outputs_names_flatten)}
 
     def process_outputs(outputs):
         out_flatten = [None] * (max(out2idx.values()) + 1)
