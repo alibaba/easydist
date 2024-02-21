@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import logging
 import operator
 import textwrap
@@ -533,6 +534,9 @@ class CompiledStageBase(ABC):
     @abstractmethod
     def state_dict(self):...
 
+    @abstractmethod
+    def get_params_and_grads(self, outputs):...
+
 class StateType(Enum):
     PARAMS = "params"
     BUFFERS = "buffers"
@@ -542,6 +546,77 @@ class SubmodType(Enum):
     FW = "fw"
     BW = "bw"
     STEP = "step"
+
+@dataclass
+class CompiledMeta:
+    nstages: int
+
+    node_to_stage_idx: Dict[str, int]
+
+    # input meta
+    params_names_unflatten: Dict[str, str]
+    buffers_names_unflatten: Dict[str, str]
+    optimstates_names_unflatten: Dict[str, Dict[str, str]]
+    args_names_unflatten: Tuple[str, ...]
+    kwargs_names_unflatten: Dict[str, str]
+
+    # node name to torch name mapping
+    inv_params: Dict[str, str]
+    inv_buffers: Dict[str, str]
+    inv_optimstates: Dict[str, str]
+    inv_optimstates_type: Dict[str, str]
+
+    # output meta
+    maybe_updated_params_names_unflatten: Dict[str, str]
+    maybe_updated_buffers_names_unflatten: Dict[str, str]
+    updated_optimstates_names_unflatten: Dict[str, Dict[str, str]]
+    nones_or_grads_names_unflatten: Dict[str, str]
+    returns_names_unflatten: Union[Tuple[str, ...]]
+
+
+
+def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
+    nstages = compiled_meta.nstages
+    args_names_unflatten = compiled_meta.args_names_unflatten
+    kwargs_names_unflatten = compiled_meta.kwargs_names_unflatten
+    name_to_stage_idx = compiled_meta.node_to_stage_idx
+
+    stage_kwargs = [{} for _ in range(nstages)]
+    assert len(args) == len(args_names_unflatten), "args should have the same length as args_names"
+    for arg_name, arg_val in zip(args_names_unflatten, args):
+        if not arg_name in name_to_stage_idx:
+            continue
+        stage_idx = name_to_stage_idx[arg_name]
+        if move_to_device:
+            arg_val = arg_val.to(f'cuda:{stage_idx}') # TODO @botbw: improve this
+        stage_kwargs[stage_idx][arg_name] = arg_val
+    
+    assert set(kwargs.keys()) == set(kwargs_names_unflatten.keys()), "kwargs should have the same keys as kwargs_names"
+    for k, v in kwargs.items():
+        if not k in name_to_stage_idx:
+            continue
+        stage_idx = name_to_stage_idx[k]
+        stage_kwargs[stage_idx][kwargs_names_unflatten[k]] = v
+    return stage_kwargs
+
+def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
+    maybe_updated_params_names_unflatten = compiled_meta.maybe_updated_params_names_unflatten
+    maybe_updated_buffers_names_unflatten = compiled_meta.maybe_updated_buffers_names_unflatten
+    updated_optimstates_names_unflatten = compiled_meta.updated_optimstates_names_unflatten
+    nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_names_unflatten
+    returns_names_unflatten = compiled_meta.returns_names_unflatten
+
+    ret = []
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_params_names_unflatten.items()})
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_buffers_names_unflatten.items()})
+    optimstates = defaultdict(dict)
+    for torch_name, state_dict in updated_optimstates_names_unflatten.items():
+        for typ, ph_name in state_dict.items():
+            optimstates[torch_name][typ] = outputs_dict[ph_name]
+    ret.append(dict(optimstates))
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in nones_or_grads_names_unflatten.items()})
+    ret.append(tuple(outputs_dict[node_name] for node_name in returns_names_unflatten))
+    return ret
 
 # TODO @botbw: simplify
 def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delayed_init=False, strict=True):
@@ -584,11 +659,11 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
     inv_params = {arg: param_name for param_name, arg in params_names_unflatten.items()}
     inv_buffers = {arg: buffer_name for buffer_name, arg in buffers_names_unflatten.items()}
     inv_optimstates = {}
-    ph_name_to_optimstates_type = {}
+    inv_optimstates_type = {}
     for param_key, state in optimstates_names_unflatten.items():
         for typ, ph_name in state.items():
             inv_optimstates[ph_name] = param_key
-            ph_name_to_optimstates_type[ph_name] = typ
+            inv_optimstates_type[ph_name] = typ
 
     splited_global, part_cnt = split_by(traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
@@ -708,13 +783,12 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
                     raise RuntimeError(f"output {output_name} not sure where to go")
             return ret
 
-        def step(self, activations=None, outputs=None):
+        def step(self, params_and_grads=None):
             if not self.has_step():
                 raise NotImplementedError("This compiled stage doesn't contain step_gm")
 
-            if activations is None or outputs is None:
-                activations = self.activation_nodes
-                outputs = self.outputs
+            if params_and_grads is None:
+                params_and_grads = self.outputs
 
             kwargs = {}
             for arg_name in self.step_gm_args:
@@ -723,17 +797,17 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
                 elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
                     kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
                 elif arg_name in nones_or_grads_names_unflatten.values(): # grads
-                    kwargs[arg_name] = outputs[arg_name]
+                    kwargs[arg_name] = params_and_grads[arg_name]
                 else:
                     raise RuntimeError(f"arg {arg_name} not sure where to go")
             
             rets = _to_tuple(self.step_gm(**kwargs))
 
             for output, ret in zip(self.step_gm.outputs_spec, rets):
-                if output in maybe_updated_params_names_unflatten.values():
-                    outputs[output] = ret
-                elif output in updated_optimstates_names_flatten:
-                    outputs[output] = ret
+                if output in maybe_updated_params_names_unflatten.values(): # params
+                    params_and_grads[output] = ret
+                elif output in updated_optimstates_names_flatten: # optimstates
+                    params_and_grads[output] = ret
                 else:
                     raise RuntimeError(f"output {output} not sure where to go")
 
@@ -759,9 +833,14 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
 
         def optimizer_state_dict(self):
             optim_state = defaultdict(dict)
-            for name, tensor in self.fw_gm.injected_states[StateType.OPTIMSTATES].items():
-                optim_state[inv_optimstates[name]][ph_name_to_optimstates_type[name]] = tensor
+            for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
+                optim_state[inv_optimstates[name]][inv_optimstates_type[name]] = tensor
             return dict(optim_state)
+
+        def get_params_and_grads(self, local_outputs_dict_after_fw_bw: dict):
+            return \
+                {node_name: local_outputs_dict_after_fw_bw[node_name] for _, node_name in maybe_updated_params_names_unflatten.items() if node_name in local_outputs_dict_after_fw_bw}, \
+                    {node_name: local_outputs_dict_after_fw_bw[node_name] for _, node_name in nones_or_grads_names_unflatten.items() if node_name in local_outputs_dict_after_fw_bw}
 
     states_used_by = defaultdict(list)
 
@@ -864,7 +943,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
             if arg.name in inv_optimstates:  # inject states to the first submod (might be fw_gm or step_gm but not bw_gm)
                 try:
                     torch_state_name = inv_optimstates[arg.name]
-                    injected_states[StateType.OPTIMSTATES][arg.name] = optimstates[torch_state_name].pop(ph_name_to_optimstates_type[arg.name])
+                    injected_states[StateType.OPTIMSTATES][arg.name] = optimstates[torch_state_name].pop(inv_optimstates_type[arg.name])
                 except KeyError:
                     name = inv_optimstates[arg.name]
                     typ = StateType.OPTIMSTATES
@@ -1039,42 +1118,28 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
     def eliminate_dead_node():
         raise RuntimeError("This method should be called since the graph doesn't have output node")
     setattr(g, 'eliminate_dead_node', eliminate_dead_node)
-    gm = fx.GraphModule({}, g)
+    local_gm = fx.GraphModule({}, g)
 
-    def process_inputs(*args, move_to_device=False, **kwargs):
-        stage_kwargs = [{} for _ in range(nstages)]
-        assert len(args) == len(args_names_unflatten), "args should have the same length as args_names"
-        for arg_name, arg_val in zip(args_names_unflatten, args):
-            if not arg_name in name_to_stage_idx:
-                continue
-            stage_idx = name_to_stage_idx[arg_name]
-            if move_to_device:
-                arg_val = arg_val.to(f'cuda:{stage_idx}') # TODO @botbw: improve this
-            stage_kwargs[stage_idx][arg_name] = arg_val
-        
-        assert set(kwargs.keys()) == set(kwargs_names_unflatten.keys()), "kwargs should have the same keys as kwargs_names"
-        for k, v in kwargs.items():
-            if not k in name_to_stage_idx:
-                continue
-            stage_idx = name_to_stage_idx[k]
-            stage_kwargs[stage_idx][kwargs_names_unflatten[k]] = v
-        return stage_kwargs
+    compiled_meta = CompiledMeta(
+        nstages=nstages,
+        node_to_stage_idx=name_to_stage_idx,
+        params_names_unflatten=params_names_unflatten,
+        buffers_names_unflatten=buffers_names_unflatten,
+        optimstates_names_unflatten=optimstates_names_unflatten,
+        args_names_unflatten=args_names_unflatten,
+        kwargs_names_unflatten=kwargs_names_unflatten,
+        inv_params=inv_params,
+        inv_buffers=inv_buffers,
+        inv_optimstates=inv_optimstates,
+        inv_optimstates_type=inv_optimstates_type,
+        maybe_updated_params_names_unflatten=maybe_updated_params_names_unflatten,
+        maybe_updated_buffers_names_unflatten=maybe_updated_buffers_names_unflatten,
+        updated_optimstates_names_unflatten=updated_optimstates_names_unflatten,
+        nones_or_grads_names_unflatten=nones_or_grads_names_unflatten,
+        returns_names_unflatten=returns_names_unflatten
+    )
 
-
-    def process_outputs(outputs_dict):
-        ret = []
-        ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_params_names_unflatten.items()})
-        ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_buffers_names_unflatten.items()})
-        optimstates = defaultdict(dict)
-        for torch_name, state_dict in updated_optimstates_names_unflatten.items():
-            for typ, ph_name in state_dict.items():
-                optimstates[torch_name][typ] = outputs_dict[ph_name]
-        ret.append(dict(optimstates))
-        ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in nones_or_grads_names_unflatten.items()})
-        ret.append(tuple(outputs_dict[node_name] for node_name in returns_names_unflatten))
-        return ret
-
-    return process_inputs, process_outputs, compiled_stages, gm, name_to_stage_idx
+    return compiled_meta, compiled_stages, local_gm
 
 @before_split_register(torch.Tensor)
 def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:

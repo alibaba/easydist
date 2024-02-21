@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+from functools import reduce
 from heapq import merge
 import logging
 import operator
@@ -11,9 +12,11 @@ import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_aggregate, map_arg
 from torch.nn.parallel import DistributedDataParallel
+import torch.utils._pytree as pytree
 
 from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.utils import flatten_args, modify_graph_op_device, QualnameMapMixin, map_debug_info
+from easydist.torch.experimental.pp.utils import modify_graph_op_device, map_debug_info
+from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStageBase, process_inputs, process_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -53,35 +56,37 @@ class StageKwargPlaceholder:
 class PipelineStage:
     def __init__(
         self,
-        node_to_stage,
+        local_gm: fx.GraphModule,
+        compiled_meta: CompiledMeta,
+        stage_idx: int,
+        compiled_stage: CompiledStageBase,
         node_metas,
-        split_gm,
-        compiled_stages,
-        num_stages,
         num_chunks,
         args_chunk_spec,
         kwargs_chunk_spec,
         outputs_chunk_spec,
-        stage_index: int,
         device: torch.device,
         group: dist.ProcessGroup = None,
     ):
-        self.node_to_stage = node_to_stage
+        self.local_gm = local_gm
+        self.compiled_meta = compiled_meta
+        self.stage_idx = stage_idx
+        self.compiled_stage = compiled_stage
         self.node_metas = node_metas
-        compiled_stage = compiled_stages[stage_index]
-        self.stage_index = stage_index
-        self.nstages = num_stages
-        self.chunks = num_chunks
+        self.num_chunks = num_chunks
         self.args_chunk_spec = args_chunk_spec
         self.kwargs_chunk_spec = kwargs_chunk_spec
         self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
         self.group = group
 
-        if dist.get_world_size(self.group) > self.nstages:
-            raise RuntimeError(
-                "Number of ranks is larger than number of stages, some ranks are unused"
-            )
+        self.num_stages = compiled_meta.nstages
+        self.node_to_stage_idx = compiled_meta.node_to_stage_idx
+        self.name = f'stage_{stage_idx}'
+
+
+        if dist.get_world_size(self.group) > self.num_stages:
+            raise RuntimeError("Number of ranks is larger than number of stages, some ranks are unused")
 
         # `group_rank` is rank in process group `group`.
         self.group_rank = dist.get_rank(group)
@@ -91,21 +96,11 @@ class PipelineStage:
         # Grad send requests of all chunk
         self.all_bw_send_reqs: List[dist.Work] = []
         # Caching chunk outputs for final output merge or reduction
-        self.saved_for_bw_chunks: List[Any] = [{} for _ in range(self.chunks)]
-        self.outputs_chunks: List[Any] = [{} for _ in range(self.chunks)]
-
-        self.split_gm = split_gm
-        self.stage = compiled_stage
-        self.name, self.submod = f'stage_{stage_index}', compiled_stage.fw_gm
-        logger.info(
-            f"[{self.group_rank}] "
-            f"Creating PipelineStage:\n"
-            f"{self.submod}"
-        )
-
+        self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
+        self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         # Find my forward node in graph
         self.fw_node = None
-        for node in self.split_gm.graph.nodes:
+        for node in self.local_gm.graph.nodes:
             if node.name == f'{self.name}_fw':
                 assert self.fw_node is None, "Multiple forward nodes found"
                 self.fw_node = node
@@ -114,14 +109,14 @@ class PipelineStage:
         
         # Find my backward node in graph
         self.bw_node = None
-        for node in self.split_gm.graph.nodes:
+        for node in self.local_gm.graph.nodes:
             if node.name == f'{self.name}_bw':
                 assert self.bw_node is None, "Multiple backward nodes found"
                 self.bw_node = node
 
         # Find my step node in graph
         self.step_node = None
-        for node in self.split_gm.graph.nodes:
+        for node in self.local_gm.graph.nodes:
             if node.name == f'{self.name}_step':
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
@@ -130,7 +125,7 @@ class PipelineStage:
         # In interleaved case, `group_rank` is stage index % group size.
         self.stage_index_to_group_rank: Dict[int, int] = {}
         pg_world_size = dist.get_world_size(group)
-        for i in range(self.nstages):
+        for i in range(self.num_stages):
             # We only support wrapped-around interleaving
             peer_rank = i % pg_world_size
             self.stage_index_to_group_rank.setdefault(i, peer_rank)
@@ -148,12 +143,15 @@ class PipelineStage:
         # Note: we cannot move meta module to real devices because meta tensors
         # do not support to() method. One needs to do an in-place tensor swap in
         # that case.
-        assert not any(
-            isinstance(p, FakeTensor) or p.is_meta
-            for p in self.submod.parameters()
-        )
-        for _, tensor in self.stage.fw_gm.injected_states.items():
-            tensor.to(self.device)
+        for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(self.device)
+        for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(self.device)
+        for name, tensor in self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;
@@ -161,39 +159,33 @@ class PipelineStage:
         # code.  Here we provide a workaround for users to manually modify the
         # "device" kwarg of operations. Such operation may include:
         # `torch.ones`, `torch.zeros`, `torch.rand`, etc.
-        modify_graph_op_device(self.stage.fw_gm, self.device)
-        modify_graph_op_device(self.stage.bw_gm, self.device)
-        if self.stage.has_step():
-            modify_graph_op_device(self.stage.step_gm, self.device)
+        modify_graph_op_device(self.compiled_stage.fw_gm, self.device)
+        if self.compiled_stage.has_bw():
+            modify_graph_op_device(self.compiled_stage.bw_gm, self.device)
+        if self.compiled_stage.has_step():
+            modify_graph_op_device(self.compiled_stage.step_gm, self.device)
 
     def is_first(self):
-        return self.stage_index == 0
+        return self.stage_idx == 0
 
     def is_last(self):
-        return self.stage_index == self.nstages - 1
+        return self.stage_idx == self.num_stages - 1
 
     def _prepare_send_recv_infra(self):
         """
         Create send/recv infrastructures for activations (during forward) and
         gradients (during backward)
         """
-        # chunk : Tuple of arg buffers
-        self.fw_args_recv_info: Dict[int, Tuple] = {}
+
         # chunk : Dict of kwarg buffers
         self.fw_kwargs_recv_info: Dict[int, Dict] = {}
-        for chunk in range(self.chunks):
-            (
-                self.fw_args_recv_info[chunk],
-                self.fw_kwargs_recv_info[chunk],
-            ) = self._create_act_recv_buffers(self.fw_node)
+        for chunk in range(self.num_chunks):
+            self.fw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.fw_node)
 
         self.bw_args_recv_info: Dict[int, Tuple] = {}
         self.bw_kwargs_recv_info: Dict[int, Dict] = {}
-        for chunk in range(self.chunks):
-            (
-                self.bw_args_recv_info[chunk],
-                self.bw_kwargs_recv_info[chunk],
-            ) = self._create_act_recv_buffers(self.bw_node)
+        for chunk in range(self.num_chunks):
+            self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.bw_node)
 
         # Send info during forward for each activation
         self.fw_act_send_info = self._create_act_send_info(self.fw_node)
@@ -204,7 +196,7 @@ class PipelineStage:
         self,
         node_name: str,
     ):
-        return self.node_to_stage[node_name]
+        return self.node_to_stage_idx[node_name]
 
     def _create_act_recv_buffers(
         self,
@@ -239,19 +231,11 @@ class PipelineStage:
                 buffer,
             )
 
-        # `args` is a Tuple, hence we will have:
-        # Tuple[RecvInfo]
-        args_recv_info = map_arg(node.args, create_recv_tensor)
-
         # `kwargs` is a Dict, hence we will have:
         # Dict[keyword, RecvInfo]
         kwargs_recv_info = map_arg(node.kwargs, create_recv_tensor)
 
-        logger.info(
-            f"[{self.group_rank}] "
-            f"Activation recv / args info: {args_recv_info}"
-        )
-        return args_recv_info, kwargs_recv_info
+        return kwargs_recv_info
 
     def find_dst_rank(
         self,
@@ -313,16 +297,14 @@ class PipelineStage:
             self.args_split, self.kwargs_split = split_args_kwargs_into_chunks(
                 args,
                 kwargs,
-                self.chunks,
+                self.num_chunks,
                 None, #self.pipe.args_chunk_spec,
                 None, #self.pipe.kwargs_chunk_spec,
             )
 
     def _recv_and_fill_inputs(
         self,
-        args_split,
         kwargs_split,
-        args_recv_info,
         kwargs_recv_info,
         chunk: int,
     ):
@@ -330,23 +312,6 @@ class PipelineStage:
         recv_reqs: List[dist.Work] = []
 
         act_recv = self.recv_tensor_fn(recv_reqs)
-
-        chunk_args_list: List = []
-        if args_split:
-            chunk_args = args_split[chunk]
-            chunk_args_list = list(chunk_args)
-
-        def recv_args(info):
-            if isinstance(info, RecvInfo):
-                # This is an activation to receive
-                return act_recv(info)
-            else:
-                return chunk_args_list.pop(0)  # type: ignore[has-type]
-
-        composite_args = map_aggregate(
-            args_recv_info[chunk],
-            recv_args,
-        )
 
         chunk_kwargs = {}
         if kwargs_split:
@@ -364,7 +329,7 @@ class PipelineStage:
         for work in recv_reqs:
             work.wait()
 
-        return composite_args, composite_kwargs
+        return composite_kwargs
 
     def _send_output_dict(
         self,
@@ -397,16 +362,14 @@ class PipelineStage:
         self,
         chunk: int,
     ):
-        _, composite_kwargs = self._recv_and_fill_inputs(
-            self.args_split,
+        composite_kwargs = self._recv_and_fill_inputs(
             self.kwargs_split,
-            self.fw_args_recv_info,
             self.fw_kwargs_recv_info,
             chunk
         )
 
         # Compute forward
-        output = self.stage.forward(self.saved_for_bw_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs)
+        output = self.compiled_stage.forward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs)
 
         assert isinstance(output, dict), "Only dict output is supported"
         logger.debug(map_debug_info(output))
@@ -422,31 +385,34 @@ class PipelineStage:
         if not self.bw_node:
             return {}
 
-        _, composite_kwargs = self._recv_and_fill_inputs(
-            None,
-            None,
+        composite_kwargs = self._recv_and_fill_inputs(
             self.bw_args_recv_info,
             self.bw_kwargs_recv_info,
             bwd_chunk
         )
 
         # `stage_backward` node does not have `args`, only `kwargs`
-        grads_input = self.stage.backward(self.saved_for_bw_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk], **composite_kwargs)
+        grads_input = self.compiled_stage.backward(self.activations_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk], **composite_kwargs)
 
         grad_send_reqs = self._send_output_dict(self.bw_act_send_info, grads_input)
         self.all_bw_send_reqs += grad_send_reqs
 
-    def merge_saved_for_bw(self) -> Dict[str, Any]:
-        return merge_chunks(
-            self.saved_for_bw_chunks,
-            self.outputs_chunk_spec,
-        )
-
     def step(self):
         if self.step_node is not None:
-            saved_for_bw = self.merge_saved_for_bw()
-            outputs = self.merge_output_chunks()
-            self.stage.step(saved_for_bw, outputs)
+            grads = []
+            for chunk in self.outputs_chunks:
+                params, grads_batch = self.compiled_stage.get_params_and_grads(chunk)
+                grads.append(grads_batch)
+            
+            def reduce_grads(a, b):
+                return {k: torch.add(a[k], b[k]) for k in a.keys()}
+            grads = reduce(reduce_grads, grads)
+
+            params_and_grads = {
+                **params,
+                **grads,
+            }
+            self.compiled_stage.step(params_and_grads)
 
     def clear_runtime_states(self):
         # Activation send requests of all chunk
@@ -454,24 +420,35 @@ class PipelineStage:
         # Grad send requests of all chunk
         self.all_bw_send_reqs.clear()
         # Caching chunk outputs for final output merge or reduction
-        self.saved_for_bw_chunks.clear()
+        self.activations_chunks.clear()
         self.outputs_chunks.clear()
-        for _ in range(self.chunks):
-            self.saved_for_bw_chunks.append({})
+        for _ in range(self.num_chunks):
+            self.activations_chunks.append({})
             self.outputs_chunks.append({})
 
-    def merge_output_chunks(self) -> Dict[str, Any]: # todo output的param被当作minibatch给merge了
-        output_chunks_without_injected_states = [
-            {k: v for k, v in chunk.items() if k not in self.stage.fw_gm.injected_states and k not in self.stage.step_gm.injected_states}
-            for chunk in self.outputs_chunks
-        ]
-        outputs = merge_chunks(
-            output_chunks_without_injected_states,
-            self.outputs_chunk_spec,
-        )
-        outputs.update(self.stage.fw_gm.injected_states)
-        outputs.update(self.stage.step_gm.injected_states)
-        return outputs
+    def merge_output_chunks(self) -> Dict[str, Any]:
+        grads = []
+        rets = []
+        for chunk in self.outputs_chunks:
+            params, buffers, optimstates, grads_batch, rets_chunk = process_outputs(self.compiled_meta, chunk)
+            grads.append(grads_batch)
+            rets.append(rets_chunk)
+
+        # TODO @botbw: loss here
+        def reduce_returns(a, b):
+            return torch.add(a[0], b[0])
+
+        returns = reduce(reduce_returns, rets)
+        # returns = merge_chunks(
+        #     rets_chunk,
+        #     self.outputs_chunk_spec,
+        # )
+
+        # sum list of tensors
+        def reduce_grads(a, b):
+            return {k: torch.add(a[k], b[k]) for k in a.keys()}
+        grads = reduce(reduce_grads, grads)
+        return params, buffers, optimstates, grads, returns
 
     @torch.no_grad
     def __call__(self, *args, **kwargs) -> None:
@@ -482,12 +459,12 @@ class PipelineStage:
         self.split_inputs(args, kwargs)
 
         # Forward pass of all chunks
-        for chunk in range(self.chunks):
+        for chunk in range(self.num_chunks):
             self.forward_one_chunk(chunk)
             logger.debug(f"[{self.group_rank}] Forwarded chunk {chunk}")
 
         # Backward starts here
-        for bwd_chunk in range(self.chunks):
+        for bwd_chunk in range(self.num_chunks):
             self.backward_one_chunk(bwd_chunk)
             logger.debug(f"[{self.group_rank}] Backwarded chunk {bwd_chunk}")
 
@@ -505,9 +482,9 @@ class PipelineStage:
         logger.debug(f"[{self.group_rank}] All sends finished")
 
     def all_gather_outputs(self, rank):
-        outputs = [None for _ in range(self.nstages)]
+        outputs = [None for _ in range(self.num_stages)]
         output_dict = self.merge_output_chunks()
-        inv = self.stage.outputs_to_torch_name
+        inv = self.compiled_stage.outputs_to_torch_name
         output_dict = {(inv[k] if k in inv else k): v for k, v in output_dict.items()}
         dist.gather_object(
             output_dict,
@@ -517,8 +494,8 @@ class PipelineStage:
         return outputs
 
     def all_gather_state_dict(self, rank):
-        state_dicts = [None for _ in range(self.nstages)]
-        state_dict = self.stage.state_dict()
+        state_dicts = [None for _ in range(self.num_stages)]
+        state_dict = self.compiled_stage.state_dict()
         dist.gather_object(
             state_dict,
             state_dicts if self.group_rank == rank else None,
@@ -527,8 +504,8 @@ class PipelineStage:
         return state_dicts
     
     def all_gather_optimizer_state_dict(self, rank):
-        optimizer_state_dicts = [None for _ in range(self.nstages)]
-        optimizer_state_dict = self.stage.optimizer_state_dict()
+        optimizer_state_dicts = [None for _ in range(self.num_stages)]
+        optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
         dist.gather_object(
             optimizer_state_dict,
             optimizer_state_dicts if self.group_rank == rank else None,

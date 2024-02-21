@@ -3,6 +3,7 @@ import os
 import random
 from contextlib import nullcontext
 from functools import partial
+from threading import local
 from typing import cast
 
 import numpy as np
@@ -22,13 +23,15 @@ from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annot
                                                              PipeSplitWrapper,
                                                              compile_pipeline,
                                                              split_into_equal_size,
-                                                             set_backward_flag)
+                                                             set_backward_flag, process_inputs, process_outputs)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.torch.experimental.pp.PipelineStage import PipelineStage
 import torch.distributed as dist
+
+from tqdm import tqdm 
 
 def seed(seed=42):
     # Set seed for PyTorch
@@ -44,10 +47,12 @@ def seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+criterion = torch.nn.CrossEntropyLoss()
+
 def train_step(input, label, model, opt):
     opt.zero_grad()
     out = model(input)
-    loss = cross_entropy(out, label)
+    loss = criterion(out, label)
     loss.backward()
     opt.step()
     return loss
@@ -63,8 +68,8 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     else:
         device = torch.device("cpu")
 
-    module = module.train().to(device)
-    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    module = module.train().to('cuda:0')
+    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
         nstages = len(split_ann_or_policy) + 1
@@ -83,7 +88,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     x, y = next(iter(train_dataloader))
     
-    args = [x.to(device), y.to(device), module, opt]
+    args = [x.to('cuda:0'), y.to('cuda:0'), module, opt]
     kwargs = {}
 
     ##################################################################################################
@@ -156,59 +161,74 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     stateless_func_args = [params, buffers, named_states, args, kwargs]
 
 
-    process_args_kwargs, process_outputs, compiled_stages, gm, node_to_stage = compile_pipeline(
-        traced_stateless_func, nstages, stateless_func_args, strict=False)
-
-    rand_input1 = rand_input_gen_method()
+    compiled_meta, compiled_stages, local_gm = compile_pipeline(
+        traced_stateless_func, nstages, stateless_func_args, strict=True)
 
     pipe = PipelineStage(
-        node_to_stage,
-        traced_stateless_func_node_metas,
-        gm,
-        compiled_stages,
-        num_stages=nstages,
+        local_gm=local_gm,
+        compiled_meta=compiled_meta,
+        stage_idx=rank,
+        compiled_stage=compiled_stages[rank],
+        node_metas=traced_stateless_func_node_metas,
         num_chunks=num_chunks,
         args_chunk_spec=None,
         kwargs_chunk_spec=None,
         outputs_chunk_spec=None,
-        stage_index=rank,
         device=device
     )
 
-    epochs = 10
 
-    for _ in range(epochs):
-        for x_batch, y_batch in train_dataloader:
+    if rank == 0:
+        module.eval()
+        correct_cnt = 0
+        all_cnt = 0
+        for x_batch, y_batch in valid_dataloader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            out = module(x_batch)
+            preds = out.argmax(-1)
+            correct_cnt = (preds == y_batch).sum()
+            all_cnt = len(y_batch)
+            correct_cnt += correct_cnt.item()
+            all_cnt += all_cnt
+        print(f'accuracy: {correct_cnt / all_cnt}')
+
+    epochs = 5
+
+    for epoch in range(epochs):
+        print(f'epoch {epoch}:')
+        for i, (x_batch, y_batch) in enumerate(tqdm(train_dataloader, dynamic_ncols=True)):
+            if x_batch.size(0) != batch_size: # need to solve this?
+                continue
+            # print(f'rank {rank} epoch {epoch} batch {i} batch_size {x_batch.size(0)}')
             args = (x_batch, y_batch, module, opt)
             kwargs = {}
-            stage_kwargs = process_args_kwargs(*args, **kwargs, move_to_device=True)
-            if rank == 0:
-                pipe(**stage_kwargs[rank])    
-            else:
-                pipe(**stage_kwargs[rank])
+            stage_kwargs = process_inputs(compiled_meta, *args, **kwargs, move_to_device=True)
+            
+            pipe(**stage_kwargs[rank])    
 
-            state_dicts = pipe.all_gather_state_dict(0)
+        state_dicts = pipe.all_gather_state_dict(0)
+        optimizer_state_dicts = pipe.all_gather_optimizer_state_dict(0)
+        if rank == 0:
+            state_dict = {}
+            for d in state_dicts:
+                state_dict.update(d)
+            module.load_state_dict(state_dict)
+            module.eval()
+            correct_cnt = 0
+            all_cnt = 0
+            for x_batch, y_batch in valid_dataloader:
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                out = module(x_batch)
+                preds = out.argmax(-1)
+                correct_cnt = (preds == y_batch).sum()
+                all_cnt = len(y_batch)
+                correct_cnt += correct_cnt.item()
+                all_cnt += all_cnt
+            print(f'epoch {epoch} accuracy: {correct_cnt / all_cnt}')
 
-            if rank == 0:
-                state_dict = {}
-                for d in state_dicts:
-                    state_dict.update(d)
-                # print(list(state_dict.keys()))
-                module.load_state_dict(state_dict)
-                module.eval()
-                correct_cnt = 0
-                all_cnt = 0
-                for x_batch, y_batch in valid_dataloader:
-                    x_batch = x_batch.to(device)
-                    y_batch = y_batch.to(device)
-                    out = module(x_batch)
-                    preds = out.argmax(-1)
-                    correct_cnt = (preds == y_batch).sum()
-                    all_cnt = len(y_batch)
-                    correct_cnt += correct_cnt.item()
-                    all_cnt += all_cnt
-                print(f'accuracy: {correct_cnt / all_cnt}')
-
+    print("finished")
 
 def gen_rand_input_imagenet():
     return None
