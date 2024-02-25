@@ -1,22 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 from functools import reduce
-from heapq import merge
 import logging
 import operator
-from platform import node
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
-from torch.fx.node import map_aggregate, map_arg
-from torch.nn.parallel import DistributedDataParallel
-import torch.utils._pytree as pytree
+from torch.fx.node import map_arg
 
 from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.utils import modify_graph_op_device, map_debug_info
-from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStageBase, process_inputs, process_outputs
+from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStageBase, process_outputs_non_strict
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +71,6 @@ class PipelineStage:
         self.compiled_stage = compiled_stage
         self.node_metas = node_metas
         self.num_chunks = num_chunks
-        self.args_chunk_spec = args_chunk_spec
         self.kwargs_chunk_spec = kwargs_chunk_spec
         self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
@@ -291,10 +287,10 @@ class PipelineStage:
         return lambda info: self._recv_tensor(info, reqs)
 
     def split_inputs(self, args, kwargs):
-        self.args_split = None
+
         self.kwargs_split = None
         if args or kwargs:
-            self.args_split, self.kwargs_split = split_args_kwargs_into_chunks(
+            _, self.kwargs_split = split_args_kwargs_into_chunks(
                 args,
                 kwargs,
                 self.num_chunks,
@@ -319,7 +315,7 @@ class PipelineStage:
 
         composite_kwargs = {}
 
-        for kw, info in kwargs_recv_info[chunk].items():
+        for kw, info in kwargs_recv_info[chunk].items(): # TODO TODO TODO @botbw: recv info not consistent with send info
             if isinstance(info, RecvInfo):
                 composite_kwargs[kw] = act_recv(info)
             else:
@@ -382,9 +378,6 @@ class PipelineStage:
         self,
         bwd_chunk: int,
     ):
-        if not self.bw_node:
-            return {}
-
         composite_kwargs = self._recv_and_fill_inputs(
             self.bw_args_recv_info,
             self.bw_kwargs_recv_info,
@@ -398,21 +391,19 @@ class PipelineStage:
         self.all_bw_send_reqs += grad_send_reqs
 
     def step(self):
-        if self.step_node is not None:
-            grads = []
-            for chunk in self.outputs_chunks:
-                params, grads_batch = self.compiled_stage.get_params_and_grads(chunk)
-                grads.append(grads_batch)
-            
-            def reduce_grads(a, b):
-                return {k: torch.add(a[k], b[k]) for k in a.keys()}
-            grads = reduce(reduce_grads, grads)
+        grads = []
+        for chunk in self.outputs_chunks:
+            params, _, _, grads_batch, _ = process_outputs_non_strict(self.compiled_meta, chunk)
+            grads.append(grads_batch)
+        grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
+        params_names_unflatten = self.compiled_meta.params_names_unflatten
+        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
 
-            params_and_grads = {
-                **params,
-                **grads,
-            }
-            self.compiled_stage.step(params_and_grads)
+        params = {params_names_unflatten[k]: v for k, v in params.items()}
+        grads = {nones_or_grads_names_unflatten[k]: v for k, v in grads.items()}
+    
+        params_and_grads = {**params, **grads}
+        self.compiled_stage.step(params_and_grads)
 
     def clear_runtime_states(self):
         # Activation send requests of all chunk
@@ -430,25 +421,14 @@ class PipelineStage:
         grads = []
         rets = []
         for chunk in self.outputs_chunks:
-            params, buffers, optimstates, grads_batch, rets_chunk = process_outputs(self.compiled_meta, chunk)
+            params, buffers, optimstates, grads_batch, rets_chunk = process_outputs_non_strict(self.compiled_meta, chunk)
             grads.append(grads_batch)
             rets.append(rets_chunk)
 
-        # TODO @botbw: loss here
-        def reduce_returns(a, b):
-            return torch.add(a[0], b[0])
+        rets = merge_chunks(rets, self.outputs_chunk_spec)
+        grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
-        returns = reduce(reduce_returns, rets)
-        # returns = merge_chunks(
-        #     rets_chunk,
-        #     self.outputs_chunk_spec,
-        # )
-
-        # sum list of tensors
-        def reduce_grads(a, b):
-            return {k: torch.add(a[k], b[k]) for k in a.keys()}
-        grads = reduce(reduce_grads, grads)
-        return params, buffers, optimstates, grads, returns
+        return params, buffers, optimstates, grads, rets
 
     @torch.no_grad
     def __call__(self, *args, **kwargs) -> None:
@@ -464,9 +444,10 @@ class PipelineStage:
             logger.debug(f"[{self.group_rank}] Forwarded chunk {chunk}")
 
         # Backward starts here
-        for bwd_chunk in range(self.num_chunks):
-            self.backward_one_chunk(bwd_chunk)
-            logger.debug(f"[{self.group_rank}] Backwarded chunk {bwd_chunk}")
+        if self.bw_node is not None:
+            for bwd_chunk in range(self.num_chunks):
+                self.backward_one_chunk(bwd_chunk)
+                logger.debug(f"[{self.group_rank}] Backwarded chunk {bwd_chunk}")
 
         # Wait for all sends to finish
         # TODO: okay to delay the sync till completion of all chunks?
@@ -475,23 +456,23 @@ class PipelineStage:
 
         # Wait for all sends to finish
         # TODO: okay to delay the sync till completion of all chunks?
-        for work in self.all_bw_send_reqs:
-            work.wait()
+        if self.bw_node is not None:
+            for work in self.all_bw_send_reqs:
+                work.wait()
 
-        self.step()
+        if self.step_node is not None:
+            self.step()
         logger.debug(f"[{self.group_rank}] All sends finished")
 
     def all_gather_outputs(self, rank):
-        outputs = [None for _ in range(self.num_stages)]
-        output_dict = self.merge_output_chunks()
-        inv = self.compiled_stage.outputs_to_torch_name
-        output_dict = {(inv[k] if k in inv else k): v for k, v in output_dict.items()}
+        outputs_all_stages = [None for _ in range(self.num_stages)]
+        outputs = self.merge_output_chunks()
         dist.gather_object(
-            output_dict,
-            outputs if self.group_rank == rank else None,
+            outputs,
+            outputs_all_stages if self.group_rank == rank else None,
             dst=rank
         )
-        return outputs
+        return outputs_all_stages
 
     def all_gather_state_dict(self, rank):
         state_dicts = [None for _ in range(self.num_stages)]

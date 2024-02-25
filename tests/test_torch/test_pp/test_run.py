@@ -1,8 +1,9 @@
+from email import generator
 from multiprocessing import process
 import os
 import random
 from contextlib import nullcontext
-from functools import partial
+from functools import partial, reduce
 from threading import local
 from typing import cast
 
@@ -36,6 +37,7 @@ from tqdm import tqdm
 def seed(seed=42):
     # Set seed for PyTorch
     torch.manual_seed(seed)
+    # torch.use_deterministic_algorithms(True)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
@@ -61,7 +63,7 @@ def train_step(input, label, model, opt):
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func, num_chunks=2):
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-
+    seed(42)
     # Figure out device to use
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
@@ -83,8 +85,10 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         ])
     train_data = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
     valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
-    valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
+    g = torch.Generator()
+    g.manual_seed(0)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, generator=g)
+    valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size, generator=g)
 
     x, y = next(iter(train_dataloader))
     
@@ -139,7 +143,6 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         args,
         kwargs,
         num_chunks,
-        None, #self.pipe.args_chunk_spec,
         None, #self.pipe.kwargs_chunk_spec,
     )
 
@@ -193,8 +196,9 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             all_cnt += all_cnt
         print(f'accuracy: {correct_cnt / all_cnt}')
 
-    epochs = 5
-
+    epochs = 10
+    num_batches_tracked = 0
+    num_step = 0
     for epoch in range(epochs):
         print(f'epoch {epoch}:')
         for i, (x_batch, y_batch) in enumerate(tqdm(train_dataloader, dynamic_ncols=True)):
@@ -205,11 +209,34 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             kwargs = {}
             stage_kwargs = process_inputs(compiled_meta, *args, **kwargs, move_to_device=True)
             
-            pipe(**stage_kwargs[rank])    
+        
+            pipe(**stage_kwargs[rank])
+            num_batches_tracked += 1
+            num_step += 1
 
         state_dicts = pipe.all_gather_state_dict(0)
         optimizer_state_dicts = pipe.all_gather_optimizer_state_dict(0)
+        outputs = pipe.all_gather_outputs(0)
         if rank == 0:
+            def reduce_outputs(a, b):
+                ret = []
+                for aa, bb in zip(a, b):
+                    if isinstance(aa, dict):
+                        aa.update(bb)
+                        ret.append(aa)
+                    else:
+                        tup = []
+                        for aaa, bbb in zip(aa, bb):
+                            if aaa is None:
+                                tup.append(bbb)
+                            elif bbb is None:
+                                tup.append(aaa)
+                            else:
+                                raise ValueError('both are not None')
+                        ret.append(tup)
+                return ret
+            _, _, _, _, returns = reduce(reduce_outputs, outputs)
+            print(f'epoch {epoch} loss: {returns[0].sum().item()}')
             state_dict = {}
             for d in state_dicts:
                 state_dict.update(d)

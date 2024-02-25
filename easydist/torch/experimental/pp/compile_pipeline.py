@@ -534,9 +534,6 @@ class CompiledStageBase(ABC):
     @abstractmethod
     def state_dict(self):...
 
-    @abstractmethod
-    def get_params_and_grads(self, outputs):...
-
 class StateType(Enum):
     PARAMS = "params"
     BUFFERS = "buffers"
@@ -613,15 +610,38 @@ def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
     for torch_name, state_dict in updated_optimstates_names_unflatten.items():
         for typ, ph_name in state_dict.items():
             optimstates[torch_name][typ] = outputs_dict[ph_name]
+
     ret.append(dict(optimstates))
     ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in nones_or_grads_names_unflatten.items()})
     ret.append(tuple(outputs_dict[node_name] for node_name in returns_names_unflatten))
     return ret
 
+
+def process_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
+    maybe_updated_params_names_unflatten = compiled_meta.maybe_updated_params_names_unflatten
+    maybe_updated_buffers_names_unflatten = compiled_meta.maybe_updated_buffers_names_unflatten
+    updated_optimstates_names_unflatten = compiled_meta.updated_optimstates_names_unflatten
+    nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_names_unflatten
+    returns_names_unflatten = compiled_meta.returns_names_unflatten
+
+    ret = []
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_params_names_unflatten.items() if node_name in outputs_dict})
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in maybe_updated_buffers_names_unflatten.items() if node_name in outputs_dict})
+    optimstates = defaultdict(dict)
+    for torch_name, state_dict in updated_optimstates_names_unflatten.items():
+        for typ, ph_name in state_dict.items():
+            if ph_name in outputs_dict:
+                optimstates[torch_name][typ] = outputs_dict[ph_name]
+
+    ret.append(dict(optimstates))
+    ret.append({torch_name: outputs_dict[node_name] for torch_name, node_name in nones_or_grads_names_unflatten.items() if node_name in outputs_dict})
+    ret.append(tuple(outputs_dict[node_name] if node_name in outputs_dict else None for node_name in returns_names_unflatten))
+    return ret
+
+
 # TODO @botbw: simplify
 def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delayed_init=False, strict=True):
     is_backward_called = get_backward_flag()
-    stateless_func_args_flatten, _ = pytree.tree_flatten(stateless_func_args)
 
     phs_names_flatten = [ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder']
     phs_names_unflatten = pytree.tree_unflatten(phs_names_flatten, traced_stateless_func._in_spec)
@@ -836,11 +856,6 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
             for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
                 optim_state[inv_optimstates[name]][inv_optimstates_type[name]] = tensor
             return dict(optim_state)
-
-        def get_params_and_grads(self, local_outputs_dict_after_fw_bw: dict):
-            return \
-                {node_name: local_outputs_dict_after_fw_bw[node_name] for _, node_name in maybe_updated_params_names_unflatten.items() if node_name in local_outputs_dict_after_fw_bw}, \
-                    {node_name: local_outputs_dict_after_fw_bw[node_name] for _, node_name in nones_or_grads_names_unflatten.items() if node_name in local_outputs_dict_after_fw_bw}
 
     states_used_by = defaultdict(list)
 

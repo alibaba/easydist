@@ -318,7 +318,7 @@ def merge_chunks(chunks, chunk_spec):
     for arg_idx, arg in enumerate(spec_flattened):
         if isinstance(arg, TensorChunkSpec):
             partial_values = [
-                chunks_flattened[chunk_idx][arg_idx] if chunks_flattened[chunk_idx][arg_idx].dim() > 0 else chunks_flattened[chunk_idx][arg_idx].unsqueeze(0)
+                chunks_flattened[chunk_idx][arg_idx]
                 for chunk_idx in range(len(chunks_flattened))
             ]
 
@@ -350,16 +350,23 @@ def merge_chunks(chunks, chunk_spec):
                         chunk_start_idx, chunk_end_idx
                     )
                     sliced = partial_value[slice_indices]
-                    if sliced.dim() == 0:
-                        sliced = sliced.unsqueeze(0)
                     values_to_cat.append(sliced)
 
                     chunk_start_idx = chunk_end_idx
 
             else:
                 values_to_cat = partial_values
+            
+            if all(v is None for v in values_to_cat): # None
+                args_flattened.append(None)
+                continue
 
-            args_flattened.append(torch.cat(values_to_cat, dim=arg.split_dim))
+            try:
+                args_flattened.append(torch.cat(values_to_cat, dim=arg.split_dim))
+            except RuntimeError as e:
+                assert "zero-dimensional tensor (at position 0) cannot be concatenated" == str(e)
+                args_flattened.append(torch.stack(values_to_cat, dim=arg.split_dim))
+
         elif isinstance(arg, CustomReducer):
             reduced_val = arg.init_value
 
