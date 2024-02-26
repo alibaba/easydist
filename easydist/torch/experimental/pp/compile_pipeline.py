@@ -99,16 +99,17 @@ class CompiledStage: # TODO @botbw: make this picklable
             self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
             self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
 
-    def forward(self, activations_batch=None, outputs_batch=None, **kwargs):
+    @torch.no_grad
+    def forward(self, activations_chunk=None, outputs_chunk=None, **kwargs):
         assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
 
-        if activations_batch is None or outputs_batch is None: # for local run
+        if activations_chunk is None or outputs_chunk is None: # for local run
             if not hasattr(self, 'activations'):
                 self.activations = {}
             if not hasattr(self, 'outputs'):
                 self.outputs = {}
-            activations_batch = self.activations
-            outputs_batch = self.outputs
+            activations_chunk = self.activations
+            outputs_chunk = self.outputs
 
         kwargs4gm = {}
         for arg_name in self.fw_gm.inputs_spec:
@@ -117,16 +118,16 @@ class CompiledStage: # TODO @botbw: make this picklable
             elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
                 kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
                 if arg_name in self.compiled_meta.maybe_updated_params_names_unflatten.values():  # params need to be returned directly if there is no opt_gm
-                    outputs_batch[arg_name] = kwargs4gm[arg_name]
+                    outputs_chunk[arg_name] = kwargs4gm[arg_name]
             elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
                 kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
                 if arg_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values():  # buffers need to be returned directly
-                    outputs_batch[arg_name] = kwargs4gm[arg_name]
+                    outputs_chunk[arg_name] = kwargs4gm[arg_name]
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
 
             if self.has_bw() and arg_name in self.activation_nodes:
-                activations_batch[arg_name] = kwargs4gm[arg_name]
+                activations_chunk[arg_name] = kwargs4gm[arg_name]
 
         output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
 
@@ -139,31 +140,32 @@ class CompiledStage: # TODO @botbw: make this picklable
                 if output_name in self.fw_func_returns:
                     ret[output_name] = output
                 if self.has_bw() and output_name in self.activation_nodes:
-                    activations_batch[output_name] = output
+                    activations_chunk[output_name] = output
                 if (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
-                    outputs_batch[output_name] = output
+                    outputs_chunk[output_name] = output
             else:
                 raise RuntimeError(f"output {output_name} not sure where to go")
 
         return ret
 
-    def backward(self, activations_batch=None, outputs_batch=None, **kwargs):
+    @torch.no_grad
+    def backward(self, activations_chunk=None, outputs_chunk=None, **kwargs):
         if not self.has_bw():
             raise NotImplementedError("This compiled stage doesn't contain bw_gm")
 
         assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
 
-        if activations_batch is None or outputs_batch is None: # for local run
-            activations_batch = self.activations
-            outputs_batch = self.outputs
+        if activations_chunk is None or outputs_chunk is None: # for local run
+            activations_chunk = self.activations
+            outputs_chunk = self.outputs
 
         kwargs4gm = {}
         for arg_name in self.bw_gm.inputs_spec:
             if arg_name in kwargs:
                 kwargs4gm[arg_name] = kwargs[arg_name]
-            elif arg_name in activations_batch:
-                kwargs4gm[arg_name] = activations_batch[arg_name]
-                activations_batch.pop(arg_name)
+            elif arg_name in activations_chunk:
+                kwargs4gm[arg_name] = activations_chunk[arg_name]
+                activations_chunk.pop(arg_name)
             elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
                 kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
             elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
@@ -171,7 +173,7 @@ class CompiledStage: # TODO @botbw: make this picklable
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
 
-        assert len(activations_batch) == 0, "all backward args should be used"
+        assert len(activations_chunk) == 0, "all backward args should be used"
         output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
 
         ret = {}
@@ -179,19 +181,20 @@ class CompiledStage: # TODO @botbw: make this picklable
 
         for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
             if output_name in self.compiled_meta.nones_or_grads_names_unflatten.values():
-                outputs_batch[output_name] = output
+                outputs_chunk[output_name] = output
             elif output_name in self.bw_gm.call_module_users:
                 ret[output_name] = output
             else:
                 raise RuntimeError(f"output {output_name} not sure where to go")
         return ret
 
-    def step(self, params_and_grads=None):
+    @torch.no_grad
+    def step(self, outputs_batch=None): # params_and_grads is the args
         if not self.has_step():
             raise NotImplementedError("This compiled stage doesn't contain step_gm")
-
-        if params_and_grads is None:
-            params_and_grads = self.outputs
+        
+        if outputs_batch is None:
+            outputs_batch = self.outputs
 
         kwargs = {}
         for arg_name in self.step_gm_args:
@@ -199,8 +202,8 @@ class CompiledStage: # TODO @botbw: make this picklable
                 kwargs[arg_name] = self.step_gm.injected_states[StateType.OPTIMSTATES][arg_name]
             elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
                 kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-            elif arg_name in self.compiled_meta.nones_or_grads_names_unflatten.values(): # grads
-                kwargs[arg_name] = params_and_grads[arg_name]
+            elif arg_name in self.compiled_meta.nones_or_grads_names_unflatten.values(): # grads already in outputs
+                kwargs[arg_name] = outputs_batch[arg_name]
             else:
                 raise RuntimeError(f"arg {arg_name} not sure where to go")
 
@@ -208,9 +211,9 @@ class CompiledStage: # TODO @botbw: make this picklable
 
         for output, ret in zip(self.step_gm.outputs_spec, rets):
             if output in self.compiled_meta.maybe_updated_params_names_unflatten.values(): # params
-                params_and_grads[output] = ret
+                outputs_batch[output] = ret
             elif output in self.compiled_meta.updated_optimstates_names_flatten: # optimstates
-                params_and_grads[output] = ret
+                outputs_batch[output] = ret
             else:
                 raise RuntimeError(f"output {output} not sure where to go")
 
@@ -724,11 +727,9 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
     for name in to_pop:
         ed_gm.injected_states[StateType.OPTIMSTATES].pop(name)
 
-    new_gm.inputs_spec = inputs_spec
-    new_gm.injected_states = injected_states  # TODO @botbw: move this to meta
-    new_gm.outputs_spec = [node.name for node in outputs]
+    output_spec = [node.name for node in outputs]
 
-    return new_gm
+    return EDGraphModule(new_gm, ed_gm.submod_type, inputs_spec, injected_states, output_spec, ed_gm.call_module_users, ed_gm.name)
 
 
 def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
@@ -960,7 +961,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
     )
 
     current_stateful_fw_bw = None
-    compiled_stages = []
+    compiled_stages: List[CompiledStage] = []
     submod_idx = 0
     for node in splited_global.graph.nodes:
         if node.op == 'call_module':
@@ -1110,9 +1111,9 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
             submod_idx += 1
 
     compiled_meta.node_to_stage_idx = name_to_stage_idx # TODO @botbw move this to constructor?
-    def eliminate_dead_node():
-        raise RuntimeError("This method should be called since the graph doesn't have output node")
-    setattr(g, 'eliminate_dead_node', eliminate_dead_node)
+    # def eliminate_dead_node():
+    #     raise RuntimeError("This method should be called since the graph doesn't have output node")
+    # setattr(g, 'eliminate_dead_node', eliminate_dead_node)
     local_gm = fx.GraphModule({}, g)
 
     return compiled_meta, compiled_stages, local_gm

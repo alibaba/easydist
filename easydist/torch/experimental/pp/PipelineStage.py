@@ -80,6 +80,8 @@ class PipelineStage:
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx
         self.name = f'stage_{stage_idx}'
 
+        self.outputs_batch = {}
+
 
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError("Number of ranks is larger than number of stages, some ranks are unused")
@@ -155,11 +157,11 @@ class PipelineStage:
         # code.  Here we provide a workaround for users to manually modify the
         # "device" kwarg of operations. Such operation may include:
         # `torch.ones`, `torch.zeros`, `torch.rand`, etc.
-        modify_graph_op_device(self.compiled_stage.fw_gm, self.device)
+        modify_graph_op_device(self.compiled_stage.fw_gm.gm, self.device)
         if self.compiled_stage.has_bw():
-            modify_graph_op_device(self.compiled_stage.bw_gm, self.device)
+            modify_graph_op_device(self.compiled_stage.bw_gm.gm, self.device)
         if self.compiled_stage.has_step():
-            modify_graph_op_device(self.compiled_stage.step_gm, self.device)
+            modify_graph_op_device(self.compiled_stage.step_gm.gm, self.device)
 
     def is_first(self):
         return self.stage_idx == 0
@@ -334,8 +336,8 @@ class PipelineStage:
         # Send requests of a chunk
         send_reqs: List[dist.Work] = []
 
-        for name, out in output_dict.items():
-            dst_stages = send_info[name]
+        for name, dst_stages in send_info.items():
+            out = output_dict[name]
             for dst in dst_stages:
                 logger.debug(
                     f"[{self.group_rank}] "
@@ -357,52 +359,40 @@ class PipelineStage:
         self,
         chunk: int,
     ):
-        composite_kwargs = self._recv_and_fill_inputs(
+        composite_kwargs_chunk = self._recv_and_fill_inputs(
             self.kwargs_split,
             self.fw_kwargs_recv_info,
             chunk
         )
 
         # Compute forward
-        output = self.compiled_stage.forward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs)
+        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs_chunk)
 
-        assert isinstance(output, dict), "Only dict output is supported"
-        logger.debug(map_debug_info(output))
+        assert isinstance(outputs_chunk, dict), "Only dict output is supported"
+        logger.debug(map_debug_info(outputs_chunk))
 
         # Send activations
-        send_reqs = self._send_output_dict(self.fw_act_send_info, output)
+        send_reqs = self._send_output_dict(self.fw_act_send_info, outputs_chunk)
         self.all_fw_send_reqs += send_reqs
 
     def backward_one_chunk(
         self,
-        bwd_chunk: int,
+        chunk: int,
     ):
-        composite_kwargs = self._recv_and_fill_inputs(
+        composite_kwargs_chunk = self._recv_and_fill_inputs(
             self.bw_args_recv_info,
             self.bw_kwargs_recv_info,
-            bwd_chunk
+            chunk
         )
 
         # `stage_backward` node does not have `args`, only `kwargs`
-        grads_input = self.compiled_stage.backward(self.activations_chunks[bwd_chunk], self.outputs_chunks[bwd_chunk], **composite_kwargs)
+        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs_chunk)
 
-        grad_send_reqs = self._send_output_dict(self.bw_act_send_info, grads_input)
+        grad_send_reqs = self._send_output_dict(self.bw_act_send_info, outputs_chunk)
         self.all_bw_send_reqs += grad_send_reqs
 
     def step(self):
-        grads = []
-        for chunk in self.outputs_chunks:
-            params, _, _, grads_batch, _ = process_outputs_non_strict(self.compiled_meta, chunk)
-            grads.append(grads_batch)
-        grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
-        params_names_unflatten = self.compiled_meta.params_names_unflatten
-        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
-
-        params = {params_names_unflatten[k]: v for k, v in params.items()}
-        grads = {nones_or_grads_names_unflatten[k]: v for k, v in grads.items()}
-    
-        params_and_grads = {**params, **grads}
-        self.compiled_stage.step(params_and_grads)
+        self.compiled_stage.step(self.outputs_batch)
 
     def clear_runtime_states(self):
         # Activation send requests of all chunk
@@ -415,21 +405,53 @@ class PipelineStage:
         for _ in range(self.num_chunks):
             self.activations_chunks.append({})
             self.outputs_chunks.append({})
+        self.outputs_batch.clear()
 
-    def merge_output_chunks(self) -> Dict[str, Any]:
+    def _merge_output_chunks(self) -> Dict[str, Any]:
+        maybe_updated_params_names_unflatten = self.compiled_meta.maybe_updated_params_names_unflatten
+        maybe_updated_buffers_names_unflatten = self.compiled_meta.maybe_updated_buffers_names_unflatten
+        updated_optimstates_names_unflatten = self.compiled_meta.updated_optimstates_names_unflatten
+        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
+        returns_names_unflatten = self.compiled_meta.returns_names_unflatten
+        
+        params = {}
+        buffers = {}
+        optimstates = {}
         grads = []
         rets = []
         for chunk in self.outputs_chunks:
-            params, buffers, optimstates, grads_batch, rets_chunk = process_outputs_non_strict(self.compiled_meta, chunk)
-            grads.append(grads_batch)
+            grads_chunk = {}
+            rets_chunk = [None for _ in range(len(returns_names_unflatten))]
+            for node_name, tensor in chunk.items():
+                if node_name in maybe_updated_params_names_unflatten.values():
+                    params[node_name] = tensor
+                elif node_name in maybe_updated_buffers_names_unflatten.values():
+                    buffers[node_name] = tensor
+                elif node_name in updated_optimstates_names_unflatten.values():
+                    optimstates[node_name] = tensor
+                elif node_name in nones_or_grads_names_unflatten.values():
+                    grads_chunk[node_name] = tensor
+                elif node_name in returns_names_unflatten:
+                    rets_chunk[returns_names_unflatten.index(node_name)] = tensor
+                else:
+                    raise RuntimeError(f"Unknown output {node_name}")
+            grads.append(grads_chunk)
             rets.append(rets_chunk)
 
         rets = merge_chunks(rets, self.outputs_chunk_spec)
+        rets = {k: v for k, v in zip(returns_names_unflatten, rets)}
         grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
-        return params, buffers, optimstates, grads, rets
+        self.outputs_batch = {
+            **params,
+            **buffers,
+            **optimstates,
+            **grads,
+            **rets
+        }
 
-    @torch.no_grad
+        return self.outputs_batch
+
     def __call__(self, *args, **kwargs) -> None:
         # Clean per iteration
         self.clear_runtime_states()
@@ -459,13 +481,16 @@ class PipelineStage:
             for work in self.all_bw_send_reqs:
                 work.wait()
 
-        if self.step_node is not None:
-            self.step()
+        self._merge_output_chunks()
+
+        # if self.step_node is not None:
+        #     self.step()
+
         logger.debug(f"[{self.group_rank}] All sends finished")
 
     def all_gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
-        outputs = self.merge_output_chunks()
+        outputs = process_outputs_non_strict(self.compiled_meta, self.outputs_batch)
         dist.gather_object(
             outputs,
             outputs_all_stages if self.group_rank == rank else None,

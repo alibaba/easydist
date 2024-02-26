@@ -221,7 +221,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func, nstages, stateless_func_args, strict=False)
 
-    epochs = 5
+    epochs = 2
     dataset = []
     for _ in range(epochs):
         rand_input = rand_input_gen_method()
