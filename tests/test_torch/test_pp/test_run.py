@@ -64,108 +64,110 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     seed(42)
+
     # Figure out device to use
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     else:
         device = torch.device("cpu")
 
-    module = module.train().to('cuda:0')
-    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    if isinstance(split_ann_or_policy, set):
-        annotate_split_points(module, split_ann_or_policy)
-        nstages = len(split_ann_or_policy) + 1
-    else:
-        nstages, module = split_ann_or_policy(module)
+    if rank == 0:
+        module = module.train().to(device)
+        opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+        if isinstance(split_ann_or_policy, set):
+            annotate_split_points(module, split_ann_or_policy)
+            nstages = len(split_ann_or_policy) + 1
+        else:
+            nstages, module = split_ann_or_policy(module)
 
-    batch_size = 64
-    transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        ])
-    train_data = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
-    valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
-    g = torch.Generator()
-    g.manual_seed(0)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, generator=g)
-    valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size, generator=g)
+        batch_size = 64
+        transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            ])
+        train_data = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+        valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
+        g = torch.Generator()
+        g.manual_seed(0)
+        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, generator=g)
+        valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size, generator=g)
 
-    x, y = next(iter(train_dataloader))
-    
-    args = [x.to('cuda:0'), y.to('cuda:0'), module, opt]
-    kwargs = {}
+        x, y = next(iter(train_dataloader))
+        
+        args = [x.to(device), y.to(device), module, opt]
+        kwargs = {}
 
-    ##################################################################################################
-    params = dict(module.named_parameters())
-    buffers = dict(module.named_buffers())
+        ##################################################################################################
+        params = dict(module.named_parameters())
+        buffers = dict(module.named_buffers())
 
-    named_states = {}
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = rgetattr(module, name).data.fake_mode
-        with mode:
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
-
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-    # fix for sgd withtout momentum
-    if all(state is None for state in flat_named_states):
         named_states = {}
+        if opt is not None:
+            # assign grad and warm up optimizer
+            mode = nullcontext()
+            for name in dict(module.named_parameters()):
+                with torch.no_grad():
+                    rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+                    if isinstance(rgetattr(module, name).data, FakeTensor):
+                        mode = rgetattr(module, name).data.fake_mode
+            with mode:
+                opt.step()
+                opt.zero_grad(True)
+
+            for n, p in params.items():
+                if p in opt.state:
+                    named_states[n] = opt.state[p]  # type: ignore[index]
+                    # if step in state, reduce one for warmup step.
+                    if 'step' in named_states[n]:
+                        named_states[n]['step'] -= 1
+
         flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
-    def stateless_func(func, params, buffers, named_states, args, kwargs):
-        with stateless._reparametrize_module(
-                cast(torch.nn.Module, module), {
-                    **params,
-                    **buffers
-                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-                    opt, named_states, params) if opt else nullcontext():
-            ret = func(*args, **kwargs)
+        # fix for sgd withtout momentum
+        if all(state is None for state in flat_named_states):
+            named_states = {}
+            flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
-        grads = {k: v.grad for k, v in params.items()}
-        return params, buffers, named_states, grads, ret
+        def stateless_func(func, params, buffers, named_states, args, kwargs):
+            with stateless._reparametrize_module(
+                    cast(torch.nn.Module, module), {
+                        **params,
+                        **buffers
+                    }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
+                        opt, named_states, params) if opt else nullcontext():
+                ret = func(*args, **kwargs)
 
-    from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
-    args_split, kwargs_split = split_args_kwargs_into_chunks(
-        args,
-        kwargs,
-        num_chunks,
-        None, #self.pipe.kwargs_chunk_spec,
-    )
+            grads = {k: v.grad for k, v in params.items()}
+            return params, buffers, named_states, grads, ret
 
-    with _enable_compile(), SplitPatcher(module, opt):
-        set_backward_flag(False)
-        traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
-                                  tracing_mode='fake',
-                                  decomposition_table=EASYDIST_DECOMP_TABLE,
-                                  _allow_non_fake_inputs=False)(params, buffers, named_states,
-                                                                args_split[0], kwargs_split[0])
+        from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
+        args_split, kwargs_split = split_args_kwargs_into_chunks(
+            args,
+            kwargs,
+            num_chunks,
+            None, #self.pipe.kwargs_chunk_spec,
+        )
 
-    traced_stateless_func.graph.eliminate_dead_code()
-    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
-    traced_stateless_func.recompile()
-    ##################################################################################################
-    save_graphviz_dot(traced_stateless_func, 'traced_graph')
+        with _enable_compile(), SplitPatcher(module, opt):
+            set_backward_flag(False)
+            traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
+                                    tracing_mode='fake',
+                                    decomposition_table=EASYDIST_DECOMP_TABLE,
+                                    _allow_non_fake_inputs=False)(params, buffers, named_states,
+                                                                    args_split[0], kwargs_split[0])
 
-    traced_stateless_func_node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
-    stateless_func_args = [params, buffers, named_states, args, kwargs]
+        traced_stateless_func.graph.eliminate_dead_code()
+        traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
+        traced_stateless_func.recompile()
+        ##################################################################################################
+        save_graphviz_dot(traced_stateless_func, 'traced_graph')
+
+        traced_stateless_func_node_metas = {node.name: node.meta for node in traced_stateless_func.graph.nodes}
+        stateless_func_args = [params, buffers, named_states, args, kwargs]
 
 
-    compiled_meta, compiled_stages, local_gm = compile_pipeline(
-        traced_stateless_func, nstages, stateless_func_args, strict=True)
+        compiled_meta, compiled_stages, local_gm = compile_pipeline(
+            traced_stateless_func, nstages, stateless_func_args, strict=True)
 
     pipe = PipelineStage(
         local_gm=local_gm,
@@ -208,8 +210,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             args = (x_batch, y_batch, module, opt)
             kwargs = {}
             stage_kwargs = process_inputs(compiled_meta, *args, **kwargs, move_to_device=True)
-            
-        
+
             pipe(**stage_kwargs[rank])
             num_batches_tracked += 1
             num_step += 1

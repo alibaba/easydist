@@ -27,14 +27,15 @@ from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
                                                              PipeSplitWrapper,
-                                                             compile_pipeline,
+                                                             compile_pipeline, process_outputs,
                                                              split_into_equal_size,
                                                              before_split_register,
                                                              after_split_register,
                                                              tuple_after_split,
                                                              tuple_before_split,
                                                              set_backward_flag,
-                                                             get_backward_flag)
+                                                             get_backward_flag,
+                                                             process_inputs)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -218,8 +219,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
 
-    process_inputs, process_outputs, compiled_stages, gm, _ = compile_pipeline(
-        traced_stateless_func, nstages, stateless_func_args, strict=False)
+    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func, nstages, stateless_func_args, strict=False)
 
     epochs = 5
     dataset = []
@@ -233,17 +233,17 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         for rand_input, label in dataset:
             args = (rand_input, label, module, opt)
             kwargs = {}
-            kwargs_stage = process_inputs(*args, **kwargs)
+            kwargs_stage = process_inputs(compiled_meta, *args, **kwargs)
             input_dict = {}
             for di in kwargs_stage:
                 input_dict.update(di)
-            gm(**input_dict)
+            local_gm(**input_dict)
 
     outputs = {}
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_unflatten = process_outputs(outputs)
+    out_unflatten = process_outputs(compiled_meta, outputs)
     out_flatten, _ = pytree.tree_flatten(out_unflatten)
 
     seed()

@@ -3,7 +3,7 @@ from functools import reduce
 import logging
 import operator
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
+from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
@@ -13,7 +13,7 @@ from torch.fx.node import map_arg
 
 from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.utils import modify_graph_op_device, map_debug_info
-from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStageBase, process_outputs_non_strict
+from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, process_outputs_non_strict
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class PipelineStage:
         local_gm: fx.GraphModule,
         compiled_meta: CompiledMeta,
         stage_idx: int,
-        compiled_stage: CompiledStageBase,
+        compiled_stage: CompiledStage,
         node_metas,
         num_chunks,
         args_chunk_spec,
@@ -194,6 +194,24 @@ class PipelineStage:
     ):
         return self.node_to_stage_idx[node_name]
 
+    def _create_act_send_info(self, node):
+        # Output index: List of receiver ranks
+        act_send_info: Dict[str, List] = {}
+
+        for user in node.users:
+            assert user.target is operator.getitem, "Output must be a dict"
+            out_str = user.args[-1]
+            assert isinstance(out_str, str)
+            # Recursively find the real destination
+            gi_dsts = act_send_info.setdefault(out_str, [])
+            for gi_user in user.users:
+                dst_rank = self.find_dst_rank(gi_user)
+                gi_dsts.append(dst_rank)
+            # Next `getitem` will point to the next output index
+
+        logger.info(f"[{self.group_rank}] " f"Send info: {act_send_info}")
+        return dict(sorted(act_send_info.items()))
+
     def _create_act_recv_buffers(
         self,
         node,
@@ -231,7 +249,7 @@ class PipelineStage:
         # Dict[keyword, RecvInfo]
         kwargs_recv_info = map_arg(node.kwargs, create_recv_tensor)
 
-        return kwargs_recv_info
+        return dict(sorted(kwargs_recv_info.items()))
 
     def find_dst_rank(
         self,
@@ -242,25 +260,6 @@ class PipelineStage:
         If the `user` is not a submod, `None` may be returned.
         """
         return self.get_stage_index_of_node_name(user.name)
-
-
-    def _create_act_send_info(self, node):
-        # Output index: List of receiver ranks
-        act_send_info: Dict[str, List] = {}
-
-        for user in node.users:
-            assert user.target is operator.getitem, "Output must be a dict"
-            out_str = user.args[-1]
-            assert isinstance(out_str, str)
-            # Recursively find the real destination
-            gi_dsts = act_send_info.setdefault(out_str, [])
-            for gi_user in user.users:
-                dst_rank = self.find_dst_rank(gi_user)
-                gi_dsts.append(dst_rank)
-            # Next `getitem` will point to the next output index
-
-        logger.info(f"[{self.group_rank}] " f"Send info: {act_send_info}")
-        return act_send_info
 
     def _recv_tensor(self, info, recv_reqs):
         logger.debug(
@@ -315,7 +314,7 @@ class PipelineStage:
 
         composite_kwargs = {}
 
-        for kw, info in kwargs_recv_info[chunk].items(): # TODO TODO TODO @botbw: recv info not consistent with send info
+        for kw, info in kwargs_recv_info[chunk].items():
             if isinstance(info, RecvInfo):
                 composite_kwargs[kw] = act_recv(info)
             else:
@@ -494,57 +493,8 @@ class PipelineStage:
         )
         return optimizer_state_dicts
 
-# class PipelineStage1F1B(PipelineStage):
-#     def __init__(
-#         self,
-#         pipe: Pipe,
-#         rank: int,
-#         device: torch.device,
-#         group: dist.ProcessGroup = None,
-#     ):
-#         super().__init__(
-#             pipe,
-#             rank,
-#             device,
-#             group=group,
-#         )
 
-#     def forward(self, *args, **kwargs):
-#         # Clean per iteration
-#         self.clear_runtime_states()
-
-#         # Split inputs into chunks
-#         self.split_inputs(args, kwargs)
-
-#         warmup_chunks = cooldown_chunks = self.nstages
-
-#         # Warm-up phase: forward number of chunks equal to pipeline depth.
-#         for chunk in range(warmup_chunks):
-#             self.forward_one_chunk(chunk)
-
-#         # 1F1B phase
-#         for bwd_chunk in range(0, self.chunks - cooldown_chunks):
-#             # Schedule backward for one warmed up chunk
-#             self.backward_one_chunk(bwd_chunk)
-
-#             # Schedule forward for one new chunk
-#             fwd_chunk = bwd_chunk + warmup_chunks
-#             self.forward_one_chunk(fwd_chunk)
-
-#         # Cool-down phase: backward for the rest of the chunks
-#         for bwd_chunk in range(self.chunks - cooldown_chunks, self.chunks):
-#             self.backward_one_chunk(bwd_chunk)
-
-#         # Wait for all sends to finish
-#         # TODO: okay to delay the sync till completion of all chunks?
-#         for work in self.all_act_send_reqs:
-#             work.wait()
-
-#         for work in self.all_grad_send_reqs:
-#             work.wait()
-
-#         # Last rank return merged results per original format
-#         if self.is_last():
-#             return self.merge_output_chunks()
-#         else:
-#             return None
+def print_tensor_dict(chunk, di):
+    print(f'Chunk {chunk}')
+    for k, v in di.items():
+        print(f'{k} size {v.size()} mean {v.float().mean()}')
