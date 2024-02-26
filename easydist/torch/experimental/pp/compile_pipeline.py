@@ -2,12 +2,12 @@ from dataclasses import dataclass
 import logging
 import operator
 import textwrap
-from typing import (Callable, Dict, List, Optional, Tuple, Any, Union)
+from typing import (Callable, Dict, List, Optional, Set, Tuple, Any, Union)
 from abc import ABC, abstractmethod
 from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
 from enum import Enum
-from regex import E
+
 import torch
 import torch.fx as fx
 from torch.fx._symbolic_trace import _Patcher
@@ -17,6 +17,229 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
+
+
+class StateType(Enum):
+    PARAMS = "params"
+    BUFFERS = "buffers"
+    OPTIMSTATES = "optimstates"
+
+class SubmodType(Enum):
+    FW = "fw"
+    BW = "bw"
+    STEP = "step"
+
+@dataclass
+class CompiledMeta:
+    nstages: int
+
+    # input meta
+    params_names_unflatten: Dict[str, str]
+    buffers_names_unflatten: Dict[str, str]
+    optimstates_names_unflatten: Dict[str, Dict[str, str]]
+    args_names_unflatten: Tuple[str, ...]
+    kwargs_names_unflatten: Dict[str, str]
+
+    # node name to torch name mapping
+    inv_params: Dict[str, str]
+    inv_buffers: Dict[str, str]
+    inv_optimstates: Dict[str, str]
+    inv_optimstates_type: Dict[str, str]
+
+    # output meta
+    maybe_updated_params_names_unflatten: Dict[str, str]
+    maybe_updated_buffers_names_unflatten: Dict[str, str]
+    updated_optimstates_names_unflatten: Dict[str, Dict[str, str]]
+    updated_optimstates_names_flatten: List[str]
+    nones_or_grads_names_unflatten: Dict[str, str]
+    returns_names_unflatten: Union[Tuple[str, ...]]
+
+    # node name to stage idx mapping
+    node_to_stage_idx: Dict[str, int]
+
+@dataclass
+class EDGraphModule:
+    gm: torch.fx.GraphModule
+    submod_type: SubmodType
+    inputs_spec: set[str]
+    injected_states: Dict[StateType, Dict[str, torch.Tensor]]
+    outputs_spec: List[str]
+    call_module_users: Dict[str, Set[str]]
+    name: str
+
+    def __call__(self, *args, **kwargs):
+        return self.gm(*args, **kwargs)
+
+class CompiledStage: # TODO @botbw: make this picklable
+
+    def __init__(self, compiled_meta: CompiledMeta, fw_gm: EDGraphModule, bw_gm: Optional[EDGraphModule], full_step_gm: Optional[EDGraphModule]):
+        self.compiled_meta = compiled_meta
+        self.fw_gm = fw_gm
+        params_and_buffers = (set(fw_gm.injected_states[StateType.PARAMS].keys()) | set(fw_gm.injected_states[StateType.BUFFERS].keys()))
+        self.fw_func_args = set(fw_gm.inputs_spec) - params_and_buffers  # args for self.forward
+        self.fw_func_returns = set( # TODO @botbw: better way of doing this
+            output
+            for output, users in self.fw_gm.call_module_users.items()
+            if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name))
+        )  # not just used by bw, need to pass to next stage
+
+        if bw_gm is not None:
+            self.bw_gm = bw_gm
+            args_activations = set(fw_gm.inputs_spec) & set(bw_gm.inputs_spec) - params_and_buffers
+            outputs_activations = set(fw_gm.outputs_spec) & set(bw_gm.inputs_spec)
+            self.activation_nodes = args_activations | outputs_activations
+            self.bw_func_args = set(bw_gm.inputs_spec) - set(self.activation_nodes) - params_and_buffers  # args for self.backward
+
+        if full_step_gm is not None:  # TODO @botbw: simplify this
+            stage_params_inputs = set(self.fw_gm.injected_states[StateType.PARAMS]) & set(full_step_gm.inputs_spec)
+            inv_stage_params_inputs = set(self.compiled_meta.inv_params[name] for name in stage_params_inputs)
+            stage_grad_inputs = set({self.compiled_meta.nones_or_grads_names_unflatten[k] for k in inv_stage_params_inputs})
+            stage_optimstates_inputs, _ = pytree.tree_flatten([self.compiled_meta.optimstates_names_unflatten[k] for k in inv_stage_params_inputs])
+            stage_optimstates_inputs = set(stage_optimstates_inputs)
+            self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
+            self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
+
+    def forward(self, activations_batch=None, outputs_batch=None, **kwargs):
+        assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
+
+        if activations_batch is None or outputs_batch is None: # for local run
+            if not hasattr(self, 'activations'):
+                self.activations = {}
+            if not hasattr(self, 'outputs'):
+                self.outputs = {}
+            activations_batch = self.activations
+            outputs_batch = self.outputs
+
+        kwargs4gm = {}
+        for arg_name in self.fw_gm.inputs_spec:
+            if arg_name in kwargs:
+                kwargs4gm[arg_name] = kwargs[arg_name]
+            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
+                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+                if arg_name in self.compiled_meta.maybe_updated_params_names_unflatten.values():  # params need to be returned directly if there is no opt_gm
+                    outputs_batch[arg_name] = kwargs4gm[arg_name]
+            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
+                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
+                if arg_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values():  # buffers need to be returned directly
+                    outputs_batch[arg_name] = kwargs4gm[arg_name]
+            else:
+                raise RuntimeError(f"arg {arg_name} not found")
+
+            if self.has_bw() and arg_name in self.activation_nodes:
+                activations_batch[arg_name] = kwargs4gm[arg_name]
+
+        output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
+
+        ret = {}
+        assert len(output_from_gm) == len(self.fw_gm.outputs_spec), "output_from_gm should have the same length as self.fw_gm.outputs_spec"
+        for output_name, output in zip(self.fw_gm.outputs_spec, output_from_gm):
+            if (output_name in self.fw_func_returns) \
+                or (self.has_bw() and output_name in self.activation_nodes) \
+                    or (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
+                if output_name in self.fw_func_returns:
+                    ret[output_name] = output
+                if self.has_bw() and output_name in self.activation_nodes:
+                    activations_batch[output_name] = output
+                if (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
+                    outputs_batch[output_name] = output
+            else:
+                raise RuntimeError(f"output {output_name} not sure where to go")
+
+        return ret
+
+    def backward(self, activations_batch=None, outputs_batch=None, **kwargs):
+        if not self.has_bw():
+            raise NotImplementedError("This compiled stage doesn't contain bw_gm")
+
+        assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
+
+        if activations_batch is None or outputs_batch is None: # for local run
+            activations_batch = self.activations
+            outputs_batch = self.outputs
+
+        kwargs4gm = {}
+        for arg_name in self.bw_gm.inputs_spec:
+            if arg_name in kwargs:
+                kwargs4gm[arg_name] = kwargs[arg_name]
+            elif arg_name in activations_batch:
+                kwargs4gm[arg_name] = activations_batch[arg_name]
+                activations_batch.pop(arg_name)
+            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
+                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
+                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
+            else:
+                raise RuntimeError(f"arg {arg_name} not found")
+
+        assert len(activations_batch) == 0, "all backward args should be used"
+        output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
+
+        ret = {}
+        assert len(output_from_gm) == len(self.bw_gm.outputs_spec), "output_from_gm should have the same length as self.bw_gm.outputs_spec"
+
+        for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
+            if output_name in self.compiled_meta.nones_or_grads_names_unflatten.values():
+                outputs_batch[output_name] = output
+            elif output_name in self.bw_gm.call_module_users:
+                ret[output_name] = output
+            else:
+                raise RuntimeError(f"output {output_name} not sure where to go")
+        return ret
+
+    def step(self, params_and_grads=None):
+        if not self.has_step():
+            raise NotImplementedError("This compiled stage doesn't contain step_gm")
+
+        if params_and_grads is None:
+            params_and_grads = self.outputs
+
+        kwargs = {}
+        for arg_name in self.step_gm_args:
+            if arg_name in self.step_gm.injected_states[StateType.OPTIMSTATES]: # optimstates
+                kwargs[arg_name] = self.step_gm.injected_states[StateType.OPTIMSTATES][arg_name]
+            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
+                kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
+            elif arg_name in self.compiled_meta.nones_or_grads_names_unflatten.values(): # grads
+                kwargs[arg_name] = params_and_grads[arg_name]
+            else:
+                raise RuntimeError(f"arg {arg_name} not sure where to go")
+
+        rets = _to_tuple(self.step_gm(**kwargs))
+
+        for output, ret in zip(self.step_gm.outputs_spec, rets):
+            if output in self.compiled_meta.maybe_updated_params_names_unflatten.values(): # params
+                params_and_grads[output] = ret
+            elif output in self.compiled_meta.updated_optimstates_names_flatten: # optimstates
+                params_and_grads[output] = ret
+            else:
+                raise RuntimeError(f"output {output} not sure where to go")
+
+        return None  # step should always return None
+
+    def has_step(self):
+        return hasattr(self, 'step_gm')
+
+    def has_bw(self):
+        return hasattr(self, 'bw_gm')
+
+    def state_dict(self):
+        state_dict = {}
+        state_dict.update(self.named_parameters())
+        state_dict.update(self.named_buffers())
+        return state_dict
+
+    def named_parameters(self):
+        return {self.compiled_meta.inv_params[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()}
+
+    def named_buffers(self):
+        return {self.compiled_meta.inv_buffers[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()}
+
+    def optimizer_state_dict(self):
+        optim_state = defaultdict(dict)
+        for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
+            optim_state[self.compiled_meta.inv_optimstates[name]][self.compiled_meta.inv_optimstates_type[name]] = tensor
+        return dict(optim_state)
+
 # ================================= section start ========================================
 # The idea of functions in this section are borrowed from
 # https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L346
@@ -403,10 +626,11 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
     return split, part_idx + 1
 
 
-def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: set[str]):
+def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]):
     new_graph = fx.Graph()
     env = {}
     outputs = []
+    gm = ed_gm.gm
     for node in gm.graph.nodes:
         if node.op == 'placeholder':
             if node.name in inputs_spec:  # only those in inputs
@@ -493,228 +717,18 @@ def _extract_step_subgraph_from_args(gm: torch.fx.GraphModule, inputs_spec: set[
         StateType.OPTIMSTATES: {},
     }
     to_pop = []
-    for name, val in gm.injected_states[StateType.OPTIMSTATES].items():
+    for name, val in ed_gm.injected_states[StateType.OPTIMSTATES].items():
         if name in inputs_spec:
             injected_states[StateType.OPTIMSTATES][name] = val
             to_pop.append(name)
     for name in to_pop:
-        gm.injected_states[StateType.OPTIMSTATES].pop(name)
+        ed_gm.injected_states[StateType.OPTIMSTATES].pop(name)
 
     new_gm.inputs_spec = inputs_spec
     new_gm.injected_states = injected_states  # TODO @botbw: move this to meta
     new_gm.outputs_spec = [node.name for node in outputs]
 
     return new_gm
-
-class StateType(Enum):
-    PARAMS = "params"
-    BUFFERS = "buffers"
-    OPTIMSTATES = "optimstates"
-
-class SubmodType(Enum):
-    FW = "fw"
-    BW = "bw"
-    STEP = "step"
-
-@dataclass
-class CompiledMeta:
-    nstages: int
-
-    # input meta
-    params_names_unflatten: Dict[str, str]
-    buffers_names_unflatten: Dict[str, str]
-    optimstates_names_unflatten: Dict[str, Dict[str, str]]
-    args_names_unflatten: Tuple[str, ...]
-    kwargs_names_unflatten: Dict[str, str]
-
-    # node name to torch name mapping
-    inv_params: Dict[str, str]
-    inv_buffers: Dict[str, str]
-    inv_optimstates: Dict[str, str]
-    inv_optimstates_type: Dict[str, str]
-
-    # output meta
-    maybe_updated_params_names_unflatten: Dict[str, str]
-    maybe_updated_buffers_names_unflatten: Dict[str, str]
-    updated_optimstates_names_unflatten: Dict[str, Dict[str, str]]
-    updated_optimstates_names_flatten: List[str]
-    nones_or_grads_names_unflatten: Dict[str, str]
-    returns_names_unflatten: Union[Tuple[str, ...]]
-
-    # node name to stage idx mapping
-    node_to_stage_idx: Dict[str, int]
-
-
-
-class CompiledStage: # TODO @botbw: make this picklable
-
-    def __init__(self, compiled_meta: CompiledMeta, fw_gm: fx.GraphModule, bw_gm: Optional[fx.GraphModule], full_step_gm: Optional[fx.GraphModule]):
-        self.compiled_meta = compiled_meta
-        self.fw_gm = fw_gm
-        params_and_buffers = (set(fw_gm.injected_states[StateType.PARAMS].keys()) | set(fw_gm.injected_states[StateType.BUFFERS].keys()))
-        self.fw_func_args = set(fw_gm.inputs_spec) - params_and_buffers  # args for self.forward
-        self.fw_func_returns = set( # TODO @botbw: better way of doing this
-            output
-            for output, users in self.fw_gm.call_module_users.items()
-            if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name))
-        )  # not just used by bw, need to pass to next stage
-
-        if bw_gm is not None:
-            self.bw_gm = bw_gm
-            args_activations = set(fw_gm.inputs_spec) & set(bw_gm.inputs_spec) - params_and_buffers
-            outputs_activations = set(fw_gm.outputs_spec) & set(bw_gm.inputs_spec)
-            self.activation_nodes = args_activations | outputs_activations
-            self.bw_func_args = set(bw_gm.inputs_spec) - set(self.activation_nodes) - params_and_buffers  # args for self.backward
-
-        if full_step_gm is not None:  # TODO @botbw: simplify this
-            stage_params_inputs = set(self.fw_gm.injected_states[StateType.PARAMS]) & set(full_step_gm.inputs_spec)
-            inv_stage_params_inputs = set(self.compiled_meta.inv_params[name] for name in stage_params_inputs)
-            stage_grad_inputs = set({self.compiled_meta.nones_or_grads_names_unflatten[k] for k in inv_stage_params_inputs})
-            stage_optimstates_inputs, _ = pytree.tree_flatten([self.compiled_meta.optimstates_names_unflatten[k] for k in inv_stage_params_inputs])
-            stage_optimstates_inputs = set(stage_optimstates_inputs)
-            self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
-            self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
-
-    def forward(self, activations_batch=None, outputs_batch=None, **kwargs):
-        assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
-
-        if activations_batch is None or outputs_batch is None: # for local run
-            if not hasattr(self, 'activations'):
-                self.activations = {}
-            if not hasattr(self, 'outputs'):
-                self.outputs = {}
-            activations_batch = self.activations
-            outputs_batch = self.outputs
-
-        kwargs4gm = {}
-        for arg_name in self.fw_gm.inputs_spec:
-            if arg_name in kwargs:
-                kwargs4gm[arg_name] = kwargs[arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
-                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-                if arg_name in self.compiled_meta.maybe_updated_params_names_unflatten.values():  # params need to be returned directly if there is no opt_gm
-                    outputs_batch[arg_name] = kwargs4gm[arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
-                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
-                if arg_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values():  # buffers need to be returned directly
-                    outputs_batch[arg_name] = kwargs4gm[arg_name]
-            else:
-                raise RuntimeError(f"arg {arg_name} not found")
-
-            if self.has_bw() and arg_name in self.activation_nodes:
-                activations_batch[arg_name] = kwargs4gm[arg_name]
-
-        output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
-
-        ret = {}
-        assert len(output_from_gm) == len(self.fw_gm.outputs_spec), "output_from_gm should have the same length as self.fw_gm.outputs_spec"
-        for output_name, output in zip(self.fw_gm.outputs_spec, output_from_gm):
-            if (output_name in self.fw_func_returns) \
-                or (self.has_bw() and output_name in self.activation_nodes) \
-                    or (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
-                if output_name in self.fw_func_returns:
-                    ret[output_name] = output
-                if self.has_bw() and output_name in self.activation_nodes:
-                    activations_batch[output_name] = output
-                if (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
-                    outputs_batch[output_name] = output
-            else:
-                raise RuntimeError(f"output {output_name} not sure where to go")
-
-        return ret
-
-    def backward(self, activations_batch=None, outputs_batch=None, **kwargs):
-        if not self.has_bw():
-            raise NotImplementedError("This compiled stage doesn't contain bw_gm")
-
-        assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
-
-        if activations_batch is None or outputs_batch is None: # for local run
-            activations_batch = self.activations
-            outputs_batch = self.outputs
-
-        kwargs4gm = {}
-        for arg_name in self.bw_gm.inputs_spec: 
-            if arg_name in kwargs:
-                kwargs4gm[arg_name] = kwargs[arg_name]
-            elif arg_name in activations_batch:
-                kwargs4gm[arg_name] = activations_batch[arg_name]
-                activations_batch.pop(arg_name)
-            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
-                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
-                kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
-            else:
-                raise RuntimeError(f"arg {arg_name} not found")
-
-        assert len(activations_batch) == 0, "all backward args should be used"
-        output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
-
-        ret = {}
-        assert len(output_from_gm) == len(self.bw_gm.outputs_spec), "output_from_gm should have the same length as self.bw_gm.outputs_spec"
-        
-        for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
-            if output_name in self.compiled_meta.nones_or_grads_names_unflatten.values():
-                outputs_batch[output_name] = output
-            elif output_name in self.bw_gm.call_module_users:
-                ret[output_name] = output
-            else:
-                raise RuntimeError(f"output {output_name} not sure where to go")
-        return ret
-
-    def step(self, params_and_grads=None):
-        if not self.has_step():
-            raise NotImplementedError("This compiled stage doesn't contain step_gm")
-
-        if params_and_grads is None:
-            params_and_grads = self.outputs
-
-        kwargs = {}
-        for arg_name in self.step_gm_args:
-            if arg_name in self.step_gm.injected_states[StateType.OPTIMSTATES]: # optimstates
-                kwargs[arg_name] = self.step_gm.injected_states[StateType.OPTIMSTATES][arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
-                kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-            elif arg_name in self.compiled_meta.nones_or_grads_names_unflatten.values(): # grads
-                kwargs[arg_name] = params_and_grads[arg_name]
-            else:
-                raise RuntimeError(f"arg {arg_name} not sure where to go")
-        
-        rets = _to_tuple(self.step_gm(**kwargs))
-
-        for output, ret in zip(self.step_gm.outputs_spec, rets):
-            if output in self.compiled_meta.maybe_updated_params_names_unflatten.values(): # params
-                params_and_grads[output] = ret
-            elif output in self.compiled_meta.updated_optimstates_names_flatten: # optimstates
-                params_and_grads[output] = ret
-            else:
-                raise RuntimeError(f"output {output} not sure where to go")
-
-        return None  # step should always return None
-
-    def has_step(self):
-        return hasattr(self, 'step_gm')
-
-    def has_bw(self):
-        return hasattr(self, 'bw_gm')
-
-    def state_dict(self):
-        state_dict = {}
-        state_dict.update(self.named_parameters())
-        state_dict.update(self.named_buffers())
-        return state_dict
-
-    def named_parameters(self):
-        return {self.compiled_meta.inv_params[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()}
-
-    def named_buffers(self):
-        return {self.compiled_meta.inv_buffers[name]: tensor for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()}
-
-    def optimizer_state_dict(self):
-        optim_state = defaultdict(dict)
-        for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
-            optim_state[self.compiled_meta.inv_optimstates[name]][self.compiled_meta.inv_optimstates_type[name]] = tensor
-        return dict(optim_state)
 
 
 def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
@@ -732,7 +746,7 @@ def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **k
         if move_to_device:
             arg_val = arg_val.to(f'cuda:{stage_idx}') # TODO @botbw: improve this
         stage_kwargs[stage_idx][arg_name] = arg_val
-    
+
     assert set(kwargs.keys()) == set(kwargs_names_unflatten.keys()), "kwargs should have the same keys as kwargs_names"
     for k, v in kwargs.items():
         if not k in name_to_stage_idx:
@@ -815,7 +829,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
                 return fake_tensor_mode.from_tensor(x, source=source)
             return x
         params, buffers, optimstates = pytree.tree_map(wrap_fake, [params, buffers, optimstates])
-    
+
     params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten, args_names_unflatten, kwargs_names_unflatten = phs_names_unflatten
     maybe_updated_params_names_unflatten, maybe_updated_buffers_names_unflatten, updated_optimstates_names_unflatten, nones_or_grads_names_unflatten, returns_names_unflatten = outputs_names_unflatten
     updated_optimstates_names_flatten, _ = pytree.tree_flatten(updated_optimstates_names_unflatten)
@@ -883,18 +897,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         # process output
         outputs_spec, call_module_users = extract_output(node)
 
-        assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
-                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
-                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
-
-        submod.submod_type = SubmodType.FW
-        submod.inputs_spec = inputs_spec
-        submod.injected_states = injected_states
-        submod.outputs_spec = outputs_spec
-        submod.call_module_users = call_module_users
-        submod.name = node.target
-
-        return submod
+        return EDGraphModule(submod, SubmodType.FW, inputs_spec, injected_states, outputs_spec, call_module_users, node.target)
 
     def extract_bw_submod(node, submod):
         # process input
@@ -907,17 +910,8 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
 
         # process output
         outputs_spec, call_module_users = extract_output(node)
-        assert not (hasattr(submod, 'inputs_spec')
-                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
-                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
 
-        submod.submod_type = SubmodType.BW
-        submod.inputs_spec = inputs_spec
-        submod.outputs_spec = outputs_spec
-        submod.call_module_users = call_module_users
-        submod.name = node.target
-
-        return submod
+        return EDGraphModule(submod, SubmodType.BW, inputs_spec, {}, outputs_spec, call_module_users, node.target)
 
     def extract_step_submod(node, submod):
         # process input
@@ -943,18 +937,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         # process output
             outputs_spec, call_module_users = extract_output(node)
 
-        assert not (hasattr(submod, 'inputs_spec') or hasattr(submod, 'injected_states')
-                    or hasattr(submod, 'outputs_spec') or hasattr(submod, 'call_module_users')
-                    or hasattr(submod, 'name') or hasattr(submod, 'submod_type'))
-        
-        submod.submod_type = SubmodType.STEP
-        submod.inputs_spec = inputs_spec
-        submod.injected_states = injected_states
-        submod.outputs_spec = outputs_spec
-        submod.call_module_users = call_module_users
-        submod.name = node.target
-
-        return submod
+        return EDGraphModule(submod, SubmodType.STEP, inputs_spec, injected_states, outputs_spec, call_module_users, node.target)
 
     compiled_meta = CompiledMeta(
         nstages=nstages,
@@ -1092,7 +1075,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
                             env[output] = g.create_node(
                                 name=output,
                                 op='call_function',
-                                target=operator.getitem, 
+                                target=operator.getitem,
                                 args=(out_maybe_tuple, output))
                             name_to_stage_idx[output] = stage_idx
                     if hasattr(stage, 'step_gm'):
