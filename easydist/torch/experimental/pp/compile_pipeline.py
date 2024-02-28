@@ -94,7 +94,7 @@ class CompiledStage: # TODO @botbw: make this picklable
             stage_params_inputs = set(self.fw_gm.injected_states[StateType.PARAMS]) & set(full_step_gm.inputs_spec)
             inv_stage_params_inputs = set(self.compiled_meta.inv_params[name] for name in stage_params_inputs)
             stage_grad_inputs = set({self.compiled_meta.nones_or_grads_names_unflatten[k] for k in inv_stage_params_inputs})
-            stage_optimstates_inputs, _ = pytree.tree_flatten([self.compiled_meta.optimstates_names_unflatten[k] for k in inv_stage_params_inputs])
+            stage_optimstates_inputs, _ = pytree.tree_flatten([self.compiled_meta.optimstates_names_unflatten[k] for k in inv_stage_params_inputs if k in self.compiled_meta.optimstates_names_unflatten])
             stage_optimstates_inputs = set(stage_optimstates_inputs)
             self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
             self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
