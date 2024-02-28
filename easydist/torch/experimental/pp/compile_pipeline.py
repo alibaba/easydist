@@ -47,12 +47,17 @@ class CompiledMeta:
     inv_optimstates_type: Dict[str, str]
 
     # output meta
-    maybe_updated_params_names_unflatten: Dict[str, str]
-    maybe_updated_buffers_names_unflatten: Dict[str, str]
-    updated_optimstates_names_unflatten: Dict[str, Dict[str, str]]
-    updated_optimstates_names_flatten: List[str]
+    output_params_names_unflatten: Dict[str, str]
+    output_buffers_names_unflatten: Dict[str, str]
+    output_optimstates_names_unflatten: Dict[str, Dict[str, str]]
+    output_optimstates_names_flatten: List[str]
     nones_or_grads_names_unflatten: Dict[str, str]
     returns_names_unflatten: Union[Tuple[str, ...]]
+
+    # output node to input node mapping
+    output2input_params: Dict[str, str]
+    output2input_buffers: Dict[str, str]
+    output2input_optimstates: Dict[str, str]
 
     # node name to stage idx mapping
     node_to_stage_idx: Dict[str, int]
@@ -115,13 +120,13 @@ class CompiledStage: # TODO @botbw: make this picklable
         for arg_name in self.fw_gm.inputs_spec:
             if arg_name in kwargs:
                 kwargs4gm[arg_name] = kwargs[arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # param
+            elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]: # params
                 kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-                if arg_name in self.compiled_meta.maybe_updated_params_names_unflatten.values():  # params need to be returned directly if there is no opt_gm
+                if arg_name in self.compiled_meta.output2input_params:  # param in returns
                     outputs_chunk[arg_name] = kwargs4gm[arg_name]
-            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffer
+            elif arg_name in self.fw_gm.injected_states[StateType.BUFFERS]: # buffers
                 kwargs4gm[arg_name] = self.fw_gm.injected_states[StateType.BUFFERS][arg_name]
-                if arg_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values():  # buffers need to be returned directly
+                if arg_name in self.compiled_meta.output2input_buffers:  # buffer in returned value
                     outputs_chunk[arg_name] = kwargs4gm[arg_name]
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
@@ -136,13 +141,17 @@ class CompiledStage: # TODO @botbw: make this picklable
         for output_name, output in zip(self.fw_gm.outputs_spec, output_from_gm):
             if (output_name in self.fw_func_returns) \
                 or (self.has_bw() and output_name in self.activation_nodes) \
-                    or (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
-                if output_name in self.fw_func_returns:
+                    or (output_name in self.compiled_meta.returns_names_unflatten) \
+                        or (output_name in self.compiled_meta.output2input_buffers): # TODO @botbw: simplify this
+                if output_name in self.fw_func_returns: # output in next stages
                     ret[output_name] = output
-                if self.has_bw() and output_name in self.activation_nodes:
+                if self.has_bw() and output_name in self.activation_nodes: # output in activations
                     activations_chunk[output_name] = output
-                if (output_name in self.compiled_meta.maybe_updated_buffers_names_unflatten.values() or output_name in self.compiled_meta.returns_names_unflatten):
+                if output_name in self.compiled_meta.returns_names_unflatten: # output in returns
                     outputs_chunk[output_name] = output
+                if (output_name in self.compiled_meta.output2input_buffers): # output is updated buffer (will be returned returns_names_unflatten check)
+                    input_node_name = self.compiled_meta.output2input_buffers[output_name]
+                    self.fw_gm.injected_states[StateType.BUFFERS][input_node_name] = output # update buffer in case it's not updated in place.
             else:
                 raise RuntimeError(f"output {output_name} not sure where to go")
 
@@ -210,10 +219,14 @@ class CompiledStage: # TODO @botbw: make this picklable
         rets = _to_tuple(self.step_gm(**kwargs))
 
         for output, ret in zip(self.step_gm.outputs_spec, rets):
-            if output in self.compiled_meta.maybe_updated_params_names_unflatten.values(): # params
+            if output in self.compiled_meta.output2input_params: # params
                 outputs_batch[output] = ret
-            elif output in self.compiled_meta.updated_optimstates_names_flatten: # optimstates
+                input_node_name = self.compiled_meta.output2input_params[output]
+                self.fw_gm.injected_states[StateType.PARAMS][input_node_name] = ret # update params in case it's not updated in place.
+            elif output in self.compiled_meta.output_optimstates_names_flatten: # optimstates
                 outputs_batch[output] = ret
+                input_node_name = self.compiled_meta.output2input_optimstates[output]
+                self.step_gm.injected_states[StateType.OPTIMSTATES][input_node_name] = ret # update optimstates in case it's not updated in place.
             else:
                 raise RuntimeError(f"output {output} not sure where to go")
 
@@ -757,9 +770,9 @@ def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **k
     return stage_kwargs
 
 def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
-    maybe_updated_params_names_unflatten = compiled_meta.maybe_updated_params_names_unflatten
-    maybe_updated_buffers_names_unflatten = compiled_meta.maybe_updated_buffers_names_unflatten
-    updated_optimstates_names_unflatten = compiled_meta.updated_optimstates_names_unflatten
+    maybe_updated_params_names_unflatten = compiled_meta.output_params_names_unflatten
+    maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_names_unflatten
+    updated_optimstates_names_unflatten = compiled_meta.output_optimstates_names_unflatten
     nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_names_unflatten
     returns_names_unflatten = compiled_meta.returns_names_unflatten
 
@@ -778,9 +791,9 @@ def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
 
 
 def process_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
-    maybe_updated_params_names_unflatten = compiled_meta.maybe_updated_params_names_unflatten
-    maybe_updated_buffers_names_unflatten = compiled_meta.maybe_updated_buffers_names_unflatten
-    updated_optimstates_names_unflatten = compiled_meta.updated_optimstates_names_unflatten
+    maybe_updated_params_names_unflatten = compiled_meta.output_params_names_unflatten
+    maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_names_unflatten
+    updated_optimstates_names_unflatten = compiled_meta.output_optimstates_names_unflatten
     nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_names_unflatten
     returns_names_unflatten = compiled_meta.returns_names_unflatten
 
@@ -800,7 +813,7 @@ def process_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
 
 
 # TODO @botbw: simplify
-def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delayed_init=False, strict=True):
+def compile_pipeline(traced_stateless_func: fx.GraphModule, nstages: int, stateless_func_args, delayed_init=False, strict=True):
     is_backward_called = get_backward_flag()
 
     phs_names_flatten = [ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder']
@@ -832,10 +845,10 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         params, buffers, optimstates = pytree.tree_map(wrap_fake, [params, buffers, optimstates])
 
     params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten, args_names_unflatten, kwargs_names_unflatten = phs_names_unflatten
-    maybe_updated_params_names_unflatten, maybe_updated_buffers_names_unflatten, updated_optimstates_names_unflatten, nones_or_grads_names_unflatten, returns_names_unflatten = outputs_names_unflatten
-    updated_optimstates_names_flatten, _ = pytree.tree_flatten(updated_optimstates_names_unflatten)
+    output_params_names_unflatten, output_buffers_names_unflatten, output_optimstates_names_unflatten, nones_or_grads_names_unflatten, returns_names_unflatten = outputs_names_unflatten
+    output_optimstates_names_flatten, _ = pytree.tree_flatten(output_optimstates_names_unflatten)
     returns_names_unflatten = _to_tuple(returns_names_unflatten) # returns might be value or tuple
-    all_states_names_flatten, _ = pytree.tree_flatten([params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten])
+    
     inv_params = {arg: param_name for param_name, arg in params_names_unflatten.items()}
     inv_buffers = {arg: buffer_name for buffer_name, arg in buffers_names_unflatten.items()}
     inv_optimstates = {}
@@ -844,6 +857,28 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         for typ, ph_name in state.items():
             inv_optimstates[ph_name] = param_key
             inv_optimstates_type[ph_name] = typ
+
+    output2input_params = {
+        output_name: input_name for output_name, input_name in zip(
+            pytree.tree_flatten(output_params_names_unflatten)[0],
+            pytree.tree_flatten(params_names_unflatten)[0]
+        )
+    }
+
+    output2input_buffers = {
+        output_name: input_name for output_name, input_name in zip(
+            pytree.tree_flatten(output_buffers_names_unflatten)[0],
+            pytree.tree_flatten(buffers_names_unflatten)[0]
+        )
+    }
+
+    output2input_optimstates = {
+        output_name: input_name for output_name, input_name in zip(
+            output_optimstates_names_flatten,
+            pytree.tree_flatten(optimstates_names_unflatten)[0]
+        )
+    }
+
 
     splited_global, part_cnt = split_by(traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
@@ -951,12 +986,15 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         inv_buffers=inv_buffers,
         inv_optimstates=inv_optimstates,
         inv_optimstates_type=inv_optimstates_type,
-        maybe_updated_params_names_unflatten=maybe_updated_params_names_unflatten,
-        maybe_updated_buffers_names_unflatten=maybe_updated_buffers_names_unflatten,
-        updated_optimstates_names_unflatten=updated_optimstates_names_unflatten,
-        updated_optimstates_names_flatten=updated_optimstates_names_flatten,
+        output_params_names_unflatten=output_params_names_unflatten,
+        output_buffers_names_unflatten=output_buffers_names_unflatten,
+        output_optimstates_names_unflatten=output_optimstates_names_unflatten,
+        output_optimstates_names_flatten=output_optimstates_names_flatten,
         nones_or_grads_names_unflatten=nones_or_grads_names_unflatten,
         returns_names_unflatten=returns_names_unflatten,
+        output2input_params=output2input_params,
+        output2input_buffers=output2input_buffers,
+        output2input_optimstates=output2input_optimstates,
         node_to_stage_idx=None
     )
 
@@ -1019,11 +1057,11 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
         if is_backward_called:
             for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                     reversed(current_stateful_fw_bw[nstages:])):
-                compiled_stage = CompiledStage(fw_gm, bw_gm, None)
+                compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, None)
                 compiled_stages.append(compiled_stage)
         else:
             for fw_gm in current_stateful_fw_bw:
-                compiled_stage = CompiledStage(fw_gm, None, None)
+                compiled_stage = CompiledStage(compiled_meta, fw_gm, None, None)
                 compiled_stages.append(compiled_stage)
         current_stateful_fw_bw = None
 
@@ -1031,6 +1069,7 @@ def compile_pipeline(traced_stateless_func, nstages, stateless_func_args, delaye
     env = {}
     submod_idx = 0
     name_to_stage_idx = {}
+    all_states_names_flatten = set(pytree.tree_flatten([params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten])[0])
 
     for node in splited_fw_bw_gm.graph.nodes:
         if node.op == 'placeholder':

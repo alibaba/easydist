@@ -147,9 +147,10 @@ class PipelineStage:
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
             assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
             self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(self.device)
-        for name, tensor in self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(self.device)
+        if self.step_node is not None:
+            for name, tensor in self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
+                assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+                self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;
@@ -179,15 +180,16 @@ class PipelineStage:
         self.fw_kwargs_recv_info: Dict[int, Dict] = {}
         for chunk in range(self.num_chunks):
             self.fw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.fw_node)
-
-        self.bw_args_recv_info: Dict[int, Tuple] = {}
-        self.bw_kwargs_recv_info: Dict[int, Dict] = {}
-        for chunk in range(self.num_chunks):
-            self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.bw_node)
-
-        # Send info during forward for each activation
+        
         self.fw_act_send_info = self._create_act_send_info(self.fw_node)
-        self.bw_act_send_info = self._create_act_send_info(self.bw_node)
+
+        if self.bw_node is not None:
+            self.bw_args_recv_info: Dict[int, Tuple] = {}
+            self.bw_kwargs_recv_info: Dict[int, Dict] = {}
+            for chunk in range(self.num_chunks):
+                self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.bw_node)
+
+            self.bw_act_send_info = self._create_act_send_info(self.bw_node)
 
 
     def get_stage_index_of_node_name(
@@ -408,9 +410,9 @@ class PipelineStage:
         self.outputs_batch.clear()
 
     def _merge_output_chunks(self) -> Dict[str, Any]:
-        maybe_updated_params_names_unflatten = self.compiled_meta.maybe_updated_params_names_unflatten
-        maybe_updated_buffers_names_unflatten = self.compiled_meta.maybe_updated_buffers_names_unflatten
-        updated_optimstates_names_unflatten = self.compiled_meta.updated_optimstates_names_unflatten
+        maybe_updated_params_names_unflatten = self.compiled_meta.output_params_names_unflatten
+        maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_names_unflatten
+        updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_names_unflatten
         nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
         returns_names_unflatten = self.compiled_meta.returns_names_unflatten
         
