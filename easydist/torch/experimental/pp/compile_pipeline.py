@@ -149,7 +149,8 @@ class CompiledStage: # TODO @botbw: make this picklable
                     activations_chunk[output_name] = output
                 if output_name in self.compiled_meta.returns_names_unflatten: # output in returns
                     outputs_chunk[output_name] = output
-                if (output_name in self.compiled_meta.output2input_buffers): # output is updated buffer (will be returned returns_names_unflatten check)
+                if (output_name in self.compiled_meta.output2input_buffers): # output is updated buffer
+                    outputs_chunk[output_name] = output
                     input_node_name = self.compiled_meta.output2input_buffers[output_name]
                     self.fw_gm.injected_states[StateType.BUFFERS][input_node_name] = output # update buffer in case it's not updated in place.
             else:

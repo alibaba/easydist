@@ -65,7 +65,8 @@ def train_step(input, label, model, opt):
     return out.detach(), loss.detach()
 
 def test_main(split_ann_or_policy):
-    module = resnet18().cuda()
+    seed(42)
+    module = resnet18().cuda().train()
     batch_size = 64
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
@@ -174,7 +175,7 @@ def test_main(split_ann_or_policy):
             print('training')
             correct_cnt = 0
             all_cnt = 0
-            for x_batch, y_batch in tqdm(train_dataloader, dynamic_ncols=True):
+            for i, (x_batch, y_batch) in enumerate(tqdm(train_dataloader, dynamic_ncols=True)):
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
                 if x_batch.size(0) != batch_size: # need to solve this?
                     continue
@@ -191,29 +192,27 @@ def test_main(split_ann_or_policy):
                 _, _, _, _, ret = process_outputs(compiled_meta, outputs_dict)
                 out, loss = ret
                 preds = out.argmax(-1)
-                correct_cnt = (preds == y_batch).sum()
-                all_cnt = len(y_batch)
-                correct_cnt += correct_cnt.item()
-                all_cnt += all_cnt
+                correct_cnt += (preds == y_batch).sum()
+                all_cnt += len(y_batch)
 
-            print(f'{epoch} train accuracy: {correct_cnt / all_cnt}, loss: {loss.item()}')
+            print(f'{epoch} train accuracy: {correct_cnt / all_cnt}, last loss: {loss.item()}')
 
-            state_dict = {}
-            for stage in compiled_stages:
-                state_dict.update(stage.state_dict())
-            module.load_state_dict(state_dict)
-            module.eval()
+            # state_dict = {}
+            # for stage in compiled_stages:
+            #     state_dict.update(stage.state_dict())
+            # module.load_state_dict(state_dict)
+            # module.eval()
 
             print('eval')
+            correct_cnt = 0
+            all_cnt = 0
             for x_batch, y_batch in tqdm(valid_dataloader):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 out = module(x_batch)
                 preds = out.argmax(-1)
-                correct_cnt = (preds == y_batch).sum()
-                all_cnt = len(y_batch)
-                correct_cnt += correct_cnt.item()
-                all_cnt += all_cnt
+                correct_cnt += (preds == y_batch).sum()
+                all_cnt += len(y_batch)
             print(f'{epoch} eval accuracy: {correct_cnt / all_cnt}')
 
 
@@ -230,10 +229,8 @@ def test_main(split_ann_or_policy):
         y_batch = y_batch.to(device)
         out = module(x_batch)
         preds = out.argmax(-1)
-        correct_cnt = (preds == y_batch).sum()
-        all_cnt = len(y_batch)
-        correct_cnt += correct_cnt.item()
-        all_cnt += all_cnt
+        correct_cnt += (preds == y_batch).sum()
+        all_cnt += len(y_batch)
     print(f'eval accuracy: {correct_cnt / all_cnt}')
 
 if __name__ == '__main__':

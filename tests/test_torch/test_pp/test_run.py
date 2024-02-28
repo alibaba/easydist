@@ -86,6 +86,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     module = module.train().to(device)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.01, foreach=True)
     if isinstance(split_ann_or_policy, set):
         annotate_split_points(module, split_ann_or_policy)
         nstages = len(split_ann_or_policy) + 1
@@ -199,9 +200,9 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     num_step = 0
 
     for epoch in range(epochs):
-        print(f'epoch {epoch}:')
         stage_kwarg = [None]
         if rank == 0:
+            print(f'epoch {epoch}:')
             for i, (x_batch, y_batch) in enumerate(tqdm(train_dataloader, dynamic_ncols=True)):
                 if x_batch.size(0) != batch_size: # need to solve this?
                     continue
@@ -218,11 +219,21 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         else:
             stage_kwargs = [None, None, None]
             dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
+            all_cnt = 0
+            correct_cnt = 0
             while stage_kwarg[0] != -1:
                 pipe(**stage_kwarg[0])
+                if rank == world_size - 1:
+                    out = pipe.outputs_batch[pipe.compiled_meta.returns_names_unflatten[0]]
+                    all_cnt += len(out)
+                    preds = out.argmax(-1)
+                    correct_cnt += (preds == stage_kwarg[0][pipe.compiled_meta.args_names_unflatten[1]]).sum()
                 if pipe.step_node is not None:
                     pipe.step()
                 dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
+
+        if rank == world_size - 1:
+            print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}')
 
         num_batches_tracked += 1
         num_step += 1
@@ -254,16 +265,14 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             module.eval()
             correct_cnt = 0
             all_cnt = 0
-            for x_batch, y_batch in train_dataloader:
+            for x_batch, y_batch in valid_dataloader:
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 out = module(x_batch)
                 preds = out.argmax(-1)
-                correct_cnt = (preds == y_batch).sum()
-                all_cnt = len(y_batch)
-                correct_cnt += correct_cnt.item()
-                all_cnt += all_cnt
-            print(f'epoch {epoch} accuracy: {correct_cnt / all_cnt}')
+                correct_cnt += (preds == y_batch).sum()
+                all_cnt += len(y_batch)
+            print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
 
     print("finished")
 
