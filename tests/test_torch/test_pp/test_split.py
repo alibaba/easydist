@@ -1,21 +1,13 @@
 import os
 import random
-import inspect
 from contextlib import nullcontext
 from functools import partial
 from typing import cast
 
-from requests import get
 # make easydist happy without torchrun
 os.environ['MASTER_PORT'] = '-1'
 
 import numpy as np
-
-from transformers import (OpenAIGPTConfig, OpenAIGPTModel, 
-                          AutoModel, LlamaModel, LlamaConfig, 
-                          T5Tokenizer, T5ForConditionalGeneration, 
-                          T5ForConditionalGeneration, OpenLlamaModel, 
-                          OpenLlamaConfig, GPT2Config, GPT2Model)
 
 import torch
 import torch.utils._pytree as pytree
@@ -26,16 +18,9 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
-                                                             PipeSplitWrapper,
                                                              compile_pipeline, process_outputs,
                                                              split_into_equal_size,
-                                                             before_split_register,
-                                                             after_split_register,
-                                                             tuple_after_split,
-                                                             tuple_before_split,
-                                                             set_backward_flag,
-                                                             get_backward_flag,
-                                                             process_inputs)
+                                                             set_backward_flag, process_inputs)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -105,7 +90,10 @@ def train_step_gpt(input, label, model, opt):
         opt.zero_grad()
     out = model(input)
     loss = 0
-    for key in ['attentions', 'cross_attentions', 'hidden_states', 'pooler_output', 'pask_key_values', 'last_hidden_state']:
+    for key in [
+            'attentions', 'cross_attentions', 'hidden_states', 'pooler_output', 'pask_key_values',
+            'last_hidden_state'
+    ]:
         if hasattr(out, key) and (attr := getattr(out, key)) is not None:
             if isinstance(attr, torch.Tensor):
                 loss += (attr - torch.ones_like(attr) * label).pow(2).mean()
@@ -131,7 +119,7 @@ def train_step_t5(input, label, model, opt):
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
     module = module.double().train().cuda()
-    opt = None # inference only
+    opt = None  # inference only
     # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
@@ -196,10 +184,11 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
-                                  tracing_mode='fake',
-                                  decomposition_table=EASYDIST_DECOMP_TABLE,
-                                  _allow_non_fake_inputs=False)(params, buffers, named_states,
-                                                                args, kwargs)
+                                           tracing_mode='fake',
+                                           decomposition_table=EASYDIST_DECOMP_TABLE,
+                                           _allow_non_fake_inputs=False)(params, buffers,
+                                                                         named_states, args,
+                                                                         kwargs)
 
     traced_stateless_func.graph.eliminate_dead_code()
     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
@@ -219,7 +208,10 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
 
-    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func, nstages, stateless_func_args, strict=False)
+    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
+                                                                nstages,
+                                                                stateless_func_args,
+                                                                strict=False)
 
     epochs = 2
     dataset = []
@@ -252,7 +244,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             stateless_func_args_copy[3][0] = rand_input
             stateless_func_args_copy[3][1] = label
             out_copy = traced_stateless_func(*stateless_func_args_copy)
-            stateless_func_args_copy[0] = out_copy[0] # will update inplace?
+            stateless_func_args_copy[0] = out_copy[0]  # will update inplace?
             stateless_func_args_copy[1] = out_copy[1]
             stateless_func_args_copy[2] = out_copy[2]
 
@@ -378,7 +370,7 @@ if __name__ == '__main__':
     #     tup = (input.attentions, input.cross_attentions, input.hidden_states, input.last_hidden_state,
     #            input.past_key_values, input['last_hidden_state'])
     #     return tuple_before_split(ctx, tup)
-    
+
     # @after_split_register(BaseModelOutputWithPastAndCrossAttentions)
     # def after_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
     #     tup = tuple_after_split(ctx, input)

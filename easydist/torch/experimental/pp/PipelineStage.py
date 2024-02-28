@@ -22,12 +22,11 @@ def _make_tensor_from_meta(
     example_value: FakeTensor,
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.empty(
-        example_value.size(), dtype=example_value.dtype, device=device
-    )
+    return torch.empty(example_value.size(), dtype=example_value.dtype, device=device)
 
 
 class RecvInfo:
+
     def __init__(
         self,
         input_name: str,
@@ -51,6 +50,7 @@ class StageKwargPlaceholder:
 
 
 class PipelineStage:
+
     def __init__(
         self,
         local_gm: fx.GraphModule,
@@ -82,9 +82,9 @@ class PipelineStage:
 
         self.outputs_batch = {}
 
-
         if dist.get_world_size(self.group) > self.num_stages:
-            raise RuntimeError("Number of ranks is larger than number of stages, some ranks are unused")
+            raise RuntimeError(
+                "Number of ranks is larger than number of stages, some ranks are unused")
 
         # `group_rank` is rank in process group `group`.
         self.group_rank = dist.get_rank(group)
@@ -104,7 +104,7 @@ class PipelineStage:
                 self.fw_node = node
         if not self.fw_node:
             raise AssertionError(f"Cannot find {self.name} in graph")
-        
+
         # Find my backward node in graph
         self.bw_node = None
         for node in self.local_gm.graph.nodes:
@@ -143,14 +143,18 @@ class PipelineStage:
         # that case.
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
             assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(self.device)
+            self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
+                self.device)
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
             assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(self.device)
+            self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
+                self.device)
         if self.step_node is not None:
-            for name, tensor in self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
+            for name, tensor in self.compiled_stage.step_gm.injected_states[
+                    StateType.OPTIMSTATES].items():
                 assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-                self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(self.device)
+                self.compiled_stage.step_gm.injected_states[
+                    StateType.OPTIMSTATES][name] = tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;
@@ -180,7 +184,7 @@ class PipelineStage:
         self.fw_kwargs_recv_info: Dict[int, Dict] = {}
         for chunk in range(self.num_chunks):
             self.fw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.fw_node)
-        
+
         self.fw_act_send_info = self._create_act_send_info(self.fw_node)
 
         if self.bw_node is not None:
@@ -190,7 +194,6 @@ class PipelineStage:
                 self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.bw_node)
 
             self.bw_act_send_info = self._create_act_send_info(self.bw_node)
-
 
     def get_stage_index_of_node_name(
         self,
@@ -213,13 +216,15 @@ class PipelineStage:
                 gi_dsts.append(dst_rank)
             # Next `getitem` will point to the next output index
 
-        logger.info(f"[{self.group_rank}] " f"Send info: {act_send_info}")
+        logger.info(f"[{self.group_rank}] "
+                    f"Send info: {act_send_info}")
         return dict(sorted(act_send_info.items()))
 
     def _create_act_recv_buffers(
         self,
         node,
     ):
+
         def create_recv_tensor(
             input_node,
             output_idx: Optional[int] = None,
@@ -234,11 +239,9 @@ class PipelineStage:
 
             example_value = self.node_metas[input_node.name]["val"]
 
-            logger.info(
-                f"[{self.group_rank}] "
-                f"Creating recv buffer for input '{input_node.name}' "
-                f"value index {output_idx}: {example_value.size()}"
-            )
+            logger.info(f"[{self.group_rank}] "
+                        f"Creating recv buffer for input '{input_node.name}' "
+                        f"value index {output_idx}: {example_value.size()}")
 
             src_rank = self.get_stage_index_of_node_name(input_node.name)
             buffer = _make_tensor_from_meta(example_value, self.device)
@@ -266,18 +269,14 @@ class PipelineStage:
         return self.get_stage_index_of_node_name(user.name)
 
     def _recv_tensor(self, info, recv_reqs):
-        logger.debug(
-            f"[{self.group_rank}] "
-            f"Receiving tensor '{info.input_name}' from Rank {info.source}: "
-            f"{info.buffer.size()}"
-        )
+        logger.debug(f"[{self.group_rank}] "
+                     f"Receiving tensor '{info.input_name}' from Rank {info.source}: "
+                     f"{info.buffer.size()}")
         # Use async to parallelize recv of tensors
         peer_rank = self.stage_index_to_group_rank[info.source]
         work = dist.irecv(
             info.buffer,
-            peer_rank
-            if self.group is None
-            else dist.get_global_rank(self.group, peer_rank),
+            peer_rank if self.group is None else dist.get_global_rank(self.group, peer_rank),
             group=self.group,
         )
         recv_reqs.append(work)
@@ -297,8 +296,8 @@ class PipelineStage:
                 args,
                 kwargs,
                 self.num_chunks,
-                None, #self.pipe.args_chunk_spec,
-                None, #self.pipe.kwargs_chunk_spec,
+                None,  #self.pipe.args_chunk_spec,
+                None,  #self.pipe.kwargs_chunk_spec,
             )
 
     def _recv_and_fill_inputs(
@@ -341,16 +340,13 @@ class PipelineStage:
         for name, dst_stages in send_info.items():
             out = output_dict[name]
             for dst in dst_stages:
-                logger.debug(
-                    f"[{self.group_rank}] "
-                    f"Sending tensor to Rank {dst}: {out.size()}"
-                )
+                logger.debug(f"[{self.group_rank}] "
+                             f"Sending tensor to Rank {dst}: {out.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
                     out,
-                    peer_rank
-                    if self.group is None
-                    else dist.get_global_rank(self.group, peer_rank),  # TODO
+                    peer_rank if self.group is None else dist.get_global_rank(
+                        self.group, peer_rank),  # TODO
                     group=self.group,
                 )
                 send_reqs.append(work)
@@ -361,14 +357,13 @@ class PipelineStage:
         self,
         chunk: int,
     ):
-        composite_kwargs_chunk = self._recv_and_fill_inputs(
-            self.kwargs_split,
-            self.fw_kwargs_recv_info,
-            chunk
-        )
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.kwargs_split,
+                                                            self.fw_kwargs_recv_info, chunk)
 
         # Compute forward
-        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs_chunk)
+        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[chunk],
+                                                    self.outputs_chunks[chunk],
+                                                    **composite_kwargs_chunk)
 
         assert isinstance(outputs_chunk, dict), "Only dict output is supported"
         logger.debug(map_debug_info(outputs_chunk))
@@ -381,14 +376,13 @@ class PipelineStage:
         self,
         chunk: int,
     ):
-        composite_kwargs_chunk = self._recv_and_fill_inputs(
-            self.bw_args_recv_info,
-            self.bw_kwargs_recv_info,
-            chunk
-        )
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_args_recv_info,
+                                                            self.bw_kwargs_recv_info, chunk)
 
         # `stage_backward` node does not have `args`, only `kwargs`
-        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk], self.outputs_chunks[chunk], **composite_kwargs_chunk)
+        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk],
+                                                     self.outputs_chunks[chunk],
+                                                     **composite_kwargs_chunk)
 
         grad_send_reqs = self._send_output_dict(self.bw_act_send_info, outputs_chunk)
         self.all_bw_send_reqs += grad_send_reqs
@@ -415,7 +409,7 @@ class PipelineStage:
         updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_names_unflatten
         nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
         returns_names_unflatten = self.compiled_meta.returns_names_unflatten
-        
+
         params = {}
         buffers = {}
         optimstates = {}
@@ -444,13 +438,7 @@ class PipelineStage:
         rets = {k: v for k, v in zip(returns_names_unflatten, rets)}
         grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
-        self.outputs_batch = {
-            **params,
-            **buffers,
-            **optimstates,
-            **grads,
-            **rets
-        }
+        self.outputs_batch = {**params, **buffers, **optimstates, **grads, **rets}
 
         return self.outputs_batch
 
@@ -493,31 +481,23 @@ class PipelineStage:
     def all_gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
         outputs = process_outputs_non_strict(self.compiled_meta, self.outputs_batch)
-        dist.gather_object(
-            outputs,
-            outputs_all_stages if self.group_rank == rank else None,
-            dst=rank
-        )
+        dist.gather_object(outputs,
+                           outputs_all_stages if self.group_rank == rank else None,
+                           dst=rank)
         return outputs_all_stages
 
     def all_gather_state_dict(self, rank):
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()
-        dist.gather_object(
-            state_dict,
-            state_dicts if self.group_rank == rank else None,
-            dst=rank
-        )
+        dist.gather_object(state_dict, state_dicts if self.group_rank == rank else None, dst=rank)
         return state_dicts
-    
+
     def all_gather_optimizer_state_dict(self, rank):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
-        dist.gather_object(
-            optimizer_state_dict,
-            optimizer_state_dicts if self.group_rank == rank else None,
-            dst=rank
-        )
+        dist.gather_object(optimizer_state_dict,
+                           optimizer_state_dicts if self.group_rank == rank else None,
+                           dst=rank)
         return optimizer_state_dicts
 
 

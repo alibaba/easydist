@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 from torch import fx
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -86,9 +85,7 @@ def modify_graph_op_device(
         if node.op == "call_function":
             for arg in node.args:
                 if isinstance(arg, torch.device) and arg != new_device:
-                    logger.debug(
-                        f"Changing device of Node {node.name} from {arg} to {new_device}"
-                    )
+                    logger.debug(f"Changing device of Node {node.name} from {arg} to {new_device}")
                     arg = new_device
                     modified = True
             if "device" in node.kwargs and node.kwargs["device"] != new_device:
@@ -112,15 +109,13 @@ class QualnameMapMixin:
         splitter_qualname_map: Dict[str, str] = None,
         tracer_qualname_map: Dict[str, str] = None,
     ):
-        self.new_to_old_qualname_mapping: Dict[str, str] = (
-            splitter_qualname_map or {}
-        )
+        self.new_to_old_qualname_mapping: Dict[str, str] = (splitter_qualname_map or {})
         self.tracer_qualname_map = tracer_qualname_map
 
     def remap_qualname(self, qualname: str):
         # TODO: annoying
         if qualname.startswith("split_gm."):
-            qualname = qualname[len("split_gm.") :]
+            qualname = qualname[len("split_gm."):]
 
         name_before_split = None
         if qualname in self.new_to_old_qualname_mapping:
@@ -148,11 +143,14 @@ class QualnameMapMixin:
         else:
             return name_before_split
 
+
 from torch.fx.passes.graph_drawer import FxGraphDrawer
+
 
 def save_graphviz_dot(gm, name):
     with open(f"{name}.dot", "w") as f:
         f.write(str(FxGraphDrawer(gm, name).get_dot_graph()))
+
 
 def friendly_debug_info(v):
     if isinstance(v, torch.Tensor):

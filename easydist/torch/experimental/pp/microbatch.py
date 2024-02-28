@@ -4,9 +4,7 @@ import logging
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
-
 logger = logging.getLogger(__name__)
-
 """
 _debug_mask_minibatches specifies to send masked versions of the mini-batch
 through instead of micro-batch slices--this can be used for more stable
@@ -16,6 +14,7 @@ _debug_mask_minibatches = False
 
 
 class CustomReducer:
+
     def __init__(self, init_value, reduce_fn):
         self.init_value = init_value
         self.reduce_fn = reduce_fn
@@ -32,6 +31,7 @@ DEFAULT_CHUNK_DIM = 0
 
 # Class used to specify chunking of inputs
 class TensorChunkSpec:
+
     def __init__(self, split_dim):
         self.split_dim = split_dim
 
@@ -75,10 +75,8 @@ def shard_dict_of_args(
         if chunk_spec is not None:
             chunk_spec_flat, _ = tree_flatten(chunk_spec)
             if len(flat) != len(chunk_spec_flat):
-                raise ValueError(
-                    f"Argument value {arg} did not have the same number of "
-                    f"values as as chunk spec {chunk_spec}"
-                )
+                raise ValueError(f"Argument value {arg} did not have the same number of "
+                                 f"values as as chunk spec {chunk_spec}")
         else:
             # If user did not provide an args_chunk_spec, we would use a default spec which chunks along dim 0
             chunk_spec_flat = [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(flat)
@@ -110,12 +108,9 @@ def shard_dict_of_args(
                             f"smaller than the number of chunks {num_chunks}. "
                             "PiPPy cannot reduce the number of chunks because "
                             "other arguments have bigger chunk-dimension sizes. "
-                            "Please adjust your num_chunks setting."
-                        )
+                            "Please adjust your num_chunks setting.")
 
-                chunk_tensors = torch.tensor_split(
-                    v, real_num_chunks, chunk_v.split_dim
-                )
+                chunk_tensors = torch.tensor_split(v, real_num_chunks, chunk_v.split_dim)
 
                 if _debug_mask_minibatches:
                     expanded_chunks = []
@@ -123,14 +118,10 @@ def shard_dict_of_args(
                     split_dim_idx = 0
                     for chunk_tensor in chunk_tensors:
                         new_val = torch.zeros_like(v)
-                        upper_idx = split_dim_idx + chunk_tensor.size(
-                            chunk_v.split_dim
-                        )
+                        upper_idx = split_dim_idx + chunk_tensor.size(chunk_v.split_dim)
 
                         slice_indices = [slice(None, None, None)] * new_val.ndim
-                        slice_indices[chunk_v.split_dim] = slice(
-                            split_dim_idx, upper_idx
-                        )
+                        slice_indices[chunk_v.split_dim] = slice(split_dim_idx, upper_idx)
                         new_val[slice_indices] = chunk_tensor
 
                         expanded_chunks.append(new_val)
@@ -245,10 +236,8 @@ def split_args_kwargs_into_chunks(
         )
 
     if len(args_split_dict) != len(kwargs_split):
-        raise RuntimeError(
-            "args and kwargs are split into different number of chunks: "
-            f"{len(args_split_dict)}, {len(kwargs_split)}"
-        )
+        raise RuntimeError("args and kwargs are split into different number of chunks: "
+                           f"{len(args_split_dict)}, {len(kwargs_split)}")
 
     args_split = []
     for chunk_args in args_split_dict:
@@ -305,9 +294,7 @@ def merge_chunks(chunks, chunk_spec):
     for chunk in chunks:
         chunk_flattened, _ = tree_flatten(chunk)
         if len(chunk_flattened) != len(spec_flattened):
-            raise ValueError(
-                f"Chunk {chunk} did not match chunk spec {chunk_spec}"
-            )
+            raise ValueError(f"Chunk {chunk} did not match chunk spec {chunk_spec}")
 
         chunks_flattened.append(chunk_flattened)
 
@@ -318,8 +305,7 @@ def merge_chunks(chunks, chunk_spec):
     for arg_idx, arg in enumerate(spec_flattened):
         if isinstance(arg, TensorChunkSpec):
             partial_values = [
-                chunks_flattened[chunk_idx][arg_idx]
-                for chunk_idx in range(len(chunks_flattened))
+                chunks_flattened[chunk_idx][arg_idx] for chunk_idx in range(len(chunks_flattened))
             ]
 
             if _debug_mask_minibatches:
@@ -336,19 +322,11 @@ def merge_chunks(chunks, chunk_spec):
                 values_to_cat = []
                 chunk_start_idx = 0
                 assert len(partial_values) == len(meta_chunks)
-                for partial_value, meta_chunk in zip(
-                    partial_values, meta_chunks
-                ):
-                    chunk_end_idx = chunk_start_idx + meta_chunk.size(
-                        arg.split_dim
-                    )
+                for partial_value, meta_chunk in zip(partial_values, meta_chunks):
+                    chunk_end_idx = chunk_start_idx + meta_chunk.size(arg.split_dim)
 
-                    slice_indices = [
-                        slice(None, None, None)
-                    ] * partial_value.ndim
-                    slice_indices[arg.split_dim] = slice(
-                        chunk_start_idx, chunk_end_idx
-                    )
+                    slice_indices = [slice(None, None, None)] * partial_value.ndim
+                    slice_indices[arg.split_dim] = slice(chunk_start_idx, chunk_end_idx)
                     sliced = partial_value[slice_indices]
                     values_to_cat.append(sliced)
 
@@ -356,8 +334,8 @@ def merge_chunks(chunks, chunk_spec):
 
             else:
                 values_to_cat = partial_values
-            
-            if all(v is None for v in values_to_cat): # None
+
+            if all(v is None for v in values_to_cat):  # None
                 args_flattened.append(None)
                 continue
 
@@ -371,9 +349,7 @@ def merge_chunks(chunks, chunk_spec):
             reduced_val = arg.init_value
 
             for chunk_idx in range(len(chunks_flattened)):
-                reduced_val = arg.reduce_fn(
-                    reduced_val, chunks_flattened[chunk_idx][arg_idx]
-                )
+                reduced_val = arg.reduce_fn(reduced_val, chunks_flattened[chunk_idx][arg_idx])
 
             args_flattened.append(reduced_val)
         else:

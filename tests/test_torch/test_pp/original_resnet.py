@@ -65,4 +65,6 @@ if __name__ == "__main__":
                     loss = criterion(outp, y_batch)
                     loss.backward()
                     optimizer.step()
-            print(f"Loader: {k}. Accuracy: {epoch_correct / epoch_all} Loss: {loss.item() if k == 'train' else 'N/A'}")
+            print(
+                f"Loader: {k}. Accuracy: {epoch_correct / epoch_all} Loss: {loss.item() if k == 'train' else 'N/A'}"
+            )

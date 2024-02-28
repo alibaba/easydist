@@ -49,15 +49,18 @@ dict_keys([
 fw_bw_param_type = typing.Sequence[typing.Optional[torch.Tensor]]
 fw_bw_ret_type = typing.List[torch.Tensor]
 
+
 @torch._custom_ops.custom_op("easydist::fw_bw_split")
 def fw_bw_split(args: fw_bw_param_type) -> fw_bw_ret_type:
     ...
+
 
 @torch._custom_ops.impl_abstract("easydist::fw_bw_split")
 def fw_bw_split_impl_abstract(args: fw_bw_param_type) -> fw_bw_ret_type:
     need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
     args = [arg.clone() if need_clone(arg) else arg for arg in args]
     return args
+
 
 @torch._custom_ops.impl("easydist::fw_bw_split")
 def fw_bw_split_impl(args: fw_bw_param_type) -> fw_bw_ret_type:
@@ -70,9 +73,10 @@ def fw_bw_split_impl(args: fw_bw_param_type) -> fw_bw_ret_type:
 class FWBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, *tensor_list): # tensors must be passed as args
-        tensor_list = list(tensor_list) # custom op requires list
-        return tuple(torch.ops.easydist.fw_bw_split(tensor_list)) # return must be tensor of tuple of tensors
+    def forward(ctx, *tensor_list):  # tensors must be passed as args
+        tensor_list = list(tensor_list)  # custom op requires list
+        return tuple(torch.ops.easydist.fw_bw_split(
+            tensor_list))  # return must be tensor of tuple of tensors
 
     @staticmethod
     def backward(ctx, *grads):
@@ -87,12 +91,14 @@ def fw_bw_split_func(tensor_list: fw_bw_param_type) -> fw_bw_ret_type:
 class BeforeBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, tensor): # tensors must be passed as args
-        return torch.ops.easydist.fw_bw_split([tensor])[0] # return must be tensor of tuple of tensors
+    def forward(ctx, tensor):  # tensors must be passed as args
+        return torch.ops.easydist.fw_bw_split([tensor
+                                               ])[0]  # return must be tensor of tuple of tensors
 
     @staticmethod
     def backward(ctx, grad):
-        return grad # return must be tensor of tuple of tensors
+        return grad  # return must be tensor of tuple of tensors
+
 
 def before_bw_split_func(tensor):
     ret = BeforeBWSplitFunc.apply(tensor)
