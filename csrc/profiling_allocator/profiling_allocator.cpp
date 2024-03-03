@@ -1,3 +1,17 @@
+/* Copyright (c) 2023, Alibaba Group;
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+==============================================================================*/
+
 #include <sys/types.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
@@ -18,237 +32,135 @@ PyObject *allocator_profiling_info_queue = nullptr;
 PyObject *allocator_mode = nullptr;
 
 void* reserved_space_for_memory_plan = nullptr;
+uintptr_t mem_start = 0;
+uintptr_t mem_end = 0;
 std::unordered_set<void*> profiling_ptrs;
 std::unordered_set<void*> assigned_ptrs;
 bool memory_plan_initialized = false;
 bool runtime_shortcut = false;
-
-class NodeMemoryPlan {
-   int malloc_counter = 0;
-public:
-   std::vector<int> output_indexes;
-   std::vector<uintptr_t> assigned_addresses;
-   int total_mallocs;
-
-   NodeMemoryPlan() : total_mallocs(0) {}
-
-   NodeMemoryPlan(
-      std::vector<int>&& output_indexes,
-      std::vector<uintptr_t>&& assigned_addresses,
-      int total_mallocs) noexcept
-      :  output_indexes(std::move(output_indexes)),
-         assigned_addresses(std::move(assigned_addresses)),
-         total_mallocs(total_mallocs) {}
-
-   void* get_assigned_address() {
-      // 1. return assigned address if current malloc is for output
-      // 2. return nullptr if not for output
-      void* ptr = nullptr;
-      if (std::find(output_indexes.begin(), output_indexes.end(), malloc_counter) != output_indexes.end()) {
-         ptr = reinterpret_cast<void*>(assigned_addresses[malloc_counter]);
-      }
-      malloc_counter++;
-      malloc_counter %= total_mallocs;
-      return ptr;
-   }
-};
+ssize_t mem_size = 0;
+ssize_t temp_mem_size = 0;
 
 class GraphMemoryPlan {
-   std::unordered_map<std::string, NodeMemoryPlan> m_plan;
-   std::vector<std::string> graph_execution_order;
-   std::vector<int> global_output_indexes;
-   std::vector<uintptr_t> global_assigned_addresses;
-   int global_malloc_counter = 0;
-   bool is_graph_execution_order_set = false;
-   bool is_global_info_ready = false;
-   bool is_global_output_indexes_initialized = false;
-   bool is_global_assigned_addresses_initialized = false;
+  int malloc_counter = 0;
+  std::vector<void *> mem_addresses_;
+  std::vector<void *> mem_ends_;        // for debug
+  std::vector<std::string> op_names_;   // for debug
+  std::vector<uintptr_t> mem_sizes_;   // for debug
 public:
-   NodeMemoryPlan& operator[](const std::string& key) {
-        return m_plan[key];
-   }
+  std::pair<void*, uintptr_t> get_mem_address(int device) {
+    if (malloc_counter >= mem_addresses_.size()) {
+      std::cerr << "allocation number exceeds limit!" << std::endl;
+      exit(-1);
+    }
 
-   auto find(const std::string& key) {
-      return m_plan.find(key);
-   }
+    //std::cout << "rank: " << device << ", malloc_counter: " << malloc_counter
+    //          << ", op: " << op_names_[malloc_counter] << std::endl;
+    void* ptr = mem_addresses_[malloc_counter];
+    uintptr_t size = mem_sizes_[malloc_counter];
+    ++malloc_counter;
+    if (malloc_counter == mem_addresses_.size()) {
+        malloc_counter = 0;
+    }
+    return std::make_pair(ptr, size);
+  }
 
-   auto end() {
-      return m_plan.end();
-   }
+  void reset_malloc_counter() {
+    malloc_counter = 0;
+  }
 
-   void set_graph_execution_order(std::vector<std::string>&& new_order) {
-      graph_execution_order = std::move(new_order);
-      is_graph_execution_order_set = true;
-   }
+  void set_mem_addresses(std::vector<void *>& mem_addresses) {
+    mem_addresses_ = std::move(mem_addresses);
+  }
 
-   void init_global_info() {
-      build_global_output_indexes();
-      build_global_assigned_addresses();
-      is_global_info_ready = is_global_output_indexes_initialized && is_global_assigned_addresses_initialized;
-   }
+  void set_mem_ends(std::vector<void *>& mem_ends) {
+    mem_ends_ = std::move(mem_ends);
+  }
 
-   void* get_global_assigned_address() {
-      void* ptr = nullptr;
-      if (std::find(
-         global_output_indexes.begin(),
-         global_output_indexes.end(),
-         global_malloc_counter) != global_output_indexes.end()) {
-         ptr = reinterpret_cast<void*>(global_assigned_addresses[global_malloc_counter]);
-      }
-      global_malloc_counter++;
-      return ptr;
-   }
+  void set_mem_sizes(std::vector<uintptr_t>& mem_sizes) {
+    mem_sizes_ = std::move(mem_sizes);
+  }
 
-   void print_global_info() {
-      if (!is_global_info_ready){
-         std::cerr << "global_info not ready yet!" << std::endl;
-         return;
-      }
+  void set_op_names(std::vector<std::string>& op_names) {
+    op_names_ = std::move(op_names);
+  }
 
-      // print graph_execution_order
-      int print_count = 0;
-      std::cout << "graph_execution_order: [";
-      for (auto i: graph_execution_order) {
-         std::cout << i;
-         if(print_count++ != graph_execution_order.size() - 1) std::cout << ", ";
-      }
-      std::cout << "]" << std::endl;
+  std::string memory_info_str() {
+    // print mem_addresses
+    std::string res = "mem_addresses: [\n";
+    for (int i=0; i<mem_addresses_.size(); ++i) {
+       res += std::to_string(i) + "(" + op_names_[i] + "): "
+              + std::to_string((uintptr_t)mem_addresses_[i]) + " ~ "
+              + std::to_string((uintptr_t)mem_ends_[i]) + ", size: "
+              + std::to_string(mem_sizes_[i]) + "\n";
+    }
+    res += "]\n";
 
-      // print global_output_indexes
-      print_count = 0;
-      std::cout << "global_output_indexes: [";
-      for (auto i: global_output_indexes) {
-         std::cout << i;
-         if(print_count++ != global_output_indexes.size() - 1) std::cout << ", ";
-      }
-      std::cout << "]" << std::endl;
-
-      // print global_assigned_addresses
-      print_count = 0;
-      std::cout << "global_assigned_addresses: [";
-      for (auto i: global_assigned_addresses) {
-         std::cout << i;
-         if(print_count++ != global_assigned_addresses.size() - 1) std::cout << ", ";
-      }
-      std::cout << "]" << std::endl;
-   }
-
-private:
-   void build_global_output_indexes() {
-      if (is_global_output_indexes_initialized) {
-         std::cerr << "global_output_indexes already initialized!" << std::endl;
-         exit(-1);
-      }
-
-      if (!is_graph_execution_order_set) {
-         std::cerr << "graph_execution_order not ready!" << std::endl;
-         exit(-1);
-      }
-
-      int current_index_offset = 0;
-      for (const auto& node_name: graph_execution_order) {
-         for (const auto& index: m_plan[node_name].output_indexes) {
-            global_output_indexes.push_back(current_index_offset + index);
-         }
-         current_index_offset += m_plan[node_name].total_mallocs;
-      }
-      is_global_output_indexes_initialized = true;
-   }
-
-   void build_global_assigned_addresses() {
-      if (is_global_assigned_addresses_initialized) {
-         std::cerr << "global_assigned_addresses already initialized!" << std::endl;
-         exit(-1);
-      }
-
-      if (!is_graph_execution_order_set) {
-         std::cerr << "graph_execution_order not ready!" << std::endl;
-         exit(-1);
-      }
-
-      for (const auto& node_name: graph_execution_order) {
-         const auto& next_assigned_addresses = m_plan[node_name].assigned_addresses;
-         global_assigned_addresses.insert(
-            global_assigned_addresses.end(),
-            next_assigned_addresses.begin(),
-            next_assigned_addresses.end());
-      }
-      is_global_assigned_addresses_initialized = true;
-   }
+    return res;
+  }
 };
 
 GraphMemoryPlan graph_memory_plan;
 
 void init_memory_plan(int device) {
-   if (memory_plan_initialized) {
-      std::cerr << "Error: Memory plan already initialized!" << std::endl;
-      exit(-1);
-   }
-   // read memory plan starts
-   PyObject *memory_plan = PyDict_GetItemString(global_dict, "memory_plan");
-   PyObject *keys = PyDict_Keys(memory_plan);
+  if (memory_plan_initialized) {
+    std::cerr << "Error: Memory plan already initialized!" << std::endl;
+    exit(-1);
+  }
 
-   // read node memory plan from each node
-   for (Py_ssize_t i = 0; i < PyList_Size(keys); i++) {
-      // get dict keys
-      PyObject *key = PyList_GetItem(keys, i);
+  // read memory addresses in plan and convert them to physical memory addresses
+  std::vector<void *> mem_addresses;
+  std::vector<void *> mem_ends;       // for debug
+  std::vector<std::string> op_names;  // for debug
+  std::vector<uintptr_t> mem_sizes;   // for debug
+  PyObject *py_raw_mem_allocs = PyDict_GetItemString(global_dict, "raw_mem_allocs");
+  mem_start = reinterpret_cast<uintptr_t>(reserved_space_for_memory_plan);
+  mem_end = mem_start + mem_size + temp_mem_size;
+  uintptr_t temp_mem_start = mem_start + mem_size;
+  //std::cout << "rank: " << device << ", mem_start: " << mem_start << std::endl;
+  //std::cout << "rank: " << device << ", temp_mem_start: " << temp_mem_start
+  //          << std::endl;
 
-      // get values according to the key
-      PyObject *node_memory_plan = PyDict_GetItem(memory_plan, key);
+  for (Py_ssize_t i = 0; i < PyList_Size(py_raw_mem_allocs); i++) {
+    PyObject* current_alloc = PyList_GetItem(py_raw_mem_allocs, i);
+    PyObject* py_addr = PyTuple_GetItem(current_alloc, 0);
+    uintptr_t addr = PyLong_AsLong(py_addr);
+    PyObject* py_is_temp_mem = PyTuple_GetItem(current_alloc, 2);
+    if (PyObject_IsTrue(py_is_temp_mem)) {
+      addr += temp_mem_start;
+    } else {
+      addr += mem_start;
+    }
+    mem_addresses.push_back(reinterpret_cast<void *>(addr));
 
-      // read attributes from node_memory_plan
-      //
-      // 1. read output indexes
-      PyObject *output_indexes = PyObject_GetAttrString(node_memory_plan, "output_indexes");
-      std::vector<int> new_output_indexes;
-      Py_ssize_t len_output_indexes = PyList_Size(output_indexes);
-      for (Py_ssize_t i = 0; i < len_output_indexes; i++) {
-         PyObject *index = PyList_GetItem(output_indexes, i);
-         int index_value = PyLong_AsLong(index);
-         new_output_indexes.push_back(index_value);
-      }
+    PyObject* py_size = PyTuple_GetItem(current_alloc, 1);
+    uintptr_t size = PyLong_AsLong(py_size);
+    mem_sizes.push_back(size);
+    mem_ends.push_back(reinterpret_cast<void *>(addr+size));
 
-      // 2. read assigned addresses
-      PyObject *assigned_addresses = PyObject_GetAttrString(node_memory_plan, "assigned_addresses");
-      std::vector<uintptr_t> new_assigned_addresses;
-      Py_ssize_t len_assigned_addresses = PyList_Size(assigned_addresses);
-      for (Py_ssize_t i = 0; i < len_assigned_addresses; i++) {
-         PyObject *address = PyList_GetItem(assigned_addresses, i);
-         uintptr_t address_value = PyLong_AsUnsignedLong(address);
-         new_assigned_addresses.push_back(address_value);
-      }
+    PyObject* py_op_name = PyTuple_GetItem(current_alloc, 3);
+    const char* op_name = PyBytes_AsString(PyUnicode_AsUTF8String(py_op_name));
+    op_names.push_back(std::string(op_name));
+  }
 
-      // 3. read total mallocs
-      PyObject *total_mallocs = PyObject_GetAttrString(node_memory_plan, "total_mallocs");
-      int new_total_mallocs = PyLong_AsLong(total_mallocs);
+  graph_memory_plan.set_mem_addresses(mem_addresses);
+  graph_memory_plan.set_op_names(op_names);
+  graph_memory_plan.set_mem_ends(mem_ends);
+  graph_memory_plan.set_mem_sizes(mem_sizes);
 
-      // insert node memory plan into graph memory plan
-      graph_memory_plan[PyUnicode_AsUTF8(key)] = NodeMemoryPlan(
-         std::move(new_output_indexes),
-         std::move(new_assigned_addresses),
-         new_total_mallocs);
-   }
+  //std::cout << "rank: " << device << std::endl
+  //          << graph_memory_plan.memory_info_str();
 
-   // read graph_execution_order
-   std::vector<std::string> new_graph_execution_order;
-   PyObject *py_graph_execution_order = PyDict_GetItemString(global_dict, "graph_execution_order");
-   for (Py_ssize_t i = 0; i < PyList_Size(py_graph_execution_order); i++) {
-      PyObject *current_node_name = PyList_GetItem(py_graph_execution_order, i);
-      new_graph_execution_order.push_back(PyUnicode_AsUTF8(current_node_name));
-   }
-   graph_memory_plan.set_graph_execution_order(std::move(new_graph_execution_order));
-
-   graph_memory_plan.init_global_info();
-
-   if (device == 0) graph_memory_plan.print_global_info();
-
-   // initialization finished
-   memory_plan_initialized = true;
+  // initialization finished
+  memory_plan_initialized = true;
 }
 
 void init_reserved_space() {
-   ssize_t size = PyLong_AsUnsignedLong(PyDict_GetItemString(global_dict, "reserved_memory_size"));
-   cudaMalloc(&reserved_space_for_memory_plan, size);
+  PyObject *py_mem_size = PyDict_GetItemString(global_dict, "mem_size");
+  mem_size = PyLong_AsLong(py_mem_size);
+  PyObject *py_temp_mem_size = PyDict_GetItemString(global_dict, "temp_mem_size");
+  temp_mem_size = PyLong_AsLong(py_temp_mem_size);
+  cudaMalloc(&reserved_space_for_memory_plan, mem_size+temp_mem_size);
 }
 
 void init_allocator(int device_count) {
@@ -335,29 +247,56 @@ void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 }
 
 void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
-   if (!memory_plan_initialized) {
+  PyObject *py_is_customized = PyDict_GetItemString(global_dict, "is_customized");
+  if (PyObject_IsTrue(py_is_customized)) {
+    if (!memory_plan_initialized) {
       std::cerr << "Error: Memory plan is not initialized!" << std::endl;
       exit(-1);
-   }
-   void *ptr = nullptr;
-   op_name = PyDict_GetItemString(global_dict, "op_name");
-   std::string op_name_key = std::string(PyBytes_AsString(PyUnicode_AsUTF8String(op_name)));
+    }
+    void* ptr = 0;
+    if (size == 0) {
+      return ptr;
+    }
 
-   // find if op_name is in memory plan
-   if (graph_memory_plan.find(op_name_key) != graph_memory_plan.end()) {
-      // if op_name in memory plan, set ptr to assigned_address
-      ptr = graph_memory_plan[op_name_key].get_assigned_address();
-   }
-
-   // allocate memory if is not an assigned address
-   if (ptr == nullptr) {
-      cudaMalloc(&ptr, size);
-   }
-   return ptr;
+    std::pair<void*, uintptr_t> addr_size = graph_memory_plan.get_mem_address(device);
+    /*
+    if (device == 0) {
+      std::string malloc_str = "(fake malloc) rank: " + std::to_string(device) + ", ptr: ";
+      malloc_str += std::to_string((uintptr_t)addr_size.first) + ", alloced size: ";
+      malloc_str += std::to_string(addr_size.second) + ", expected size: ";
+      malloc_str += std::to_string(size) + ", stream: ";
+      malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
+      std::cout << malloc_str;
+    }
+    */
+    return addr_size.first;
+  } else {
+    void *ptr = nullptr;
+    cudaMalloc(&ptr, size);
+    /*
+    if (device == 0) {
+      std::string malloc_str = "(real malloc) rank: " + std::to_string(device) + ", ptr: ";
+      malloc_str += std::to_string((uintptr_t)ptr) + ", alloced size: ";
+      malloc_str += std::to_string(size) + ", stream: ";
+      malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
+      std::cout << malloc_str;
+    }
+    */
+    return ptr;
+  }
 }
 
 void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
-   cudaFree(ptr);
+  if (reinterpret_cast<uintptr_t>(ptr) >= mem_end ||
+      reinterpret_cast<uintptr_t>(ptr) < mem_start)
+  {
+    //std::cout << "(real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+    //          << ", size: " << size << std::endl;
+    cudaFree(ptr);
+  } else {
+    //std::cout << "(fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+    //          << ", size: " << size << std::endl;
+  }
 }
 
 void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
@@ -381,8 +320,8 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
       return ptr;
    } else if (allocator_mode_string == "runtime") {
       runtime_shortcut = true;
-      init_memory_plan(device);
       init_reserved_space();
+      init_memory_plan(device);
       return runtime_malloc(size, device, stream);
    } else {
       std::cerr << "allocator mode: " << allocator_mode_string << " unknown!" << std::endl;

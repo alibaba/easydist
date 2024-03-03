@@ -439,10 +439,6 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
         _ = alloc_profiler.run([])
 
-        # print profiling results on rank 0
-        #if rank == 0:
-        #    print(graph_mem_info)
-
         if rank == 0:
             logging.info("finish profiling fx module's memory")
             graph_mem_info = alloc_profiler.create_graph_mem_info()
@@ -494,10 +490,10 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         #print("graph memory plan:")
         #print(str(graph_mem_plan))
 
-
         # setting allocator back to runtime mode
-        alloc_profiler.load_memory_plan()
-        __main__.allocator_mode = 'runtime'
+        alloc_profiler.load_memory_plan(graph_mem_plan)
+
+        #print(f"graph details:\n{str(sharded_graph.graph)}\nend of graph\n")
 
     class EDCompiledFunc:
 
@@ -529,14 +525,22 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
             args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
 
             # run the sharded_graph
-            params, buffers, named_states, grads, sharded_out = graph(
-                params, buffers, named_states, args, kwargs)
+            if mdconfig.enable_memory_opt:
+                __main__.allocator_mode = 'runtime'
+                __main__.is_customized = True
+                params, buffers, named_states, grads, sharded_out = graph(
+                    params, buffers, named_states, args, kwargs)
+                __main__.is_customized = False
+            else:
+                params, buffers, named_states, grads, sharded_out = graph(
+                    params, buffers, named_states, args, kwargs)
 
             for para_name in params:
                 params[para_name].grad = grads[para_name]
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
+            #print(f"local_out: {local_out}, \nshape: {local_out.shape}")
 
             return local_out
 

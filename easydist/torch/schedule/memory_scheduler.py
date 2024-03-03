@@ -36,7 +36,6 @@ class MemoryScheduler:
         for node in fx_module.graph.nodes:
             if node.op == 'placeholder' or node.op == 'get_attr':
                 self.args.append(node)
-                self.nodes_to_schedule.append(node)
             elif node.op == 'output':
                 self.outputs.append(node)
             else:
@@ -65,7 +64,11 @@ class MemoryScheduler:
             pre_scheded_nodes = {}
             step = 0
             for node in self.fx_module.graph.nodes:
-                if node.op != 'output':
+                if (
+                    node.op != 'output' and
+                    node.op != 'placeholder' and
+                    node.op != 'get_attr'
+                ):
                     pre_scheded_nodes[node] = step
                     step += 1
 

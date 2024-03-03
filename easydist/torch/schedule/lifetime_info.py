@@ -32,26 +32,29 @@ class MemSharedTensorGroup:
     def __init__(self):
         self.tensors = {}
         self.sink_nodes_cache = set()
-        self.core_tensor_size = 0
-        self.core_tensor = None  # Tuple[torch.fx.Node, int]
+        self.src_tensor_size = 0
+        self.src_tensor = None  # Tuple[torch.fx.Node, int]
+        self.src_from_ctx = False
 
     def __str__(self) -> str:
-        ret = f"core_tensor_size: {self.core_tensor_size}, core_tensor: {self.core_tensor}\n"
+        ret = f"src_tensor_size: {self.src_tensor_size}, src_tensor: {self.src_tensor}"
+        if self.src_from_ctx:
+            ret += "(from context)"
         for tensor,mem_size in self.tensors.items():
-            ret += f"  node: {tensor[0].name}, out idx: {tensor[1]}, mem size: {mem_size}\n"
+            ret += f"\n  node: {tensor[0].name}, out idx: {tensor[1]}, mem size: {mem_size}"
 
         return ret
 
-    def add_core_tensor(self, tensor: Tuple[torch.fx.Node, int], tensor_size):
-        assert self.core_tensor_size == 0
-        assert not self.core_tensor
-        self.core_tensor_size = tensor_size
-        self.core_tensor = tensor
-        self.tensors[tensor] = tensor_size
+    def set_src_tensor(self, tensor: Tuple[torch.fx.Node, int], tensor_size, src_from_ctx = False):
+        assert self.src_tensor_size == 0 or (src_from_ctx and self.src_tensor_size == tensor_size)
+        assert (not self.src_tensor) or (src_from_ctx and self.src_tensor == tensor)
+        self.src_tensor_size = tensor_size
+        self.src_tensor = tensor
+        self.src_from_ctx = src_from_ctx
 
-    def add_ref_tensor(self, tensor: Tuple[torch.fx.Node, int], tensor_size):
+    def add_tensor(self, tensor: Tuple[torch.fx.Node, int], tensor_size):
         self.tensors[tensor] = tensor_size
-        assert self.core_tensor_size == 0 or self.core_tensor_size >= tensor_size, f"core tensor: {core_tensor[0]}:{core_tensor[1]}, core tensore size: {self.core_tensor_size}, ref tensor size: {tensor_size}"
+        assert self.src_tensor_size == 0 or self.src_tensor_size >= tensor_size, f"core tensor: {src_tensor[0]}:{src_tensor[1]}, core tensore size: {self.src_tensor_size}, ref tensor size: {tensor_size}"
 
     def has_mult_tensors(self):
         return len(self.tensors) > 1
@@ -138,10 +141,12 @@ class MemSharedTensorGroup:
 
 class LifetimeInfo:
     def __init__(self,
+                 graph,                 # torch.fx.Graph
                  nodes_to_schedule,     # list of nodes to be scheduled
                  graph_mem_info,        # GraphMemInfo
                  pre_scheded_nodes,
-                 one_step_one_op):     # user's schedule
+                 one_step_one_op):
+        self.graph = graph
         self.nodes_to_schedule = nodes_to_schedule
         self.graph_mem_info = graph_mem_info
         self.node_set = set(nodes_to_schedule)
@@ -187,26 +192,33 @@ class LifetimeInfo:
             out_vars = graph_mem_info.get_out_vars(node)
             for out_var in out_vars:
                 #print(f"node: {node}, var: {out_var}")
-                out_tensor_key = (node, out_var.out_index)
+                out_tensor = (node, out_var.out_index)
                 if out_var.is_reference:
                     arg_idx = out_var.arg_index
                     tensor_idx = out_var.tensor_index
                     pre_node = node.args[arg_idx]
 
                     pre_shared_group = self.mem_share_info[(pre_node, tensor_idx)]
-                    if out_tensor_key in self.mem_share_info:
-                        out_shared_group = self.mem_share_info[out_tensor_key]
+                    if out_tensor in self.mem_share_info:
+                        out_shared_group = self.mem_share_info[out_tensor]
                         if id(pre_shared_group) != id(out_shared_group):
-                            # merge two groups
+                            # merge two groups and keep pre_shared_group
                             for out_set_item in out_shared_group:
-                                pre_shared_group.add_ref_tensor(out_set_item, out_var.mem_size)
+                                pre_shared_group.add_tensor(out_set_item, out_var.mem_size)
                                 self.mem_share_info[out_set_item] = pre_shared_group
                     else:
-                        pre_shared_group.add_ref_tensor(out_tensor_key, out_var.mem_size)
-                        self.mem_share_info[out_tensor_key] = pre_shared_group
+                        pre_shared_group.add_tensor(out_tensor, out_var.mem_size)
+                        self.mem_share_info[out_tensor] = pre_shared_group
+
+                    if pre_node not in self.node_set:
+                        pre_tensor = (pre_node, tensor_idx)
+                        pre_tensor_var = graph_mem_info.get_out_var(pre_node, tensor_idx)
+                        #print(f"context tensor: {pre_tensor}, size: {pre_tensor_var.mem_size}")
+                        pre_shared_group.set_src_tensor(pre_tensor, pre_tensor_var.mem_size, True)
                 else:
-                    out_shared_group = self.mem_share_info[out_tensor_key]
-                    out_shared_group.add_core_tensor(out_tensor_key, out_var.mem_size)
+                    out_shared_group = self.mem_share_info[out_tensor]
+                    out_shared_group.add_tensor(out_tensor, out_var.mem_size)
+                    out_shared_group.set_src_tensor(out_tensor, out_var.mem_size, False)
 
         visited_group_set = set()
         for tensor_group in self.mem_share_info.values():
@@ -218,7 +230,7 @@ class LifetimeInfo:
             # debug: dump memory-shared tensor group
             #print(str(tensor_group))
 
-            assert tensor_group.core_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
+            assert tensor_group.src_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
 
     def get_group(self, node: torch.fx.Node, out_idx: int):
         assert (node, out_idx) in self.mem_share_info
@@ -524,7 +536,8 @@ class LifetimeInfo:
                 self.node_makespans[node] = (step, step)
 
         if self.node_makespans:
-            assert len(self.node_makespans) == node_num
+            assert len(self.node_makespans) == node_num, \
+                f"scheduled node num: {len(self.node_makespans)}, node num: {node_num}"
             return self.node_makespans
 
         if self.one_step_one_op:
@@ -552,13 +565,20 @@ class LifetimeInfo:
         return self.edge_makespans
 
     def compute_buffer_makespans(self):
+        if not self.edge_makespans:
+            self.compute_edge_makespans()
+
         for nd in self.nodes_to_schedule:
             assert nd in self.edge_makespans
             lb, ub = self.edge_makespans[nd]
             out_vars = self.graph_mem_info.get_out_vars(nd)
             for var in out_vars:
-                out_tensor_key = (nd, var.out_index)
-                out_shared_group = self.mem_share_info[out_tensor_key]
+                out_tensor = (nd, var.out_index)
+                out_shared_group = self.mem_share_info[out_tensor]
+                if out_shared_group.src_from_ctx:
+                    if out_shared_group not in self.buffer_makespans:
+                        self.buffer_makespans[out_shared_group] = [0, self.num_steps - 1]
+                    continue
                 if out_shared_group in self.buffer_makespans:
                     buffer_span = self.buffer_makespans[out_shared_group]
                     if lb < buffer_span[0]:

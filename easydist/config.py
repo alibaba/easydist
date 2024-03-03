@@ -78,7 +78,7 @@ tile_context_length = 15
 nvlink_processor_usage = 0.15
 
 # Scheduling communication
-comm_optimization = False
+comm_optimization = True
 # 'general', 'odd_even'
 rcpsp_method = 'general'
 rcpsp_iter_round = 1 # odd_even rounds
@@ -89,6 +89,9 @@ use_contiguous_buffer = False
 
 # memory optimization
 enable_memory_opt = os.environ.get("ENABLE_MEMORY_OPT", "False").upper() in ["1", "TRUE"]
+
+# ignore memory reuse
+ignore_memory_reuse = os.environ.get("IGNORE_MEMORY_REUSE", "False").upper() in ["1", "TRUE"]
 
 # reschedule ops
 enable_reschedule = os.environ.get("ENABLE_RESCHEDULE", "False").upper() in ["1", "TRUE"]

@@ -68,7 +68,8 @@ class ILPMemoryScheduler(MemoryScheduler):
         pre_scheded_nodes=None,
     ):
 
-        lifetime_info = LifetimeInfo(self.nodes_to_schedule,
+        lifetime_info = LifetimeInfo(self.fx_module.graph,
+                                     self.nodes_to_schedule,
                                      self.graph_mem_info,
                                      pre_scheded_nodes,
                                      self.one_step_one_op)

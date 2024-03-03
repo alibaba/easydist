@@ -46,13 +46,13 @@ class OutVar:
 
     def __str__(self) -> str:
         if self.is_reference:
-            mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
+            mem_info_str = "out idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", arg idx: " + \
                            str(self.arg_index) + ", tensor idx: " + \
                            str(self.tensor_index) + ", offset: " + \
                            str(self.offset)
         else:
-            mem_info_str = "idx: " + str(self.out_index) + ", size: " + \
+            mem_info_str = "out idx: " + str(self.out_index) + ", size: " + \
                            str(self.mem_size) + ", alloc idx: " + \
                            str(self.alloc_index)
         return mem_info_str
@@ -96,8 +96,10 @@ class NodeMemInfo:
 
     def __str__(self) -> str:
         mem_info_str = ""
-        for tensor_mem_info in self.out_vars:
-            mem_info_str += str(tensor_mem_info) + "\n"
+        for out_var in self.out_vars:
+            mem_info_str += str(out_var) + "\n"
+        for temp_var in self.temp_vars:
+            mem_info_str += str(temp_var) + "\n"
         return mem_info_str
 
 class GraphMemInfo:

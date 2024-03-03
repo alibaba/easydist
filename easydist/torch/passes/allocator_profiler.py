@@ -27,6 +27,7 @@ from easydist.torch.utils import EDNodeType
 from easydist.torch.init_helper import materialize_random
 from easydist.torch.utils import to_meta
 from easydist.torch.mem_allocation_info import GraphMemInfo
+from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 
 __all__ = ['AllocatorProfiler']
 logger = logging.getLogger(__name__)
@@ -85,7 +86,8 @@ class NodeProfilingInfo:
 
     def record_alloc_info(self, allocator_info: List[Any]) -> None:
         address, size, *_ = allocator_info
-        self.alloc_addr_size.append((address,size))
+        if size > 0:
+            self.alloc_addr_size.append((address,size))
 
     def __str__(self) -> str:
         return_str = self.name + "\n"
@@ -123,15 +125,16 @@ class ModuleProfilingInfo:
             node_mem_info = graph_mem_info.get_node_mem_info(node_name)
             node_profiling_info = self.get_node_profiling_info(node_name)
             node_mem_info.alloc_num = len(node_profiling_info.alloc_addr_size)
-            #print(f"rank {self.rank}: {node_name}: node_profiling_info alloc_addr_size: {node_profiling_info.alloc_addr_size}")
 
             #str_info += str(node_profiling_info) + "\n"
             alloced_out_idx_set = set()
+            #print(f"node_profiling_info:\n{str(node_profiling_info)}")
             for alloc_idx, addr_size in enumerate(node_profiling_info.alloc_addr_size):
                 alloc_for_out = False
                 for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
                     if out_addr_size[0] == addr_size[0]:
                         alloc_size = addr_size[1]
+                        #print(f"add out var: alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
                         node_mem_info.add_out_var(
                                           out_idx, alloc_size, False,
                                           alloc_index=alloc_idx)
@@ -144,6 +147,7 @@ class ModuleProfilingInfo:
 
                 if not alloc_for_out:
                     alloc_size = addr_size[1]
+                    #print(f"add temp var: alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
                     node_mem_info.add_temp_var(alloc_size, alloc_idx)
                     if alloc_size==0:
                         logger.info(f"The allocated temp buffer size of tensor {node_name} is zero")
@@ -169,6 +173,7 @@ class ModuleProfilingInfo:
 
                     assert is_ref, f"rank {self.rank}, {node_name}:{out_idx} is neither allocated nor a reference"
 
+            #print(f"node_mem_info:\n{str(node_mem_info)}")
         #print(str_info)
         return graph_mem_info
 
@@ -301,11 +306,10 @@ class AllocatorProfiler(Interpreter):
 
         return graph_mem_info
 
-    def load_memory_plan(self):
-        memory_plan: Dict[str, NodeMemoryPlan] = dict()
-        memory_plan['foo'] = NodeMemoryPlan([0, 2], [140231118422016, 140233702113280], 3)
-        memory_plan['bar'] = NodeMemoryPlan([1, 3], [140245869126656, 140245869175808], 4)
-        __main__.memory_plan = memory_plan
-        graph_execution_order = ['bar', 'foo']
-        __main__.graph_execution_order = graph_execution_order
-        __main__.reserved_memory_size = 1024 * 1024
+    def load_memory_plan(self, graph_mem_plan: GraphMemPlan):
+        __main__.raw_mem_allocs = graph_mem_plan.raw_mem_allocs
+        __main__.mem_size = graph_mem_plan.mem_size
+        __main__.temp_mem_size = graph_mem_plan.temp_mem_size
+        logger.info(f"load_memory_plan: mem_size: {__main__.mem_size}, temp_mem_size: {__main__.temp_mem_size}")
+
+

@@ -39,7 +39,7 @@ class EfficientMemoryScheduler(MemoryScheduler):
     ):
         super().__init__(fx_module, graph_mem_info, align_scale)
 
-    def create_min_mem_plan(self, pre_scheded_nodes=None):
+    def build_lifetime(self, pre_scheded_nodes=None) -> LifetimeInfo:
         manual_alloc = True
         if not pre_scheded_nodes:   # pre_scheded_nodes: map of node -> step
             manual_alloc = False
@@ -53,23 +53,81 @@ class EfficientMemoryScheduler(MemoryScheduler):
             logger.info(f"Some ops are not scheduled yet, ignore memory address generation")
             return (None, None, None, None)
 
-        lifetime_info = LifetimeInfo(self.nodes_to_schedule,
+        lifetime_info = LifetimeInfo(self.fx_module.graph,
+                                     self.nodes_to_schedule,
                                      self.graph_mem_info,
                                      pre_scheded_nodes,
                                      True)
-        edge_makespans = lifetime_info.compute_edge_makespans()
+        lifetime_info.compute_buffer_makespans()
+
         #print("asap and alap information:")
         #print(lifetime_info.node_makespans)
         #print("edge lifetime information:")
-        #print(edge_makespans)
+        #print(lifetime_info.edge_makespans)
 
-        buf_makespans = lifetime_info.compute_buffer_makespans()
         #print("buffer lifetime information:")
-        #print(buf_makespans)
+        #print(lifetime_info.buffer_makespans)
 
-        tensor_groups = set(buf_makespans.keys())
-        #print("tensor_groups:")
-        #print(tensor_groups)
+        return lifetime_info
+
+    def export_mem_plan(self, group_addresses):
+        mem_locations = {}
+        mem_alloc_info = {}
+
+        max_temp_size = 0
+        for node in self.nodes_to_schedule:
+            out_vars = self.graph_mem_info.get_out_vars(node)
+            mem_locations[node.name] = [None]*len(out_vars)
+
+            temp_vars = self.graph_mem_info.get_temp_vars(node)
+            node_temp_addr = 0
+            for temp_var in temp_vars:
+                if node.name not in mem_alloc_info:
+                    mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
+                else:
+                    mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
+                node_temp_addr += temp_var.mem_size
+            if node_temp_addr > max_temp_size:
+                max_temp_size = node_temp_addr
+
+        max_end_addr = 0
+
+        for group, addr_size in group_addresses.items():
+            if max_end_addr < addr_size[0]+addr_size[1]:
+                max_end_addr = addr_size[0]+addr_size[1]
+
+            group_addr = addr_size[0]*self.gcd
+            group_end = group_addr + addr_size[1]*self.gcd
+            for tensor in group.tensors:
+                node = tensor[0]
+                out_idx = tensor[1]
+                out_var = self.graph_mem_info.get_out_var(node, out_idx)
+                addr = group_addr + out_var.offset
+                mem_locations[node.name][out_idx] = (addr, out_var.mem_size)
+                if not out_var.is_reference:
+                    if node.name not in mem_alloc_info:
+                        mem_alloc_info[node.name] = [(out_var.alloc_index, addr, out_var.mem_size, 1)]
+                    else:
+                        mem_alloc_info[node.name].append((out_var.alloc_index, addr, out_var.mem_size, 1))
+
+                assert addr + out_var.mem_size <= group_end
+
+        required_memory = max_end_addr*self.gcd
+
+        for nd_name, alloc_list in mem_alloc_info.items():
+            # sort allocation by allocation index
+            alloc_list.sort(key=lambda x:x[0])
+            for idx, alloc_info in enumerate(alloc_list):
+                assert idx == alloc_info[0], f"Invalid allocation index in node {nd_name}, alloc info: {alloc_list}"
+
+        return (required_memory, max_temp_size, mem_alloc_info, mem_locations)
+
+    def plan_mem_addr_by_min_skyline(self, lifetime_info):
+        buf_makespans = lifetime_info.buffer_makespans
+        tensor_groups = set()
+        for ten_group in buf_makespans.keys():
+            if not ten_group.src_from_ctx:
+                tensor_groups.add(ten_group)
 
         num_steps = lifetime_info.num_steps
         group_addresses = {}
@@ -104,8 +162,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
             assert fixed_ten_group
             lb, ub = buf_makespans[fixed_ten_group]
-            scaled_size = (fixed_ten_group.core_tensor_size + self.gcd - 1) // self.gcd
-            #print(f"scaled_size: {scaled_size}, core tensor size: {fixed_ten_group.core_tensor_size}")
+            scaled_size = (fixed_ten_group.src_tensor_size + self.gcd - 1) // self.gcd
+            #print(f"scaled_size: {scaled_size}, source tensor size: {fixed_ten_group.src_tensor_size}")
 
             # update intervals
             mem_used.remove_envelop(lb, ub+1)
@@ -125,100 +183,96 @@ class EfficientMemoryScheduler(MemoryScheduler):
             group_addresses[fixed_ten_group] = (min_max_addr, scaled_size)
             tensor_groups.remove(fixed_ten_group)
 
-        mem_locations = {}
-        mem_alloc_info = {}
+        return group_addresses
 
-        max_temp_size = 0
-        for node in self.nodes_to_schedule:
-            out_vars = self.graph_mem_info.get_out_vars(node)
-            mem_addrs = [None]*len(out_vars)
-            mem_locations[node.name] = mem_addrs
+    def plan_mem_addr_by_ignore_reuse(self, lifetime_info):  # as a golden for memory reusing version
+        buf_makespans = lifetime_info.buffer_makespans
+        tensor_groups = set()
+        for ten_group in buf_makespans.keys():
+            if not ten_group.src_from_ctx:
+                tensor_groups.add(ten_group)
 
-            temp_vars = self.graph_mem_info.get_temp_vars(node)
-            node_temp_addr = 0
-            for temp_var in temp_vars:
-                if node.name not in mem_alloc_info:
-                    mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
-                else:
-                    mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
-                node_temp_addr += temp_var.mem_size
-            if node_temp_addr > max_temp_size:
-                max_temp_size = node_temp_addr
+        group_addresses = {}
+        max_addr = 0;
+        for ten_group in tensor_groups:
+            scaled_size = (ten_group.src_tensor_size + self.gcd - 1) // self.gcd
+            group_addresses[ten_group] = (max_addr, scaled_size)
+            max_addr += scaled_size
 
-        max_end_addr = 0
+        return group_addresses
 
-        for group, addr_size in group_addresses.items():
-            if max_end_addr < addr_size[0]+addr_size[1]:
-                max_end_addr = addr_size[0]+addr_size[1]
+    def create_min_mem_plan(self, pre_scheded_nodes=None):
+        lifetime_info = self.build_lifetime(pre_scheded_nodes)
 
-            group_addr = addr_size[0]*self.gcd
-            group_end = group_addr + addr_size[1]*self.gcd
-            for tensor in group.tensors:
-                node = tensor[0]
-                out_idx = tensor[1]
-                out_var = self.graph_mem_info.get_out_var(node, out_idx)
-                addr = group_addr + out_var.offset
-                mem_addrs = mem_locations[node.name]
-                mem_addrs[out_idx] = (addr, out_var.mem_size)
-                if not out_var.is_reference:
-                    if node.name not in mem_alloc_info:
-                        mem_alloc_info[node.name] = [(out_var.alloc_index, addr, out_var.mem_size, 1)]
-                    else:
-                        mem_alloc_info[node.name].append((out_var.alloc_index, addr, out_var.mem_size, 1))
+        if mdconfig.ignore_memory_reuse:
+            group_addresses = self.plan_mem_addr_by_ignore_reuse(lifetime_info)
+        else:
+            group_addresses = self.plan_mem_addr_by_min_skyline(lifetime_info)
 
-                assert addr + out_var.mem_size <= group_end
-
-        required_memory = max_end_addr*self.gcd
-
-        for nd_name, alloc_list in mem_alloc_info.items():
-            alloc_list.sort(key=lambda x:x[0])
-            for idx, alloc_info in enumerate(alloc_list):
-                assert idx == alloc_info[0], f"Invalid allocation index in node {nd_name}"
+        required_memory, max_temp_size, mem_alloc_info, mem_locations = \
+                                          self.export_mem_plan(group_addresses)
 
         # dump peak memory
         logger.info(f"required memory: {required_memory/1024/1024/1024}GB")
 
         if mdconfig.dump_mem_usage_graph:
             # dump memory addresses
-            graph_mem_addr_str = "graph memory addresses:\n"
-            for node_name, mem_addrs in mem_locations.items():
-                node_mem_str = node.name + ": "
-                for mem_addr_size in mem_addrs:
-                    node_mem_str += "([" + str(mem_addr_size[0]) + "~" + \
-                                    str(mem_addr_size[0]+mem_addr_size[1]-1) + "], " + \
-                                    str(mem_addr_size[1]) + "), "
-
-                graph_mem_addr_str += node_mem_str + "\n"
-
-            logger.info(graph_mem_addr_str)
-
-            # dump memory usage in graph
-            node_map = {}
-            for node in self.nodes_to_schedule:
-                node_map[node.name] = node
-
-            _, ax = plt.subplots()
-            ax.axis([0,num_steps,0,required_memory])
-            dumped_group = set()
-            for node_name, mem_addrs in mem_locations.items():
-                node = node_map[node_name]
-                for out_idx,mem_addr_size in enumerate(mem_addrs):
-                    group = lifetime_info.get_group(node, out_idx)
-                    if group in dumped_group:
-                        continue
-                    dumped_group.add(group)
-                    lb, ub = buf_makespans[group]
-                    left = lb
-                    width = ub - lb + 1
-                    bottom = mem_addr_size[0]
-                    height = mem_addr_size[1]
-                    ax.add_patch(plt.Rectangle((left, bottom), width, height, fill=None, alpha=1))
-
-            plt.savefig("./tmp/mem_fig.pdf")
+            self.dump_mem_usage_graph(mem_locations,
+                                      lifetime_info.buffer_makespans,
+                                      lifetime_info.num_steps,
+                                      required_memory,
+                                      lifetime_info)
 
         ordered_schedules = []
         for node in self.nodes_to_schedule:
             ordered_schedules.append(node.name)
 
         return (required_memory, max_temp_size, None, ordered_schedules, mem_alloc_info, mem_locations)
+
+    def dump_mem_usage_graph(self,
+                             mem_locations,
+                             buf_makespans,
+                             num_steps,
+                             required_memory,
+                             lifetime_info):
+        graph_mem_addr_str = "graph memory addresses:\n"
+        for node_name, mem_addrs in mem_locations.items():
+            node_mem_str = node_name + ": "
+            for addr_size in mem_addrs:
+                if addr_size:
+                    node_mem_str += "([" + str(addr_size[0]) + "~" + \
+                                    str(addr_size[0]+addr_size[1]-1) + \
+                                    "], " + str(addr_size[1]) + "),"
+                else:
+                    node_mem_str += "([NA ~ NA], NA),"
+
+            graph_mem_addr_str += node_mem_str + "\n"
+
+        logger.info(graph_mem_addr_str)
+
+        # dump memory usage in graph
+        node_map = {}
+        for node in self.nodes_to_schedule:
+            node_map[node.name] = node
+
+        _, ax = plt.subplots()
+        ax.axis([0,num_steps,0,required_memory])
+        dumped_group = set()
+        for node_name, mem_addrs in mem_locations.items():
+            node = node_map[node_name]
+            for out_idx,mem_addr_size in enumerate(mem_addrs):
+                group = lifetime_info.get_group(node, out_idx)
+                if group.src_from_ctx:
+                    continue
+                if group in dumped_group:
+                    continue
+                dumped_group.add(group)
+                lb, ub = buf_makespans[group]
+                left = lb
+                width = ub - lb + 1
+                bottom = mem_addr_size[0]
+                height = mem_addr_size[1]
+                ax.add_patch(plt.Rectangle((left, bottom), width, height, fill=None, alpha=1))
+
+        plt.savefig("./tmp/mem_fig.pdf")
 
