@@ -70,26 +70,7 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
         return lifetime_info
 
-    def export_mem_plan(self, group_addresses):
-        mem_locations = {}
-        mem_alloc_info = {}
-
-        max_temp_size = 0
-        for node in self.nodes_to_schedule:
-            out_vars = self.graph_mem_info.get_out_vars(node)
-            mem_locations[node.name] = [None]*len(out_vars)
-
-            temp_vars = self.graph_mem_info.get_temp_vars(node)
-            node_temp_addr = 0
-            for temp_var in temp_vars:
-                if node.name not in mem_alloc_info:
-                    mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
-                else:
-                    mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
-                node_temp_addr += temp_var.mem_size
-            if node_temp_addr > max_temp_size:
-                max_temp_size = node_temp_addr
-
+    def export_mem_plan(self, group_addresses, mem_locations, mem_alloc_info):
         max_end_addr = 0
 
         for group, addr_size in group_addresses.items():
@@ -120,9 +101,10 @@ class EfficientMemoryScheduler(MemoryScheduler):
             for idx, alloc_info in enumerate(alloc_list):
                 assert idx == alloc_info[0], f"Invalid allocation index in node {nd_name}, alloc info: {alloc_list}"
 
-        return (required_memory, max_temp_size, mem_alloc_info, mem_locations)
+        return required_memory
 
     def plan_mem_addr_by_min_skyline(self, lifetime_info):
+        # 1. generate memory address for tensor between ops
         buf_makespans = lifetime_info.buffer_makespans
         tensor_groups = set()
         for ten_group in buf_makespans.keys():
@@ -183,9 +165,29 @@ class EfficientMemoryScheduler(MemoryScheduler):
             group_addresses[fixed_ten_group] = (min_max_addr, scaled_size)
             tensor_groups.remove(fixed_ten_group)
 
-        return group_addresses
+        # 2. generate memory address for temp allocation inside an op
+        temp_mem_locations = {}
+        temp_mem_alloc_info = {}
+        max_temp_size = 0
+        for node in self.nodes_to_schedule:
+            out_vars = self.graph_mem_info.get_out_vars(node)
+            temp_mem_locations[node.name] = [None]*len(out_vars)
+
+            temp_vars = self.graph_mem_info.get_temp_vars(node)
+            node_temp_addr = 0
+            for temp_var in temp_vars:
+                if node.name not in temp_mem_alloc_info:
+                    temp_mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
+                else:
+                    temp_mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
+                node_temp_addr += temp_var.mem_size
+            if node_temp_addr > max_temp_size:
+                max_temp_size = node_temp_addr
+
+        return (group_addresses, temp_mem_locations, temp_mem_alloc_info, max_temp_size)
 
     def plan_mem_addr_by_ignore_reuse(self, lifetime_info):  # as a golden for memory reusing version
+        # 1. generate memory address for tensor between ops
         buf_makespans = lifetime_info.buffer_makespans
         tensor_groups = set()
         for ten_group in buf_makespans.keys():
@@ -199,18 +201,38 @@ class EfficientMemoryScheduler(MemoryScheduler):
             group_addresses[ten_group] = (max_addr, scaled_size)
             max_addr += scaled_size
 
-        return group_addresses
+        # 2. generate memory address for temp allocation inside an op
+        temp_mem_locations = {}
+        temp_mem_alloc_info = {}
+        node_temp_addr = 0
+        for node in self.nodes_to_schedule:
+            out_vars = self.graph_mem_info.get_out_vars(node)
+            temp_mem_locations[node.name] = [None]*len(out_vars)
+
+            temp_vars = self.graph_mem_info.get_temp_vars(node)
+            for temp_var in temp_vars:
+                if node.name not in temp_mem_alloc_info:
+                    temp_mem_alloc_info[node.name] = [(temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0)]
+                else:
+                    temp_mem_alloc_info[node.name].append((temp_var.alloc_index, node_temp_addr, temp_var.mem_size, 0))
+                node_temp_addr += temp_var.mem_size
+        max_temp_size = node_temp_addr
+
+        return (group_addresses, temp_mem_locations, temp_mem_alloc_info, max_temp_size)
 
     def create_min_mem_plan(self, pre_scheded_nodes=None):
         lifetime_info = self.build_lifetime(pre_scheded_nodes)
 
         if mdconfig.ignore_memory_reuse:
-            group_addresses = self.plan_mem_addr_by_ignore_reuse(lifetime_info)
+            group_addresses, mem_locations, mem_alloc_info, max_temp_size = \
+                              self.plan_mem_addr_by_ignore_reuse(lifetime_info)
         else:
-            group_addresses = self.plan_mem_addr_by_min_skyline(lifetime_info)
+            group_addresses, mem_locations, mem_alloc_info, max_temp_size = \
+                              self.plan_mem_addr_by_min_skyline(lifetime_info)
 
-        required_memory, max_temp_size, mem_alloc_info, mem_locations = \
-                                          self.export_mem_plan(group_addresses)
+        required_memory = self.export_mem_plan(group_addresses,
+                                               mem_locations,
+                                               mem_alloc_info)
 
         # dump peak memory
         logger.info(f"required memory: {required_memory/1024/1024/1024}GB")
