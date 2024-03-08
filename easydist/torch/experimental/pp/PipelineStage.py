@@ -41,9 +41,6 @@ class RecvInfo:
         return f"RecvInfo(input={self.input_name}, source={self.source}, shape={self.buffer.size()})"
 
 
-class StageArgPlaceholder:
-    pass
-
 
 class StageKwargPlaceholder:
     pass
@@ -59,7 +56,6 @@ class PipelineStage:
         compiled_stage: CompiledStage,
         node_metas,
         num_chunks,
-        args_chunk_spec,
         kwargs_chunk_spec,
         outputs_chunk_spec,
         device: torch.device,
@@ -69,7 +65,6 @@ class PipelineStage:
         self.compiled_meta = compiled_meta
         self.stage_idx = stage_idx
         self.compiled_stage = compiled_stage
-        self.node_metas = node_metas
         self.num_chunks = num_chunks
         self.kwargs_chunk_spec = kwargs_chunk_spec
         self.outputs_chunk_spec = outputs_chunk_spec
@@ -129,8 +124,7 @@ class PipelineStage:
             self.stage_index_to_group_rank.setdefault(i, peer_rank)
 
         # Prepare send/recv infrastructure
-        self._prepare_send_recv_infra()
-        del self.node_metas
+        self._prepare_send_recv_infra(node_metas)
         # Cast submodule to device
         self._move_inject_states_to_device()
         # Move ops argument to device
@@ -174,7 +168,7 @@ class PipelineStage:
     def is_last(self):
         return self.stage_idx == self.num_stages - 1
 
-    def _prepare_send_recv_infra(self):
+    def _prepare_send_recv_infra(self, node_metas):
         """
         Create send/recv infrastructures for activations (during forward) and
         gradients (during backward)
@@ -183,7 +177,7 @@ class PipelineStage:
         # chunk : Dict of kwarg buffers
         self.fw_kwargs_recv_info: Dict[int, Dict] = {}
         for chunk in range(self.num_chunks):
-            self.fw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.fw_node)
+            self.fw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(node_metas, self.fw_node)
 
         self.fw_act_send_info = self._create_act_send_info(self.fw_node)
 
@@ -191,7 +185,7 @@ class PipelineStage:
             self.bw_args_recv_info: Dict[int, Tuple] = {}
             self.bw_kwargs_recv_info: Dict[int, Dict] = {}
             for chunk in range(self.num_chunks):
-                self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(self.bw_node)
+                self.bw_kwargs_recv_info[chunk] = self._create_act_recv_buffers(node_metas, self.bw_node)
 
             self.bw_act_send_info = self._create_act_send_info(self.bw_node)
 
@@ -222,6 +216,7 @@ class PipelineStage:
 
     def _create_act_recv_buffers(
         self,
+        node_metas,
         node,
     ):
 
@@ -235,9 +230,9 @@ class PipelineStage:
             """
             if input_node.op == "placeholder":
                 # Do not create buffer for placeholder
-                return StageArgPlaceholder()
+                return StageKwargPlaceholder()
 
-            example_value = self.node_metas[input_node.name]["val"]
+            example_value = node_metas[input_node.name]["val"]
 
             logger.info(f"[{self.group_rank}] "
                         f"Creating recv buffer for input '{input_node.name}' "
@@ -288,12 +283,11 @@ class PipelineStage:
     ):
         return lambda info: self._recv_tensor(info, reqs)
 
-    def split_inputs(self, args, kwargs):
-
+    def split_input_kwargs(self, kwargs):
         self.kwargs_split = None
-        if args or kwargs:
+        if kwargs:
             _, self.kwargs_split = split_args_kwargs_into_chunks(
-                args,
+                (),
                 kwargs,
                 self.num_chunks,
                 None,  #self.pipe.args_chunk_spec,
@@ -442,12 +436,12 @@ class PipelineStage:
 
         return self.outputs_batch
 
-    def __call__(self, *args, **kwargs) -> None:
+    def __call__(self, **kwargs) -> None:
         # Clean per iteration
         self.clear_runtime_states()
 
         # Split inputs into chunks
-        self.split_inputs(args, kwargs)
+        self.split_input_kwargs(kwargs)
 
         # Forward pass of all chunks
         for chunk in range(self.num_chunks):
@@ -461,20 +455,20 @@ class PipelineStage:
                 logger.debug(f"[{self.group_rank}] Backwarded chunk {bwd_chunk}")
 
         # Wait for all sends to finish
-        # TODO: okay to delay the sync till completion of all chunks?
+        # TODO okay to delay the sync till completion of all chunks?
         for work in self.all_fw_send_reqs:
             work.wait()
 
         # Wait for all sends to finish
-        # TODO: okay to delay the sync till completion of all chunks?
+        # TODO okay to delay the sync till completion of all chunks?
         if self.bw_node is not None:
             for work in self.all_bw_send_reqs:
                 work.wait()
 
         self._merge_output_chunks()
 
-        # if self.step_node is not None:
-        #     self.step()
+        if self.step_node is not None:
+            self.step()
 
         logger.debug(f"[{self.group_rank}] All sends finished")
 
@@ -505,3 +499,63 @@ def print_tensor_dict(chunk, di):
     print(f'Chunk {chunk}')
     for k, v in di.items():
         print(f'{k} size {v.size()} mean {v.float().mean()}')
+
+class PipelineStage1F1B(PipelineStage):
+    def __init__(
+        self,
+        local_gm: fx.GraphModule,
+        compiled_meta: CompiledMeta,
+        stage_idx: int,
+        compiled_stage: CompiledStage,
+        node_metas,
+        num_chunks,
+        kwargs_chunk_spec,
+        outputs_chunk_spec,
+        device: torch.device,
+        group: dist.ProcessGroup = None,
+    ):
+        super().__init__(local_gm, compiled_meta, stage_idx, compiled_stage, node_metas, num_chunks, kwargs_chunk_spec, outputs_chunk_spec, device, group)
+    
+    def __call__(self, **kwargs) -> None:
+        # Clean per iteration
+        self.clear_runtime_states()
+
+        # Split inputs into chunks
+        self.split_input_kwargs(kwargs)
+
+        num_warmup = self.num_stages - self.stage_idx - 1
+        num_warmup = min(num_warmup, self.num_chunks)
+
+        # Warm-up phase: forward number of chunks equal to pipeline depth.
+        for chunk in range(num_warmup):
+            self.forward_one_chunk(chunk)
+
+        # 1F1B phase
+        for fwd_chunk in range(num_warmup, self.num_chunks):
+            bwd_chunk = fwd_chunk - num_warmup
+            if self.bw_node is not None: # backward first
+                self.backward_one_chunk(bwd_chunk)
+            self.forward_one_chunk(fwd_chunk)
+
+
+        # Cool-down phase: backward for the rest of the chunks
+        if self.bw_node is not None:
+            for bwd_chunk in range(self.num_chunks - num_warmup, self.num_chunks):
+                self.backward_one_chunk(bwd_chunk)
+
+        # Wait for all sends to finish
+        # TODO: okay to delay the sync till completion of all chunks?
+        for work in self.all_fw_send_reqs:
+            work.wait()
+
+        if self.bw_node is not None:
+            for work in self.all_bw_send_reqs:
+                work.wait()
+
+        self._merge_output_chunks()
+
+        if self.step_node is not None:
+            self.step()
+
+        logger.debug(f"[{self.group_rank}] All sends finished")
+

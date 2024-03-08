@@ -24,7 +24,7 @@ from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage
+from easydist.torch.experimental.pp.PipelineStage import PipelineStage, PipelineStage1F1B
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 
 from tqdm import tqdm
@@ -99,13 +99,12 @@ def test_main():
     traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm = compile_resnet(
         module, num_chunks, opt, nstages, args, kwargs)
 
-    pipe = PipelineStage(local_gm=local_gm,
+    pipe = PipelineStage1F1B(local_gm=local_gm,
                          compiled_meta=compiled_meta,
                          stage_idx=rank,
                          compiled_stage=compiled_stages[rank],
                          node_metas=traced_stateless_func_node_metas,
                          num_chunks=num_chunks,
-                         args_chunk_spec=None,
                          kwargs_chunk_spec=None,
                          outputs_chunk_spec=None,
                          device=device)
@@ -124,8 +123,6 @@ def test_main():
                 stage_kwargs = process_inputs(compiled_meta, *args, **kwargs, move_to_device=True)
                 dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
                 pipe(**stage_kwarg[0])
-                if pipe.step_node is not None:
-                    pipe.step()
             stage_kwargs = [StopTraining()] * compiled_meta.nstages
             dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
         else:
@@ -143,8 +140,6 @@ def test_main():
                     correct_cnt += (
                         preds == stage_kwarg[0][pipe.compiled_meta.args_names_unflatten[1]]).sum()
                     loss_sum += loss.sum().item()
-                if pipe.step_node is not None:
-                    pipe.step()
                 dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
 
         if rank == world_size - 1:
