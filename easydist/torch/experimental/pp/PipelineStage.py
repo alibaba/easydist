@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 from functools import reduce
+from abc import ABC, abstractmethod
 import logging
 import operator
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 from collections import OrderedDict
 
 import torch
@@ -11,9 +12,9 @@ import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
 
-from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
 from easydist.torch.experimental.pp.utils import modify_graph_op_device, map_debug_info
-from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, process_outputs_non_strict
+from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
 
 logger = logging.getLogger(__name__)
 
@@ -46,89 +47,172 @@ class StageKwargPlaceholder:
     pass
 
 
-class PipelineStage:
+class Schedule(ABC):
+    def __init__(self, pipeline_stage: 'PipelineStageBase'):
+        assert isinstance(pipeline_stage, PipelineStageBase)
+        self.pipeline_stage = pipeline_stage
+
+    @abstractmethod
+    def __call__(self) -> None:
+        raise NotImplementedError
+
+class ScheduleGPipe(Schedule):
+
+    def __call__(self) -> None:
+
+        all_fw_send_reqs: List[dist.Work] = []
+        all_bw_send_reqs: List[dist.Work] = []
+
+        # Forward pass of all chunks
+        for chunk in range(self.pipeline_stage.num_chunks):
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(chunk)
+            logger.debug(f"[{self.pipeline_stage.group_rank}] Forwarded chunk {chunk}")
+
+        # Backward starts here
+        if self.pipeline_stage.bw_node is not None:
+            for bwd_chunk in range(self.pipeline_stage.num_chunks):
+                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk(bwd_chunk)
+                logger.debug(f"[{self.pipeline_stage.group_rank}] Backwarded chunk {bwd_chunk}")
+
+        # Wait for all sends to finish
+        # TODO okay to delay the sync till completion of all chunks?
+        for work in all_fw_send_reqs:
+            work.wait()
+
+        # Wait for all sends to finish
+        # TODO okay to delay the sync till completion of all chunks?
+        for work in all_bw_send_reqs:
+            work.wait()
+
+        self.pipeline_stage.merge_output_chunks()
+
+        if self.pipeline_stage.step_node is not None:
+            self.pipeline_stage.step()
+
+class Schedule1F1B(Schedule):
+
+    def __call__(self) -> None:
+        all_fw_send_reqs: List[dist.Work] = []
+        all_bw_send_reqs: List[dist.Work] = []
+        num_warmup = self.pipeline_stage.num_stages - self.pipeline_stage.stage_idx
+        num_warmup = min(num_warmup, self.pipeline_stage.num_chunks)
+
+        # Warm-up phase: forward number of chunks equal to pipeline depth.
+        for chunk in range(num_warmup):
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(chunk)
+
+        # 1F1B phase
+        for fwd_chunk in range(num_warmup, self.pipeline_stage.num_chunks):
+            bwd_chunk = fwd_chunk - num_warmup
+            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk_if_exists(bwd_chunk)
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(fwd_chunk)
+
+
+        # Cool-down phase: backward for the rest of the chunks
+        for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup, self.pipeline_stage.num_chunks):
+            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk(bwd_chunk)
+
+        # Wait for all sends to finish
+        # TODO: okay to delay the sync till completion of all chunks?
+        for work in all_fw_send_reqs:
+            work.wait()
+
+        for work in all_bw_send_reqs:
+            work.wait()
+
+        self.pipeline_stage.merge_output_chunks()
+
+        if self.pipeline_stage.step_node is not None:
+            self.pipeline_stage.step()
+
+class PipelineStageBase:
 
     def __init__(
         self,
+        schedule_cls: Type[Schedule],
         local_gm: fx.GraphModule,
         compiled_meta: CompiledMeta,
         stage_idx: int,
         compiled_stage: CompiledStage,
-        node_metas,
-        num_chunks,
-        kwargs_chunk_spec,
-        outputs_chunk_spec,
+        node_metas: Dict[str, Dict[str, FakeTensor]],
+        num_chunks: int,
+        args_chunk_spec: Tuple[Optional[TensorChunkSpec]],
+        kwargs_chunk_spec: Dict[str, TensorChunkSpec],
+        outputs_chunk_spec: Tuple[Optional[TensorChunkSpec]],
         device: torch.device,
-        group: dist.ProcessGroup = None,
+        group: Optional[dist.ProcessGroup] = None,
     ):
-        self.local_gm = local_gm
+        # meta info
+        self.name = f'stage_{stage_idx}'
+        self._init_fw_bw_step_nodes(local_gm)
+        assert issubclass(schedule_cls, Schedule), "schedule_cls must be the Schedule class itself"
+        self.schedule = schedule_cls(self)
         self.compiled_meta = compiled_meta
         self.stage_idx = stage_idx
         self.compiled_stage = compiled_stage
         self.num_chunks = num_chunks
-        self.kwargs_chunk_spec = kwargs_chunk_spec
+        self.node_val_chunk_spec = self._get_graph_inputs_chunk(compiled_meta, args_chunk_spec, kwargs_chunk_spec)
         self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
         self.group = group
 
+        self.group_rank = dist.get_rank(group)
         self.num_stages = compiled_meta.nstages
-        self.node_to_stage_idx = compiled_meta.node_to_stage_idx
-        self.name = f'stage_{stage_idx}'
-
-        self.outputs_batch = {}
+        self.node_to_stage_idx = compiled_meta.node_to_stage_idx # TODO refactor this mapping?
 
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
-        # `group_rank` is rank in process group `group`.
-        self.group_rank = dist.get_rank(group)
-
-        # Activation send requests of all chunk
-        self.all_fw_send_reqs: List[dist.Work] = []
-        # Grad send requests of all chunk
-        self.all_bw_send_reqs: List[dist.Work] = []
-        # Caching chunk outputs for final output merge or reduction
+        # runtimes
+        self.outputs_batch = {}        # Activation send requests of all chunk
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
-        # Find my forward node in graph
+
+        # Prepare send/recv infrastructure
+        self._init_communication(node_metas)
+        # Cast submodule to device
+        self._move_inject_states_to_device()
+        # Move ops argument to device
+        self._move_ops_to_device()
+
+    def _init_fw_bw_step_nodes(self, local_gm):
+        # Find stage forward node in graph
         self.fw_node = None
-        for node in self.local_gm.graph.nodes:
-            if node.name == f'{self.name}_fw':
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_fw': # TODO is it good to use str as a tag?
                 assert self.fw_node is None, "Multiple forward nodes found"
                 self.fw_node = node
         if not self.fw_node:
             raise AssertionError(f"Cannot find {self.name} in graph")
 
-        # Find my backward node in graph
+        # Find stage backward node in graph
         self.bw_node = None
-        for node in self.local_gm.graph.nodes:
-            if node.name == f'{self.name}_bw':
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_bw': # TODO is it good to use str as a tag?
                 assert self.bw_node is None, "Multiple backward nodes found"
                 self.bw_node = node
 
-        # Find my step node in graph
+        # Find stage step node in graph
         self.step_node = None
-        for node in self.local_gm.graph.nodes:
-            if node.name == f'{self.name}_step':
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_step': # TODO is it good to use str as a tag?
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
 
-        # Create stage id to group rank mapping
-        # In interleaved case, `group_rank` is stage index % group size.
-        self.stage_index_to_group_rank: Dict[int, int] = {}
-        pg_world_size = dist.get_world_size(group)
-        for i in range(self.num_stages):
-            # We only support wrapped-around interleaving
-            peer_rank = i % pg_world_size
-            self.stage_index_to_group_rank.setdefault(i, peer_rank)
-
-        # Prepare send/recv infrastructure
-        self._prepare_send_recv_infra(node_metas)
-        # Cast submodule to device
-        self._move_inject_states_to_device()
-        # Move ops argument to device
-        self._move_ops_to_device()
+    def _get_graph_inputs_chunk(self, compiled_meta, args_chunk_spec, kwargs_chunk_spec):
+        node_val_chunk_spec = {}
+        if args_chunk_spec is None:
+            args_chunk_spec = [None] * len(compiled_meta.args_names_unflatten)
+        assert len(args_chunk_spec) == len(compiled_meta.args_names_unflatten)
+        for node_name, arg_chunk_spec in zip(compiled_meta.args_names_unflatten, args_chunk_spec):
+            node_val_chunk_spec = arg_chunk_spec
+        if kwargs_chunk_spec is None:
+            kwargs_chunk_spec = {k: None for k in compiled_meta.kwargs_names_unflatten}
+        assert set(kwargs_chunk_spec.keys()) == set(compiled_meta.kwargs_names_unflatten)
+        for node_name, kwarg_chunk_spec in kwargs_chunk_spec.items():
+            node_val_chunk_spec[node_name] = kwarg_chunk_spec
+        return node_val_chunk_spec
 
     def _move_inject_states_to_device(self):
         # Move submodule to indicated device if possible
@@ -168,11 +252,20 @@ class PipelineStage:
     def is_last(self):
         return self.stage_idx == self.num_stages - 1
 
-    def _prepare_send_recv_infra(self, node_metas):
+    def _init_communication(self, node_metas):
         """
         Create send/recv infrastructures for activations (during forward) and
         gradients (during backward)
         """
+        # Create stage id to group rank mapping
+        # In interleaved case, `group_rank` is stage index % group size.
+        stage_index_to_group_rank: Dict[int, int] = {}
+        pg_world_size = dist.get_world_size(self.group)
+        for i in range(self.num_stages):
+            # We only support wrapped-around interleaving
+            peer_rank = i % pg_world_size
+            stage_index_to_group_rank.setdefault(i, peer_rank)
+        self.stage_index_to_group_rank = stage_index_to_group_rank
 
         # chunk : Dict of kwarg buffers
         self.fw_kwargs_recv_info: Dict[int, Dict] = {}
@@ -290,8 +383,8 @@ class PipelineStage:
                 (),
                 kwargs,
                 self.num_chunks,
-                None,  #self.pipe.args_chunk_spec,
-                None,  #self.pipe.kwargs_chunk_spec,
+                None,
+                None,
             )
 
     def _recv_and_fill_inputs(
@@ -328,6 +421,8 @@ class PipelineStage:
         send_info,
         output_dict,
     ) -> List[dist.Work]:
+        assert isinstance(output_dict, dict), "Output must be a dict"
+
         # Send requests of a chunk
         send_reqs: List[dist.Work] = []
 
@@ -350,7 +445,8 @@ class PipelineStage:
     def forward_one_chunk(
         self,
         chunk: int,
-    ):
+    ) -> List[dist.Work]:
+        # Receive activations
         composite_kwargs_chunk = self._recv_and_fill_inputs(self.kwargs_split,
                                                             self.fw_kwargs_recv_info, chunk)
 
@@ -359,45 +455,52 @@ class PipelineStage:
                                                     self.outputs_chunks[chunk],
                                                     **composite_kwargs_chunk)
 
-        assert isinstance(outputs_chunk, dict), "Only dict output is supported"
-        logger.debug(map_debug_info(outputs_chunk))
-
         # Send activations
-        send_reqs = self._send_output_dict(self.fw_act_send_info, outputs_chunk)
-        self.all_fw_send_reqs += send_reqs
+        fw_send_reqs = self._send_output_dict(self.fw_act_send_info, outputs_chunk)
+        return fw_send_reqs
 
     def backward_one_chunk(
         self,
         chunk: int,
-    ):
+    ) -> List[dist.Work]:
+        # Receive grads
         composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_args_recv_info,
                                                             self.bw_kwargs_recv_info, chunk)
 
-        # `stage_backward` node does not have `args`, only `kwargs`
+        # Compute backward
         outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk],
                                                      self.outputs_chunks[chunk],
                                                      **composite_kwargs_chunk)
 
-        grad_send_reqs = self._send_output_dict(self.bw_act_send_info, outputs_chunk)
-        self.all_bw_send_reqs += grad_send_reqs
+        # send grads
+        bw_send_reqs = self._send_output_dict(self.bw_act_send_info, outputs_chunk)
+        return bw_send_reqs
+
+    def backward_one_chunk_if_exists(
+        self,
+        chunk: int
+    ) -> List[dist.Work]:
+        if self.bw_node is not None:
+            return self.backward_one_chunk(chunk)
+        return []
 
     def step(self):
         self.compiled_stage.step(self.outputs_batch)
 
+    def step_if_exists(self):
+        if self.step_node is not None:
+            self.step()
+
     def clear_runtime_states(self):
-        # Activation send requests of all chunk
-        self.all_fw_send_reqs.clear()
-        # Grad send requests of all chunk
-        self.all_bw_send_reqs.clear()
         # Caching chunk outputs for final output merge or reduction
-        self.activations_chunks.clear()
-        self.outputs_chunks.clear()
-        for _ in range(self.num_chunks):
-            self.activations_chunks.append({})
-            self.outputs_chunks.append({})
+        for act_chunk in self.activations_chunks:
+            assert len(act_chunk) == 0, "Activations should be cleared"
+        # self.activations_chunks.clear()
+        for outputs_chunk in self.outputs_chunks:
+            outputs_chunk.clear()
         self.outputs_batch.clear()
 
-    def _merge_output_chunks(self) -> Dict[str, Any]:
+    def merge_output_chunks(self) -> Dict[str, Any]:
         maybe_updated_params_names_unflatten = self.compiled_meta.output_params_names_unflatten
         maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_names_unflatten
         updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_names_unflatten
@@ -436,45 +539,9 @@ class PipelineStage:
 
         return self.outputs_batch
 
-    def __call__(self, **kwargs) -> None:
-        # Clean per iteration
-        self.clear_runtime_states()
-
-        # Split inputs into chunks
-        self.split_input_kwargs(kwargs)
-
-        # Forward pass of all chunks
-        for chunk in range(self.num_chunks):
-            self.forward_one_chunk(chunk)
-            logger.debug(f"[{self.group_rank}] Forwarded chunk {chunk}")
-
-        # Backward starts here
-        if self.bw_node is not None:
-            for bwd_chunk in range(self.num_chunks):
-                self.backward_one_chunk(bwd_chunk)
-                logger.debug(f"[{self.group_rank}] Backwarded chunk {bwd_chunk}")
-
-        # Wait for all sends to finish
-        # TODO okay to delay the sync till completion of all chunks?
-        for work in self.all_fw_send_reqs:
-            work.wait()
-
-        # Wait for all sends to finish
-        # TODO okay to delay the sync till completion of all chunks?
-        if self.bw_node is not None:
-            for work in self.all_bw_send_reqs:
-                work.wait()
-
-        self._merge_output_chunks()
-
-        if self.step_node is not None:
-            self.step()
-
-        logger.debug(f"[{self.group_rank}] All sends finished")
-
     def all_gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
-        outputs = process_outputs_non_strict(self.compiled_meta, self.outputs_batch)
+        outputs = graph_outputs_to_func_outputs_non_strict(self.compiled_meta, self.outputs_batch)
         dist.gather_object(outputs,
                            outputs_all_stages if self.group_rank == rank else None,
                            dst=rank)
@@ -493,69 +560,36 @@ class PipelineStage:
                            optimizer_state_dicts if self.group_rank == rank else None,
                            dst=rank)
         return optimizer_state_dicts
+    
+    def __call__(self, *args, **kwargs) -> None:
+        node_input_this_stage = [None]
+        if self.is_first():
+            node_inputs_all_stages = func_inputs_to_graph_inputs_by_stages(self.compiled_meta, *args, **kwargs, move_to_device=False)
+        else:
+            node_inputs_all_stages = [None] * self.num_stages
+
+        # TODO: this is slow
+        dist.scatter_object_list(node_input_this_stage, node_inputs_all_stages, src=0)
+
+        node_input_this_stage = node_input_this_stage[0]
+        for k, v in node_input_this_stage.items():
+            if isinstance(v, torch.Tensor):
+                node_input_this_stage[k] = v.to(self.device)
+
+        # Clean per iteration
+        self.clear_runtime_states()
+
+        # Split inputs into chunks
+        self.split_input_kwargs(node_input_this_stage)
+
+        self.schedule()
+
+        logger.debug(f"[{self.group_rank}] All sends finished")
+
+        return graph_outputs_to_func_outputs_non_strict(self.compiled_meta, self.outputs_batch)[-1]
 
 
 def print_tensor_dict(chunk, di):
     print(f'Chunk {chunk}')
     for k, v in di.items():
         print(f'{k} size {v.size()} mean {v.float().mean()}')
-
-class PipelineStage1F1B(PipelineStage):
-    def __init__(
-        self,
-        local_gm: fx.GraphModule,
-        compiled_meta: CompiledMeta,
-        stage_idx: int,
-        compiled_stage: CompiledStage,
-        node_metas,
-        num_chunks,
-        kwargs_chunk_spec,
-        outputs_chunk_spec,
-        device: torch.device,
-        group: dist.ProcessGroup = None,
-    ):
-        super().__init__(local_gm, compiled_meta, stage_idx, compiled_stage, node_metas, num_chunks, kwargs_chunk_spec, outputs_chunk_spec, device, group)
-    
-    def __call__(self, **kwargs) -> None:
-        # Clean per iteration
-        self.clear_runtime_states()
-
-        # Split inputs into chunks
-        self.split_input_kwargs(kwargs)
-
-        num_warmup = self.num_stages - self.stage_idx - 1
-        num_warmup = min(num_warmup, self.num_chunks)
-
-        # Warm-up phase: forward number of chunks equal to pipeline depth.
-        for chunk in range(num_warmup):
-            self.forward_one_chunk(chunk)
-
-        # 1F1B phase
-        for fwd_chunk in range(num_warmup, self.num_chunks):
-            bwd_chunk = fwd_chunk - num_warmup
-            if self.bw_node is not None: # backward first
-                self.backward_one_chunk(bwd_chunk)
-            self.forward_one_chunk(fwd_chunk)
-
-
-        # Cool-down phase: backward for the rest of the chunks
-        if self.bw_node is not None:
-            for bwd_chunk in range(self.num_chunks - num_warmup, self.num_chunks):
-                self.backward_one_chunk(bwd_chunk)
-
-        # Wait for all sends to finish
-        # TODO: okay to delay the sync till completion of all chunks?
-        for work in self.all_fw_send_reqs:
-            work.wait()
-
-        if self.bw_node is not None:
-            for work in self.all_bw_send_reqs:
-                work.wait()
-
-        self._merge_output_chunks()
-
-        if self.step_node is not None:
-            self.step()
-
-        logger.debug(f"[{self.group_rank}] All sends finished")
-

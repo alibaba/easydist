@@ -18,9 +18,9 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
-                                                             compile_pipeline, process_outputs,
+                                                             compile_pipeline, graph_outputs_to_func_outputs,
                                                              split_into_equal_size,
-                                                             set_backward_flag, process_inputs)
+                                                             set_backward_flag, func_inputs_to_graph_inputs_by_stages)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -225,7 +225,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         for rand_input, label in dataset:
             args = (rand_input, label, module, opt)
             kwargs = {}
-            kwargs_stage = process_inputs(compiled_meta, *args, **kwargs)
+            kwargs_stage = func_inputs_to_graph_inputs_by_stages(compiled_meta, *args, **kwargs)
             input_dict = {}
             for di in kwargs_stage:
                 input_dict.update(di)
@@ -235,7 +235,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_unflatten = process_outputs(compiled_meta, outputs)
+    out_unflatten = graph_outputs_to_func_outputs(compiled_meta, outputs)
     out_flatten, _ = pytree.tree_flatten(out_unflatten)
 
     seed()

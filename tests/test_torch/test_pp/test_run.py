@@ -19,12 +19,12 @@ from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
                                                              split_into_equal_size,
-                                                             set_backward_flag, process_inputs)
+                                                             set_backward_flag, func_inputs_to_graph_inputs_by_stages)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage, PipelineStage1F1B
+from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B, ScheduleGPipe
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 
 from tqdm import tqdm
@@ -57,16 +57,6 @@ def train_step(input, label, model, opt):
     opt.step()
     return out, loss
 
-
-# sharding_sol = None
-# sol_rdy_cond = threading.Condition()
-
-# def fetch_strategy():
-#     with sol_rdy_cond:
-#         sol_rdy_cond.wait()
-#     return sharding_sol
-
-
 class StopTraining:
     pass
 
@@ -76,7 +66,7 @@ def test_main():
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    num_chunks = 1
+    num_chunks = world_size * 4
     dist.init_process_group(rank=rank, world_size=world_size)
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     module = resnet18().train().to(device)
@@ -99,12 +89,14 @@ def test_main():
     traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm = compile_resnet(
         module, num_chunks, opt, nstages, args, kwargs)
 
-    pipe = PipelineStage1F1B(local_gm=local_gm,
+    pipe = PipelineStageBase(schedule_cls=Schedule1F1B,
+                         local_gm=local_gm,
                          compiled_meta=compiled_meta,
                          stage_idx=rank,
                          compiled_stage=compiled_stages[rank],
                          node_metas=traced_stateless_func_node_metas,
                          num_chunks=num_chunks,
+                         args_chunk_spec=None,
                          kwargs_chunk_spec=None,
                          outputs_chunk_spec=None,
                          device=device)
@@ -112,35 +104,23 @@ def test_main():
     epochs = 5
 
     for epoch in range(epochs):
-        stage_kwargs = [None] * compiled_meta.nstages
-        stage_kwarg = [None]
-        if rank == 0:
-            for x_batch, y_batch in tqdm(train_dataloader, dynamic_ncols=True):
-                if x_batch.size(0) != batch_size:  # need to solve this?
-                    continue
-                args = (x_batch, y_batch, module, opt)
-                kwargs = {}
-                stage_kwargs = process_inputs(compiled_meta, *args, **kwargs, move_to_device=True)
-                dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
-                pipe(**stage_kwarg[0])
-            stage_kwargs = [StopTraining()] * compiled_meta.nstages
-            dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
-        else:
-            dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
-            all_cnt = 0
-            correct_cnt = 0
-            loss_sum = 0
-            while not isinstance(stage_kwarg[0], StopTraining):
-                pipe(**stage_kwarg[0])
-                if rank == world_size - 1:
-                    out = pipe.outputs_batch[pipe.compiled_meta.returns_names_unflatten[0]]
-                    loss = pipe.outputs_batch[pipe.compiled_meta.returns_names_unflatten[1]]
-                    all_cnt += len(out)
-                    preds = out.argmax(-1)
-                    correct_cnt += (
-                        preds == stage_kwarg[0][pipe.compiled_meta.args_names_unflatten[1]]).sum()
-                    loss_sum += loss.sum().item()
-                dist.scatter_object_list(stage_kwarg, stage_kwargs, src=0)
+        all_cnt = 0
+        correct_cnt = 0
+        loss_sum = 0
+        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True) if rank == 0 else train_dataloader):
+            if x_batch.size(0) != batch_size:  # need to solve this?
+                continue
+            args = (x_batch, y_batch, module, opt)
+            kwargs = {}
+            ret = pipe(*args, **kwargs)
+            if rank == world_size - 1:
+                out = ret[0]
+                loss = ret[-1]
+                all_cnt += len(out)
+                preds = out.argmax(-1)
+                correct_cnt += \
+                    (preds == y_batch.to(f'cuda:{rank}')).sum()
+                loss_sum += loss.sum().item()
 
         if rank == world_size - 1:
             print(
@@ -149,7 +129,6 @@ def test_main():
 
         outputs = pipe.all_gather_outputs(0)
         if rank == 0:
-
             def reduce_outputs(a, b):
                 ret = []
                 for aa, bb in zip(a, b):

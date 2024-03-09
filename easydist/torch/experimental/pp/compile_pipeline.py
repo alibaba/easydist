@@ -797,7 +797,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                          ed_gm.call_module_users, ed_gm.name)
 
 
-def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
+def func_inputs_to_graph_inputs_by_stages(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
     nstages = compiled_meta.nstages
     args_names_unflatten = compiled_meta.args_names_unflatten
     kwargs_names_unflatten = compiled_meta.kwargs_names_unflatten
@@ -823,7 +823,7 @@ def process_inputs(compiled_meta: CompiledMeta, *args, move_to_device=False, **k
     return stage_kwargs
 
 
-def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
+def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str, torch.Tensor]):
     maybe_updated_params_names_unflatten = compiled_meta.output_params_names_unflatten
     maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_names_unflatten
     updated_optimstates_names_unflatten = compiled_meta.output_optimstates_names_unflatten
@@ -832,28 +832,28 @@ def process_outputs(compiled_meta: CompiledMeta, outputs_dict):
 
     ret = []
     ret.append({
-        torch_name: outputs_dict[node_name]
+        torch_name: node_outputs[node_name]
         for torch_name, node_name in maybe_updated_params_names_unflatten.items()
     })
     ret.append({
-        torch_name: outputs_dict[node_name]
+        torch_name: node_outputs[node_name]
         for torch_name, node_name in maybe_updated_buffers_names_unflatten.items()
     })
     optimstates = defaultdict(dict)
     for torch_name, state_dict in updated_optimstates_names_unflatten.items():
         for typ, ph_name in state_dict.items():
-            optimstates[torch_name][typ] = outputs_dict[ph_name]
+            optimstates[torch_name][typ] = node_outputs[ph_name]
 
     ret.append(dict(optimstates))
     ret.append({
-        torch_name: outputs_dict[node_name]
+        torch_name: node_outputs[node_name]
         for torch_name, node_name in nones_or_grads_names_unflatten.items()
     })
-    ret.append(tuple(outputs_dict[node_name] for node_name in returns_names_unflatten))
+    ret.append(tuple(node_outputs[node_name] for node_name in returns_names_unflatten))
     return ret
 
 
-def process_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
+def graph_outputs_to_func_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
     maybe_updated_params_names_unflatten = compiled_meta.output_params_names_unflatten
     maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_names_unflatten
     updated_optimstates_names_unflatten = compiled_meta.output_optimstates_names_unflatten
