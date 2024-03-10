@@ -759,8 +759,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                     else:  # Number or _complex
                         args.append(arg)
                 if len(args) != len(node.args):
-                    assert len(
-                        args) == 0, "This node shall be completed removed since it has no args"
+                    assert not any(isinstance(arg, torch.fx.Node) for arg in args), "This node shall be completed removed since it has no tensor args"
                     continue
                 env[node.name] = new_graph.create_node(op='call_function',
                                                        name=node.name,

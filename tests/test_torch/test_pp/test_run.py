@@ -68,8 +68,9 @@ def test_main():
     world_size = int(os.environ["WORLD_SIZE"])
     num_chunks = world_size * 4
     dist.init_process_group(rank=rank, world_size=world_size)
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    module = resnet18().train().to(device)
+    compile_device = torch.device('cpu')
+    runtime_device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    module = resnet18().train()
     nstages, module = split_into_equal_size(world_size)(module)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.01, foreach=True)
@@ -84,7 +85,7 @@ def test_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
     x, y = next(iter(train_dataloader))
-    args = [x.to(device), y.to(device), module, opt]
+    args = [x, y, module, opt]
     kwargs = {}
     traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm = compile_resnet(
         module, num_chunks, opt, nstages, args, kwargs)
@@ -99,7 +100,7 @@ def test_main():
                          args_chunk_spec=None,
                          kwargs_chunk_spec=None,
                          outputs_chunk_spec=None,
-                         device=device)
+                         device=runtime_device)
 
     epochs = 5
 
@@ -154,8 +155,8 @@ def test_main():
             correct_cnt = 0
             all_cnt = 0
             for x_batch, y_batch in valid_dataloader:
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
+                x_batch = x_batch.to(runtime_device)
+                y_batch = y_batch.to(runtime_device)
                 out = module(x_batch)
                 preds = out.argmax(-1)
                 correct_cnt += (preds == y_batch).sum()
@@ -176,7 +177,8 @@ def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):
                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
                 if isinstance(rgetattr(module, name).data, FakeTensor):
                     mode = rgetattr(module, name).data.fake_mode
-        with mode:
+
+        with _enable_compile(), mode:
             opt.step()
             opt.zero_grad(True)
 
