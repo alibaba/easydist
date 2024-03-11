@@ -1,3 +1,4 @@
+from mimetypes import init
 import os
 import random
 from contextlib import nullcontext
@@ -20,6 +21,7 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
                                                              split_into_equal_size,
                                                              set_backward_flag)
+from easydist.torch.init_helper import SetParaInitHelper
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -56,10 +58,6 @@ def train_step(input, label, model, opt):
     loss.backward()
     opt.step()
     return out, loss
-
-
-class StopTraining:
-    pass
 
 
 def test_main():
@@ -133,7 +131,6 @@ def test_main():
 
         outputs = pipe.all_gather_outputs(0)
         if rank == 0:
-
             def reduce_outputs(a, b):
                 ret = []
                 for aa, bb in zip(a, b):
@@ -256,6 +253,7 @@ def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):
     compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
                                                                 nstages,
                                                                 stateless_func_args,
+                                                                init_helper=SetParaInitHelper(module),
                                                                 strict=True)
 
     return traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm

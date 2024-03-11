@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 import logging
 import operator
 import textwrap
@@ -14,6 +15,7 @@ import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
+from easydist.torch.init_helper import InitHelper, SetParaInitHelper, materialize_zero
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 
@@ -63,6 +65,10 @@ class CompiledMeta:
     # node name to stage idx mapping
     node_to_stage_idx: Dict[str, int]
 
+    # init helpers
+    params_init_helpers: Dict[str, InitHelper]
+    buffers_init_helpers: Dict[str, InitHelper]
+    optimstates_init_helpers: Dict[str, InitHelper]
 
 @dataclass
 class EDGraphModule:
@@ -912,7 +918,7 @@ def graph_outputs_to_func_outputs_non_strict(compiled_meta: CompiledMeta, output
 def compile_pipeline(traced_stateless_func: fx.GraphModule,
                      nstages: int,
                      stateless_func_args,
-                     delayed_init=False,
+                     init_helper: SetParaInitHelper=None,
                      strict=True):
     is_backward_called = get_backward_flag()
 
@@ -929,27 +935,6 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule,
 
     # defined in stateless_func
     params, buffers, optimstates, args, kwargs = stateless_func_args
-
-    if delayed_init:
-        fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True, allow_non_fake_inputs=False)
-        arg_count = 0
-
-        def wrap_fake(x):
-            nonlocal arg_count
-            if isinstance(x, torch.Tensor):
-                # TODO: it would be nice to line these up with the names
-                # FX will choose for the placeholders, but we don't
-                # actually know what the names will be at this point yet
-                # NB: the Source here is actually meaningless
-                from torch._dynamo.source import ConstantSource
-                source = ConstantSource(f"input{arg_count}")
-                arg_count += 1
-                # type: ignore[attr-defined]
-                return fake_tensor_mode.from_tensor(x, source=source)
-            return x
-
-        params, buffers, optimstates = pytree.tree_map(wrap_fake, [params, buffers, optimstates])
-
     params_names_unflatten, buffers_names_unflatten, optimstates_names_unflatten, args_names_unflatten, kwargs_names_unflatten = phs_names_unflatten
     output_params_names_unflatten, output_buffers_names_unflatten, output_optimstates_names_unflatten, nones_or_grads_names_unflatten, returns_names_unflatten = outputs_names_unflatten
     output_optimstates_names_flatten, _ = pytree.tree_flatten(output_optimstates_names_unflatten)
@@ -983,6 +968,45 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule,
         for output_name, input_name in zip(output_optimstates_names_flatten,
                                            pytree.tree_flatten(optimstates_names_unflatten)[0])
     }
+
+    params_init_helpers = None
+    buffers_init_helpers = None
+    optimstates_init_helpers = None
+    if init_helper is not None:
+        fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True, allow_non_fake_inputs=False)
+        arg_count = 0
+
+        def wrap_fake(x):
+            nonlocal arg_count
+            if isinstance(x, torch.Tensor):
+                # TODO: it would be nice to line these up with the names
+                # FX will choose for the placeholders, but we don't
+                # actually know what the names will be at this point yet
+                # NB: the Source here is actually meaningless
+                from torch._dynamo.source import ConstantSource
+                source = ConstantSource(f"input{arg_count}")
+                arg_count += 1
+                # type: ignore[attr-defined]
+                return fake_tensor_mode.from_tensor(x, source=source)
+            return x
+
+        params, buffers, optimstates = pytree.tree_map(wrap_fake, [params, buffers, optimstates])
+
+        params_init_helpers = {}
+        buffers_init_helpers = {}
+        optimstates_init_helpers = {}
+
+        params_buffers_materialize_fn = init_helper.get_materialize_fn()
+        for torch_name, _ in params.items():
+            node_name = params_names_unflatten[torch_name]
+            params_init_helpers[node_name] = partial(params_buffers_materialize_fn, param_buf_key=torch_name)
+
+        for torch_name, _ in buffers.items():
+            node_name = buffers_names_unflatten[torch_name]
+            buffers_init_helpers[node_name] = partial(params_buffers_materialize_fn, param_buf_key=torch_name)
+
+        for _, input_name in output2input_optimstates.items():
+            optimstates_init_helpers[input_name] = materialize_zero
 
     splited_global, part_cnt = split_by(traced_stateless_func, step_split_point)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
@@ -1107,7 +1131,11 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule,
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
-        node_to_stage_idx=None)
+        node_to_stage_idx=None,
+        params_init_helpers=params_init_helpers,
+        buffers_init_helpers=buffers_init_helpers,
+        optimstates_init_helpers=optimstates_init_helpers
+    )
 
     current_stateful_fw_bw = None
     compiled_stages: List[CompiledStage] = []

@@ -175,7 +175,7 @@ class PipelineStageBase:
         # Prepare send/recv infrastructure
         self._init_communication(node_metas)
         # Cast submodule to device
-        self._move_inject_states_to_device()
+        self._move_or_init_inject_states()
         # Move ops argument to device
         self._move_ops_to_device()
 
@@ -217,25 +217,44 @@ class PipelineStageBase:
             node_val_chunk_spec[node_name] = kwarg_chunk_spec
         return node_val_chunk_spec
 
-    def _move_inject_states_to_device(self):
+    def _move_or_init_inject_states(self):
         # Move submodule to indicated device if possible
         # Note: we cannot move meta module to real devices because meta tensors
         # do not support to() method. One needs to do an in-place tensor swap in
         # that case.
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
-                self.device)
+            if isinstance(tensor, FakeTensor) or tensor.is_meta:
+                materialize_fn = self.compiled_meta.params_init_helpers[name]
+                self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = materialize_fn(
+                    tensor=tensor,
+                    materialization_device=self.device
+                )
+            else:
+                self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
+                    self.device
+                )
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
-                self.device)
+            if isinstance(tensor, FakeTensor) or tensor.is_meta:
+                materialize_fn = self.compiled_meta.buffers_init_helpers[name]
+                self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = materialize_fn(
+                    tensor=tensor,
+                    materialization_device=self.device
+                )
+            else:
+                self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
+                    self.device)
         if self.step_node is not None:
             for name, tensor in self.compiled_stage.step_gm.injected_states[
                     StateType.OPTIMSTATES].items():
-                assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-                self.compiled_stage.step_gm.injected_states[
-                    StateType.OPTIMSTATES][name] = tensor.to(self.device)
+                if isinstance(tensor, FakeTensor) or tensor.is_meta:
+                    materialize_fn = self.compiled_meta.optimstates_init_helpers[name]
+                    self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = materialize_fn(
+                        tensor=tensor,
+                        materialization_device=self.device
+                    )
+                else:
+                    self.compiled_stage.step_gm.injected_states[
+                        StateType.OPTIMSTATES][name] = tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;

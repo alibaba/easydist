@@ -110,7 +110,7 @@ class InitHelper:
         pass
 
 
-class SetParaInitHelper:
+class SetParaInitHelper(InitHelper):
 
     def __init__(self, module=None) -> None:
         self.module = module
@@ -119,7 +119,7 @@ class SetParaInitHelper:
         return partial(materialize_module_from_set_parameter, module=self.module)
 
 
-class CpuModuleInitHelper:
+class CpuModuleInitHelper(InitHelper):
 
     def __init__(self, cpu_module) -> None:
         self.cpu_module = cpu_module
