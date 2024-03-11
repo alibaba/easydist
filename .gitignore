@@ -143,3 +143,6 @@ build/
 
 # torchvision dataset
 data
+
+# pt file
+*.pt

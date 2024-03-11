@@ -66,14 +66,15 @@ def test_main():
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    num_chunks = world_size * 4
+    num_chunks = 1
     dist.init_process_group(rank=rank, world_size=world_size)
     compile_device = torch.device('cpu')
     runtime_device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    module = resnet18().train()
+    module = resnet18().train().to(compile_device)
     nstages, module = split_into_equal_size(world_size)(module)
+    module.fc = torch.nn.Linear(512, 10).to(compile_device)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.01, foreach=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
     transform = transforms.Compose([
@@ -85,7 +86,7 @@ def test_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
     x, y = next(iter(train_dataloader))
-    args = [x, y, module, opt]
+    args = [x.to(compile_device), y.to(compile_device), module.to(compile_device), opt]
     kwargs = {}
     traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm = compile_resnet(
         module, num_chunks, opt, nstages, args, kwargs)
@@ -102,7 +103,7 @@ def test_main():
                          outputs_chunk_spec=None,
                          device=runtime_device)
 
-    epochs = 5
+    epochs = 1
 
     for epoch in range(epochs):
         all_cnt = 0
@@ -152,6 +153,7 @@ def test_main():
 
             module.load_state_dict({**params, **buffers})
             module.eval()
+            module.to(runtime_device)
             correct_cnt = 0
             all_cnt = 0
             for x_batch, y_batch in valid_dataloader:
@@ -162,6 +164,17 @@ def test_main():
                 correct_cnt += (preds == y_batch).sum()
                 all_cnt += len(y_batch)
             print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
+
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    ckpt_dir = os.path.join(cur_dir, 'ckpt')
+    if not os.path.exists(ckpt_dir):
+        os.makedirs(ckpt_dir)
+    
+    state_dict = pipe.state_dict()
+    opt_state_dict = pipe.optimizer_state_dict()
+
+    torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
+    torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
 
 
 def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):

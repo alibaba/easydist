@@ -269,6 +269,22 @@ class CompiledStage:  # TODO @botbw: make this picklable
         state_dict.update(self.named_buffers())
         return state_dict
 
+    def load_state_dict(self, state_dict):
+        for torch_name, tensor in state_dict.items():
+            if torch_name in self.compiled_meta.inv_params:
+                self.fw_gm.injected_states[StateType.PARAMS][torch_name] = tensor
+            elif torch_name in self.compiled_meta.inv_buffers:
+                self.fw_gm.injected_states[StateType.BUFFERS][torch_name] = tensor
+            else:
+                raise RuntimeError(f"state_dict key {torch_name} not found")
+
+    def load_optimizer_state_dict(self, state_dict):
+        for torch_name, state in state_dict.items():
+            if torch_name in self.compiled_meta.inv_optimstates:
+                self.step_gm.injected_states[StateType.OPTIMSTATES][torch_name] = state
+            else:
+                raise RuntimeError(f"state_dict key {torch_name} not found")
+
     def named_parameters(self):
         return {
             self.compiled_meta.inv_params[name]: tensor

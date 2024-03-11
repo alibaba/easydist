@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 import logging
 import operator
 from typing import Any, Dict, List, Optional, Tuple, Type
-from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
@@ -538,6 +537,18 @@ class PipelineStageBase:
         self.outputs_batch = {**params, **buffers, **optimstates, **grads, **rets}
 
         return self.outputs_batch
+
+    def state_dict(self):
+        return self.compiled_stage.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.compiled_stage.load_state_dict(state_dict)
+
+    def optimizer_state_dict(self):
+        return self.compiled_stage.optimizer_state_dict()
+
+    def load_optimizer_state_dict(self, state_dict):
+        self.compiled_stage.load_optimizer_state_dict(state_dict)
 
     def all_gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
