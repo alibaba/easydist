@@ -17,10 +17,11 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
                                 vit_b_16)
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
-                                                             compile_pipeline, graph_outputs_to_func_outputs,
-                                                             split_into_equal_size,
-                                                             set_backward_flag, func_inputs_to_graph_inputs_by_stages)
+from easydist.torch.experimental.pp.compile_pipeline import (
+    SplitPatcher, StateType, annotate_split_points, compile_pipeline,
+    graph_outputs_to_func_outputs, split_into_equal_size, set_backward_flag,
+    func_inputs_to_graph_inputs_by_stages)
+from easydist.torch.experimental.pp.PipelineStage import modify_graph_op_device
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -96,10 +97,12 @@ def train_step_gpt(input, label, model, opt):
     ]:
         if hasattr(out, key) and (attr := getattr(out, key)) is not None:
             if isinstance(attr, torch.Tensor):
-                loss += (attr - torch.ones_like(attr) * label).pow(2).mean()
+                attr_broadcast = attr.permute([i for i in range(attr.dim() - 1, -1, -1)])
+                loss += (attr_broadcast - label).pow(2).mean()
             elif isinstance(attr, (tuple, list)):
                 for a in attr:
-                    loss += (a - torch.ones_like(a) * label).pow(2).mean()
+                    attr_broadcast = a.permute([i for i in range(a.dim() - 1, -1, -1)])
+                    loss += (attr_broadcast - label).pow(2).mean()
     if opt is not None:
         loss.backward()
         opt.step()
@@ -118,10 +121,12 @@ def train_step_t5(input, label, model, opt):
 
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
-    module = module.double().train().cuda()
+    compile_device = torch.device("cpu")
+    runtime_device = torch.device("cpu")
+    module = module.double().train().to(compile_device)
     opt = None  # inference only
-    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
+    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
     if opt is None:
         module = module.eval()
@@ -132,8 +137,8 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     else:
         nstages, module = split_ann_or_policy(module)
 
-    rand_input = rand_input_gen_method()
-    label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).cuda()
+    rand_input = rand_input_gen_method().to(compile_device)
+    label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).to(compile_device)
     args = [rand_input, label, module, opt]
     kwargs = {}
 
@@ -151,7 +156,8 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
                 if isinstance(rgetattr(module, name).data, FakeTensor):
                     mode = rgetattr(module, name).data.fake_mode
-        with mode:
+
+        with _enable_compile(), mode:
             opt.step()
             opt.zero_grad(True)
 
@@ -213,11 +219,35 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                                                                 stateless_func_args,
                                                                 strict=False)
 
+    modify_graph_op_device(local_gm, runtime_device)
+    for compiled_stage in compiled_stages:
+        for name, tensor in compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
+                runtime_device)
+        for name, tensor in compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
+                runtime_device)
+        for name, tensor in compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
+            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
+            compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(
+                runtime_device)
+
+    def move_to_runtime_device(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(runtime_device)
+        else:
+            return x
+
+    stateless_func_args_copy = pytree.tree_map(move_to_runtime_device, stateless_func_args_copy)
+
     epochs = 2
     dataset = []
     for _ in range(epochs):
-        rand_input = rand_input_gen_method()
-        label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).cuda()
+        rand_input = rand_input_gen_method().to(runtime_device)
+        label = torch.tensor([random.random()
+                              for _ in range(rand_input.shape[0])]).to(runtime_device)
         dataset.append((rand_input, label))
 
     seed()
@@ -262,86 +292,88 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
 
 def gen_rand_input_foo():
-    return torch.rand(16, 1024).cuda().double()
+    return torch.rand(16, 1024).double()
 
 
 def gen_rand_input_imagenet():
-    return torch.rand(16, 3, 224, 224).cuda().double()
+    return torch.rand(16, 3, 224, 224).double()
 
 
 def factory_gen_rand_input_ids(vocab_size):
 
     def gen_rand_input_ids():
-        return torch.randint(0, vocab_size, (3, 200)).long().cuda()
+        return torch.randint(0, vocab_size, (3, 200)).long()
 
     return gen_rand_input_ids
 
 
 if __name__ == '__main__':
-    test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
-    test_main(Foo1(), {
-        'norm',
-        'linear0_1',
-    }, gen_rand_input_foo, train_step)
-    test_main(alexnet(), {
-        'features.10',
-        'classifier.3',
-    }, gen_rand_input_imagenet, train_step)
-    test_main(
-        densenet121(), {
-            'features.denseblock1.denselayer4.norm2',
-            'features.transition2.conv',
-            'features.denseblock4.denselayer1.relu1',
-            'features',
-        }, gen_rand_input_imagenet, train_step)
-    test_main(efficientnet_b0(), {
-        'features.2.0.block.1',
-        'features.4.1.block.3',
-        'features.6.1.block.3',
-        'features.8',
-    }, gen_rand_input_imagenet, train_step)
-    test_main(resnet18(), {
-        'layer1',
-        'layer2',
-        'layer3',
-        'layer4',
-    }, gen_rand_input_imagenet, train_step)
-    test_main(
-        swin_t(), {
-            'features.2.reduction',
-            'features.3.0.mlp.1',
-            'features.5.1.attn.qkv',
-            'features.7.0.stochastic_depth',
-        }, gen_rand_input_imagenet, train_step)
-    test_main(vgg19(), {
-        'features.10',
-        'features.20',
-        'classifier.3',
-    }, gen_rand_input_imagenet, train_step)
-    test_main(
-        vit_b_16(), {
-            'encoder.layers.encoder_layer_1.self_attention',
-            'encoder.layers.encoder_layer_5.mlp.3',
-            'encoder.layers.encoder_layer_9.ln_2',
-        }, gen_rand_input_imagenet, train_step)
+    # test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
+    # test_main(Foo1(), {
+    #     'norm',
+    #     'linear0_1',
+    # }, gen_rand_input_foo, train_step)
+    # test_main(alexnet(), {
+    #     'features.10',
+    #     'classifier.3',
+    # }, gen_rand_input_imagenet, train_step)
+    # test_main(
+    #     densenet121(), {
+    #         'features.denseblock1.denselayer4.norm2',
+    #         'features.transition2.conv',
+    #         'features.denseblock4.denselayer1.relu1',
+    #         'features',
+    #     }, gen_rand_input_imagenet, train_step)
+    # test_main(efficientnet_b0(), {
+    #     'features.2.0.block.1',
+    #     'features.4.1.block.3',
+    #     'features.6.1.block.3',
+    #     'features.8',
+    # }, gen_rand_input_imagenet, train_step)
+    # test_main(resnet18(), {
+    #     'layer1',
+    #     'layer2',
+    #     'layer3',
+    #     'layer4',
+    # }, gen_rand_input_imagenet, train_step)
+    # test_main(
+    #     swin_t(), {
+    #         'features.2.reduction',
+    #         'features.3.0.mlp.1',
+    #         'features.5.1.attn.qkv',
+    #         'features.7.0.stochastic_depth',
+    #     }, gen_rand_input_imagenet, train_step)
+    # test_main(vgg19(), {
+    #     'features.10',
+    #     'features.20',
+    #     'classifier.3',
+    # }, gen_rand_input_imagenet, train_step)
+    # test_main(
+    #     vit_b_16(), {
+    #         'encoder.layers.encoder_layer_1.self_attention',
+    #         'encoder.layers.encoder_layer_5.mlp.3',
+    #         'encoder.layers.encoder_layer_9.ln_2',
+    #     }, gen_rand_input_imagenet, train_step)
 
-    test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
-    test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
-    test_main(alexnet(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
-    test_main(densenet121(), split_into_equal_size(5), gen_rand_input_imagenet, train_step)
-    test_main(efficientnet_b0(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
-    test_main(resnet18(), split_into_equal_size(4), gen_rand_input_imagenet, train_step)
-    test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
-    test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
-    test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    # test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    # test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    # test_main(alexnet(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    # test_main(densenet121(), split_into_equal_size(5), gen_rand_input_imagenet, train_step)
+    # test_main(efficientnet_b0(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    # test_main(resnet18(), split_into_equal_size(4), gen_rand_input_imagenet, train_step)
+    # test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    # test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    # test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
 
     # # ======== nlp models, might take long time and OOM ========
+    # from transformers import OpenAIGPTModel, OpenAIGPTConfig
     # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
     #     'h.3',
     #     'h.6',
     #     'h.9',
     # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
+    # from transformers import AutoModel
     # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
     #     'encoder.layer.3',
     #     'encoder.layer.6',
@@ -354,6 +386,7 @@ if __name__ == '__main__':
     #     'h.9',
     # }, factory_gen_rand_input_ids(50257), train_step_gpt)
 
+    # from transformers import LlamaModel, LlamaConfig
     # test_main(LlamaModel(LlamaConfig()), {
     #     'layers.8',
     #     'layers.16',

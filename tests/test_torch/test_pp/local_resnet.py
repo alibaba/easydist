@@ -19,10 +19,9 @@ from torch._subclasses.fake_tensor import FakeTensor
 from torchvision.models import resnet18
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annotate_split_points,
-                                                             compile_pipeline, graph_outputs_to_func_outputs,
-                                                             split_into_equal_size,
-                                                             set_backward_flag, func_inputs_to_graph_inputs_by_stages)
+from easydist.torch.experimental.pp.compile_pipeline import (
+    SplitPatcher, annotate_split_points, compile_pipeline, graph_outputs_to_func_outputs,
+    split_into_equal_size, set_backward_flag, func_inputs_to_graph_inputs_by_stages)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
@@ -99,13 +98,15 @@ def test_main(split_ann_or_policy):
                     continue
                 args = (x_batch, y_batch, module, opt)
                 kwargs = {}
-                kwargs_stage = func_inputs_to_graph_inputs_by_stages(compiled_meta, *args, **kwargs)
+                kwargs_stage = func_inputs_to_graph_inputs_by_stages(compiled_meta, *args,
+                                                                     **kwargs)
                 input_dict = reduce(lambda x, y: {**x, **y}, kwargs_stage)
                 local_gm(**input_dict)
                 outputs_dict = {}
                 for stage in compiled_stages:
                     outputs_dict.update(stage.outputs)
-                params, buffers, _, _, ret = graph_outputs_to_func_outputs(compiled_meta, outputs_dict)
+                params, buffers, _, _, ret = graph_outputs_to_func_outputs(
+                    compiled_meta, outputs_dict)
                 out, loss = ret
                 loss_sum += loss.item()
                 preds = out.argmax(-1)

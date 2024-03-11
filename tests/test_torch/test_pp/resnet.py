@@ -19,12 +19,12 @@ from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
                                                              split_into_equal_size,
-                                                             set_backward_flag, func_inputs_to_graph_inputs_by_stages)
+                                                             set_backward_flag)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
-from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B, ScheduleGPipe
+from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 
 from tqdm import tqdm
@@ -56,6 +56,7 @@ def train_step(input, label, model, opt):
     loss.backward()
     opt.step()
     return out, loss
+
 
 class StopTraining:
     pass
@@ -92,24 +93,25 @@ def test_main():
         module, num_chunks, opt, nstages, args, kwargs)
 
     pipe = PipelineStageBase(schedule_cls=Schedule1F1B,
-                         local_gm=local_gm,
-                         compiled_meta=compiled_meta,
-                         stage_idx=rank,
-                         compiled_stage=compiled_stages[rank],
-                         node_metas=traced_stateless_func_node_metas,
-                         num_chunks=num_chunks,
-                         args_chunk_spec=None,
-                         kwargs_chunk_spec=None,
-                         outputs_chunk_spec=None,
-                         device=runtime_device)
+                             local_gm=local_gm,
+                             compiled_meta=compiled_meta,
+                             stage_idx=rank,
+                             compiled_stage=compiled_stages[rank],
+                             node_metas=traced_stateless_func_node_metas,
+                             num_chunks=num_chunks,
+                             args_chunk_spec=None,
+                             kwargs_chunk_spec=None,
+                             outputs_chunk_spec=None,
+                             device=runtime_device)
 
-    epochs = 1
+    epochs = 5
 
     for epoch in range(epochs):
         all_cnt = 0
         correct_cnt = 0
         loss_sum = 0
-        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True) if rank == 0 else train_dataloader):
+        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True)
+                                 if rank == 0 else train_dataloader):
             if x_batch.size(0) != batch_size:  # need to solve this?
                 continue
             args = (x_batch, y_batch, module, opt)
@@ -131,6 +133,7 @@ def test_main():
 
         outputs = pipe.all_gather_outputs(0)
         if rank == 0:
+
             def reduce_outputs(a, b):
                 ret = []
                 for aa, bb in zip(a, b):
@@ -169,7 +172,7 @@ def test_main():
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
-    
+
     state_dict = pipe.state_dict()
     opt_state_dict = pipe.optimizer_state_dict()
 

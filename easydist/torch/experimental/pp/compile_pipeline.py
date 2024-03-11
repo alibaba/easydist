@@ -3,7 +3,6 @@ import logging
 import operator
 import textwrap
 from typing import (Callable, Dict, List, Optional, Set, Tuple, Any, Union)
-from abc import ABC, abstractmethod
 from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
 from enum import Enum
@@ -388,7 +387,7 @@ def _to_tuple(x):
     return (x, )
 
 
-from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func, fw_bw_param_type, fw_bw_ret_type
+from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func
 
 
 # ================================= section start ========================================
@@ -459,8 +458,7 @@ def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], tor
 
         total_size = param_size + buffer_size
         per_stage_size = total_size // nstages
-        logging.debug(f"Total model size: {total_size}, "
-                      f"per stage size: {per_stage_size}")
+        logging.debug(f"Total model size: {total_size}, " f"per stage size: {per_stage_size}")
 
         gm, rv_nstages = _split_on_size_threshold_with_max_stages(gm, per_stage_size, nstages)
         assert rv_nstages == nstages
@@ -547,8 +545,8 @@ def _split_on_size_threshold_with_max_stages(
             for param_name, size in param_sizes.items():
                 new_size += size
 
-        if (accumulate_size + new_size
-                <= threshold):  # can accommodate this node in current bucket
+        if (accumulate_size + new_size <=
+                threshold):  # can accommodate this node in current bucket
             accumulate_size += new_size
             accumulate_params.update(new_params)
         elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage
@@ -775,7 +773,9 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                     else:  # Number or _complex
                         args.append(arg)
                 if len(args) != len(node.args):
-                    assert not any(isinstance(arg, torch.fx.Node) for arg in args), "This node shall be completed removed since it has no tensor args"
+                    assert not any(
+                        isinstance(arg, torch.fx.Node) for arg in
+                        args), "This node shall be completed removed since it has no tensor args"
                     continue
                 env[node.name] = new_graph.create_node(op='call_function',
                                                        name=node.name,
@@ -812,7 +812,10 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                          ed_gm.call_module_users, ed_gm.name)
 
 
-def func_inputs_to_graph_inputs_by_stages(compiled_meta: CompiledMeta, *args, move_to_device=False, **kwargs):
+def func_inputs_to_graph_inputs_by_stages(compiled_meta: CompiledMeta,
+                                          *args,
+                                          move_to_device=False,
+                                          **kwargs):
     nstages = compiled_meta.nstages
     args_names_unflatten = compiled_meta.args_names_unflatten
     kwargs_names_unflatten = compiled_meta.kwargs_names_unflatten
@@ -838,7 +841,8 @@ def func_inputs_to_graph_inputs_by_stages(compiled_meta: CompiledMeta, *args, mo
     return stage_kwargs
 
 
-def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str, torch.Tensor]):
+def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str,
+                                                                                  torch.Tensor]):
     maybe_updated_params_names_unflatten = compiled_meta.output_params_names_unflatten
     maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_names_unflatten
     updated_optimstates_names_unflatten = compiled_meta.output_optimstates_names_unflatten

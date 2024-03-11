@@ -12,7 +12,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
 
 from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
-from easydist.torch.experimental.pp.utils import modify_graph_op_device, map_debug_info
+from easydist.torch.experimental.pp.utils import modify_graph_op_device
 from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
 
 logger = logging.getLogger(__name__)
@@ -41,12 +41,12 @@ class RecvInfo:
         return f"RecvInfo(input={self.input_name}, source={self.source}, shape={self.example_tensor.size()})"
 
 
-
 class StageKwargPlaceholder:
     pass
 
 
 class Schedule(ABC):
+
     def __init__(self, pipeline_stage: 'PipelineStageBase'):
         assert isinstance(pipeline_stage, PipelineStageBase)
         self.pipeline_stage = pipeline_stage
@@ -54,6 +54,7 @@ class Schedule(ABC):
     @abstractmethod
     def __call__(self) -> None:
         raise NotImplementedError
+
 
 class ScheduleGPipe(Schedule):
 
@@ -88,6 +89,7 @@ class ScheduleGPipe(Schedule):
         if self.pipeline_stage.step_node is not None:
             self.pipeline_stage.step()
 
+
 class Schedule1F1B(Schedule):
 
     def __call__(self) -> None:
@@ -106,9 +108,9 @@ class Schedule1F1B(Schedule):
             all_bw_send_reqs += self.pipeline_stage.backward_one_chunk_if_exists(bwd_chunk)
             all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(fwd_chunk)
 
-
         # Cool-down phase: backward for the rest of the chunks
-        for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup, self.pipeline_stage.num_chunks):
+        for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup,
+                               self.pipeline_stage.num_chunks):
             all_bw_send_reqs += self.pipeline_stage.backward_one_chunk(bwd_chunk)
 
         # Wait for all sends to finish
@@ -123,6 +125,7 @@ class Schedule1F1B(Schedule):
 
         if self.pipeline_stage.step_node is not None:
             self.pipeline_stage.step()
+
 
 class PipelineStageBase:
 
@@ -150,21 +153,22 @@ class PipelineStageBase:
         self.stage_idx = stage_idx
         self.compiled_stage = compiled_stage
         self.num_chunks = num_chunks
-        self.node_val_chunk_spec = self._get_graph_inputs_chunk(compiled_meta, args_chunk_spec, kwargs_chunk_spec)
+        self.node_val_chunk_spec = self._get_graph_inputs_chunk(compiled_meta, args_chunk_spec,
+                                                                kwargs_chunk_spec)
         self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
         self.group = group
 
         self.group_rank = dist.get_rank(group)
         self.num_stages = compiled_meta.nstages
-        self.node_to_stage_idx = compiled_meta.node_to_stage_idx # TODO refactor this mapping?
+        self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
 
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
         # runtimes
-        self.outputs_batch = {}        # Activation send requests of all chunk
+        self.outputs_batch = {}  # Activation send requests of all chunk
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
 
@@ -179,7 +183,7 @@ class PipelineStageBase:
         # Find stage forward node in graph
         self.fw_node = None
         for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_fw': # TODO is it good to use str as a tag?
+            if node.name == f'{self.name}_fw':  # TODO is it good to use str as a tag?
                 assert self.fw_node is None, "Multiple forward nodes found"
                 self.fw_node = node
         if not self.fw_node:
@@ -188,14 +192,14 @@ class PipelineStageBase:
         # Find stage backward node in graph
         self.bw_node = None
         for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_bw': # TODO is it good to use str as a tag?
+            if node.name == f'{self.name}_bw':  # TODO is it good to use str as a tag?
                 assert self.bw_node is None, "Multiple backward nodes found"
                 self.bw_node = node
 
         # Find stage step node in graph
         self.step_node = None
         for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_step': # TODO is it good to use str as a tag?
+            if node.name == f'{self.name}_step':  # TODO is it good to use str as a tag?
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
 
@@ -277,7 +281,8 @@ class PipelineStageBase:
             self.bw_args_recv_info: Dict[int, Tuple] = {}
             self.bw_kwargs_recv_info: Dict[int, Dict] = {}
             for chunk in range(self.num_chunks):
-                self.bw_kwargs_recv_info[chunk] = self._create_recv_buffers(node_metas, self.bw_node)
+                self.bw_kwargs_recv_info[chunk] = self._create_recv_buffers(
+                    node_metas, self.bw_node)
 
             self.bw_grad_send_info = self._create_send_info(self.bw_node)
 
@@ -302,8 +307,7 @@ class PipelineStageBase:
                 gi_dsts.append(dst_rank)
             # Next `getitem` will point to the next output index
 
-        logger.info(f"[{self.group_rank}] "
-                    f"Send info: {act_send_info}")
+        logger.info(f"[{self.group_rank}] " f"Send info: {act_send_info}")
         return dict(sorted(act_send_info.items()))
 
     def _create_recv_buffers(
@@ -428,8 +432,7 @@ class PipelineStageBase:
         for name, dst_stages in send_info.items():
             out = output_dict[name]
             for dst in dst_stages:
-                logger.debug(f"[{self.group_rank}] "
-                             f"Sending tensor to Rank {dst}: {out.size()}")
+                logger.debug(f"[{self.group_rank}] " f"Sending tensor to Rank {dst}: {out.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
                     out,
@@ -475,10 +478,7 @@ class PipelineStageBase:
         bw_send_reqs = self._send_output_dict(self.bw_grad_send_info, outputs_chunk)
         return bw_send_reqs
 
-    def backward_one_chunk_if_exists(
-        self,
-        chunk: int
-    ) -> List[dist.Work]:
+    def backward_one_chunk_if_exists(self, chunk: int) -> List[dist.Work]:
         if self.bw_node is not None:
             return self.backward_one_chunk(chunk)
         return []
@@ -571,11 +571,14 @@ class PipelineStageBase:
                            optimizer_state_dicts if self.group_rank == rank else None,
                            dst=rank)
         return optimizer_state_dicts
-    
+
     def __call__(self, *args, **kwargs) -> None:
         node_input_this_stage = [None]
         if self.is_first():
-            node_inputs_all_stages = func_inputs_to_graph_inputs_by_stages(self.compiled_meta, *args, **kwargs, move_to_device=False)
+            node_inputs_all_stages = func_inputs_to_graph_inputs_by_stages(self.compiled_meta,
+                                                                           *args,
+                                                                           **kwargs,
+                                                                           move_to_device=False)
         else:
             node_inputs_all_stages = [None] * self.num_stages
 
