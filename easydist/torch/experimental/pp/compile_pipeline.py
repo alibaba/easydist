@@ -1,23 +1,23 @@
-from dataclasses import dataclass
-from functools import partial
 import logging
 import operator
 import textwrap
-from typing import (Callable, Dict, List, Optional, Set, Tuple, Any, Union)
-from typing import (Callable, Dict, List, Tuple)
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.fx as fx
-from torch.fx._symbolic_trace import _Patcher
 import torch.utils._pytree as pytree
-from torch._subclasses.fake_tensor import FakeTensorMode
 
-from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.init_helper import InitHelper, SetParaInitHelper, materialize_zero
-from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
+from easydist.torch.init_helper import (InitHelper, SetParaInitHelper,
+                                        materialize_zero)
+from easydist.utils import rgetattr, rsetattr
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx._symbolic_trace import _Patcher
 
 
 class StateType(Enum):
@@ -393,7 +393,8 @@ def _to_tuple(x):
     return (x, )
 
 
-from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func
+from easydist.torch.experimental.pp.split_op import (before_bw_split_func,
+                                                     fw_bw_split_func)
 
 
 # ================================= section start ========================================
@@ -1337,6 +1338,3 @@ def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tup
 @after_split_register(tuple)
 def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
     return tuple(list_after_split(ctx, output))
-
-
-# TODO @botbw: how to deal with dict?

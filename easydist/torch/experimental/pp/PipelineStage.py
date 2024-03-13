@@ -3,7 +3,7 @@ from functools import reduce
 from abc import ABC, abstractmethod
 import logging
 import operator
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
@@ -11,7 +11,7 @@ import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
 
-from easydist.torch.experimental.pp.microbatch import merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
+from easydist.torch.experimental.pp.microbatch import CustomReducer, merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
 from easydist.torch.experimental.pp.utils import modify_graph_op_device
 from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
 
@@ -138,9 +138,9 @@ class PipelineStageBase:
         compiled_stage: CompiledStage,
         node_metas: Dict[str, Dict[str, FakeTensor]],
         num_chunks: int,
-        args_chunk_spec: Tuple[Optional[TensorChunkSpec]],
-        kwargs_chunk_spec: Dict[str, TensorChunkSpec],
-        outputs_chunk_spec: Tuple[Optional[TensorChunkSpec]],
+        args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
+        kwargs_chunk_spec:Optional[ Dict[str, TensorChunkSpec]],
+        outputs_chunk_spec: Optional[Tuple[Union[TensorChunkSpec,CustomReducer]]],
         device: torch.device,
         group: Optional[dist.ProcessGroup] = None,
     ):

@@ -1,4 +1,3 @@
-from mimetypes import init
 import os
 import random
 from contextlib import nullcontext
@@ -18,6 +17,7 @@ from torchvision.models import resnet18
 
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
                                                              split_into_equal_size,
                                                              set_backward_flag)
@@ -26,8 +26,8 @@ from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
-from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B
-from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B, ScheduleGPipe
+from easydist.torch.experimental.pp.microbatch import CustomReducer, split_args_kwargs_into_chunks, TensorChunkSpec, Replicate
 
 from tqdm import tqdm
 
@@ -65,15 +65,18 @@ def test_main():
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+
     num_chunks = 1
     dist.init_process_group(rank=rank, world_size=world_size)
+
     compile_device = torch.device('cpu')
-    runtime_device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+
     module = resnet18().train().to(compile_device)
-    nstages, module = split_into_equal_size(world_size)(module)
     module.fc = torch.nn.Linear(512, 10).to(compile_device)
-    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    _, module = split_into_equal_size(world_size)(module)
+
+    # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
     transform = transforms.Compose([
@@ -87,23 +90,15 @@ def test_main():
     x, y = next(iter(train_dataloader))
     args = [x.to(compile_device), y.to(compile_device), module.to(compile_device), opt]
     kwargs = {}
-    traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm = compile_resnet(
-        module, num_chunks, opt, nstages, args, kwargs)
 
-    pipe = PipelineStageBase(schedule_cls=Schedule1F1B,
-                             local_gm=local_gm,
-                             compiled_meta=compiled_meta,
-                             stage_idx=rank,
-                             compiled_stage=compiled_stages[rank],
-                             node_metas=traced_stateless_func_node_metas,
-                             num_chunks=num_chunks,
-                             args_chunk_spec=None,
-                             kwargs_chunk_spec=None,
-                             outputs_chunk_spec=None,
-                             device=runtime_device)
+    args_chunk_spec = [TensorChunkSpec(0), TensorChunkSpec(0), Replicate(), Replicate()]
+    kwargs_chunk_spec = {}
+    output_chunk_spec = None #CustomReducer(0, lambda x, y: x + y.item())]
+    pipe = _compile_pp(train_step, None, SetParaInitHelper, None, args, kwargs,
+                       ScheduleGPipe, args_chunk_spec, kwargs_chunk_spec,
+                       output_chunk_spec, 1)
 
     epochs = 5
-
     for epoch in range(epochs):
         all_cnt = 0
         correct_cnt = 0
@@ -131,6 +126,7 @@ def test_main():
 
         outputs = pipe.all_gather_outputs(0)
         if rank == 0:
+            device = torch.device('cuda:0')
             def reduce_outputs(a, b):
                 ret = []
                 for aa, bb in zip(a, b):
@@ -153,12 +149,12 @@ def test_main():
 
             module.load_state_dict({**params, **buffers})
             module.eval()
-            module.to(runtime_device)
+            module.to(device)
             correct_cnt = 0
             all_cnt = 0
             for x_batch, y_batch in valid_dataloader:
-                x_batch = x_batch.to(runtime_device)
-                y_batch = y_batch.to(runtime_device)
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
                 out = module(x_batch)
                 preds = out.argmax(-1)
                 correct_cnt += (preds == y_batch).sum()
@@ -177,86 +173,86 @@ def test_main():
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
 
 
-def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):
-    params = dict(module.named_parameters())
-    buffers = dict(module.named_buffers())
+# def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):
+#     params = dict(module.named_parameters())
+#     buffers = dict(module.named_buffers())
 
-    named_states = {}
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = rgetattr(module, name).data.fake_mode
+#     named_states = {}
+#     if opt is not None:
+#         # assign grad and warm up optimizer
+#         mode = nullcontext()
+#         for name in dict(module.named_parameters()):
+#             with torch.no_grad():
+#                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+#                 if isinstance(rgetattr(module, name).data, FakeTensor):
+#                     mode = rgetattr(module, name).data.fake_mode
 
-        with _enable_compile(), mode:
-            opt.step()
-            opt.zero_grad(True)
+#         with _enable_compile(), mode:
+#             opt.step()
+#             opt.zero_grad(True)
 
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
+#         for n, p in params.items():
+#             if p in opt.state:
+#                 named_states[n] = opt.state[p]  # type: ignore[index]
+#                 # if step in state, reduce one for warmup step.
+#                 if 'step' in named_states[n]:
+#                     named_states[n]['step'] -= 1
 
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+#     flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
-    # fix for sgd withtout momentum
-    if all(state is None for state in flat_named_states):
-        named_states = {}
-        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+#     # fix for sgd withtout momentum
+#     if all(state is None for state in flat_named_states):
+#         named_states = {}
+#         flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
-    def stateless_func(func, params, buffers, named_states, args, kwargs):
-        with stateless._reparametrize_module(
-                cast(torch.nn.Module, module), {
-                    **params,
-                    **buffers
-                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-                    opt, named_states, params) if opt else nullcontext():
-            ret = func(*args, **kwargs)
+#     def stateless_func(func, params, buffers, named_states, args, kwargs):
+#         with stateless._reparametrize_module(
+#                 cast(torch.nn.Module, module), {
+#                     **params,
+#                     **buffers
+#                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
+#                     opt, named_states, params) if opt else nullcontext():
+#             ret = func(*args, **kwargs)
 
-        grads = {k: v.grad for k, v in params.items()}
-        return params, buffers, named_states, grads, ret
+#         grads = {k: v.grad for k, v in params.items()}
+#         return params, buffers, named_states, grads, ret
 
-    args_split, kwargs_split = split_args_kwargs_into_chunks(
-        args,
-        kwargs,
-        num_chunks,
-        None,  #self.pipe.kwargs_chunk_spec,
-    )
+#     args_split, kwargs_split = split_args_kwargs_into_chunks(
+#         args,
+#         kwargs,
+#         num_chunks,
+#         None,  #self.pipe.kwargs_chunk_spec,
+#     )
 
-    with _enable_compile(), SplitPatcher(module, opt):
-        set_backward_flag(False)
-        traced_stateless_func = ed_make_fx(partial(stateless_func, train_step),
-                                           tracing_mode='fake',
-                                           decomposition_table=EASYDIST_DECOMP_TABLE,
-                                           _allow_non_fake_inputs=False)(params, buffers,
-                                                                         named_states,
-                                                                         args_split[0],
-                                                                         kwargs_split[0])
+#     with _enable_compile(), SplitPatcher(module, opt):
+#         set_backward_flag(False)
+#         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step),
+#                                            tracing_mode='fake',
+#                                            decomposition_table=EASYDIST_DECOMP_TABLE,
+#                                            _allow_non_fake_inputs=False)(params, buffers,
+#                                                                          named_states,
+#                                                                          args_split[0],
+#                                                                          kwargs_split[0])
 
-    traced_stateless_func.graph.eliminate_dead_code()
-    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
-    traced_stateless_func.recompile()
+#     traced_stateless_func.graph.eliminate_dead_code()
+#     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
+#     traced_stateless_func.recompile()
 
-    save_graphviz_dot(traced_stateless_func, 'traced_graph')
+#     save_graphviz_dot(traced_stateless_func, 'traced_graph')
 
-    traced_stateless_func_node_metas = {
-        node.name: node.meta
-        for node in traced_stateless_func.graph.nodes
-    }
-    stateless_func_args = [params, buffers, named_states, args, kwargs]
+#     traced_stateless_func_node_metas = {
+#         node.name: node.meta
+#         for node in traced_stateless_func.graph.nodes
+#     }
+#     stateless_func_args = [params, buffers, named_states, args, kwargs]
 
-    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
-                                                                nstages,
-                                                                stateless_func_args,
-                                                                init_helper=SetParaInitHelper(module),
-                                                                strict=True)
+#     compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
+#                                                                 nstages,
+#                                                                 stateless_func_args,
+#                                                                 init_helper=SetParaInitHelper(module),
+#                                                                 strict=True)
 
-    return traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm
+#     return traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm
 
 
 if __name__ == '__main__':
