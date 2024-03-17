@@ -132,7 +132,7 @@ def _compile_pp(func,
     compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
                                                                 world_size,
                                                                 stateless_func_args,
-                                                                init_helper=SetParaInitHelper(module),
+                                                                init_helper=init_helper,
                                                                 strict=True)
 
     pipe = PipelineStageBase(schedule_cls=schedule_cls,

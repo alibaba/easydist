@@ -66,7 +66,6 @@ def test_main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    num_chunks = world_size * 4 # 1
     dist.init_process_group(rank=rank, world_size=world_size)
 
     compile_device = torch.device('cpu')
@@ -75,10 +74,11 @@ def test_main():
     module.fc = torch.nn.Linear(512, 10).to(compile_device)
     _, module = split_into_equal_size(world_size)(module)
 
-    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
+    num_chunks = 1 # world_size * 4
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -96,7 +96,7 @@ def test_main():
     kwargs_chunk_spec = {}
     output_chunk_spec = [TensorChunkSpec(0), CustomReducer(lambda x, y: x + y)]
 
-    compiled_fn = _compile_pp(train_step, None, SetParaInitHelper, None, args, kwargs,
+    compiled_fn = _compile_pp(train_step, None, SetParaInitHelper(), None, args, kwargs,
                        ScheduleGPipe, args_chunk_spec, kwargs_chunk_spec,
                        output_chunk_spec, num_chunks)
 
@@ -107,7 +107,7 @@ def test_main():
         loss_sum = 0
         for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True)
                                  if rank == 0 else train_dataloader):
-            if x_batch.size(0) != batch_size:  # need to solve this?
+            if x_batch.size(0) != batch_size:  # TODO how to solve this
                 continue
             args = (x_batch, y_batch, module, opt)
             kwargs = {}
@@ -126,35 +126,17 @@ def test_main():
                 f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
             )
 
-        outputs = compiled_fn.all_gather_outputs(0)
-        if rank == 0:
+        valid_rank = 0
+        outputs = compiled_fn.all_gather_outputs(valid_rank)
+        if rank == valid_rank:
             device = torch.device('cuda:0')
-            def reduce_outputs(a, b):
-                ret = []
-                for aa, bb in zip(a, b):
-                    if isinstance(aa, dict):
-                        aa.update(bb)
-                        ret.append(aa)
-                    else:
-                        tup = []
-                        for aaa, bbb in zip(aa, bb):
-                            if aaa is None:
-                                tup.append(bbb)
-                            elif bbb is None:
-                                tup.append(aaa)
-                            else:
-                                raise ValueError('both are not None')
-                        ret.append(tup)
-                return ret
-
-            params, buffers, _, _, _ = reduce(reduce_outputs, outputs)
-
+            params, buffers, _, _, _ = outputs
             module.load_state_dict({**params, **buffers})
             module.eval()
             module.to(device)
             correct_cnt = 0
             all_cnt = 0
-            for x_batch, y_batch in valid_dataloader:
+            for x_batch, y_batch in (tqdm(valid_dataloader, dynamic_ncols=True)):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 out = module(x_batch)
@@ -173,7 +155,6 @@ def test_main():
 
     torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
-
 
 
 if __name__ == '__main__':

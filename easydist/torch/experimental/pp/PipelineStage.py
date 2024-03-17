@@ -13,7 +13,7 @@ from torch.fx.node import map_arg
 
 from easydist.torch.experimental.pp.microbatch import CustomReducer, merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
 from easydist.torch.experimental.pp.utils import modify_graph_op_device
-from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
+from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
 
 logger = logging.getLogger(__name__)
 
@@ -571,11 +571,14 @@ class PipelineStageBase:
 
     def all_gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
-        outputs = graph_outputs_to_func_outputs_non_strict(self.compiled_meta, self.outputs_batch)
-        dist.gather_object(outputs,
+        dist.gather_object(self.outputs_batch,
                            outputs_all_stages if self.group_rank == rank else None,
                            dst=rank)
-        return outputs_all_stages
+        all_graph_outputs = {}
+        if self.group_rank == rank: # other rank receive None s
+            for outputs in outputs_all_stages:
+                all_graph_outputs.update(outputs)
+        return graph_outputs_to_func_outputs_non_strict(self.compiled_meta, all_graph_outputs)
 
     def all_gather_state_dict(self, rank):
         state_dicts = [None for _ in range(self.num_stages)]
