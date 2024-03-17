@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import logging
+import inspect
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -15,16 +16,21 @@ _debug_mask_minibatches = False
 
 class CustomReducer:
 
-    def __init__(self, init_value, reduce_fn):
-        self.init_value = init_value
-        self.reduce_fn = reduce_fn
+    def __init__(self, reduce_fn):
+        signature = inspect.signature(reduce_fn)
+        assert len(signature.parameters) == 2, f"CustomReducer function {reduce_fn} must take exactly 2 arguments"
+        def _reduce_fn(x, y):
+            # x, y must be all None or all not None
+            assert (x is None) == (y is None), f"CustomReducer function {reduce_fn} must take either 2 None or 2 not None arguments"
+            if x is None:
+                return None
+            return reduce_fn(x, y)
+        self.reduce_fn = _reduce_fn
 
 
 class LossReducer(CustomReducer):
     pass
 
-
-sum_reducer = LossReducer(torch.tensor(0.0), lambda a, b: a + b)
 
 DEFAULT_CHUNK_DIM = 0
 
@@ -346,9 +352,9 @@ def merge_chunks(chunks, chunk_spec):
                 args_flattened.append(torch.stack(values_to_cat, dim=arg.split_dim))
 
         elif isinstance(arg, CustomReducer):
-            reduced_val = arg.init_value
+            reduced_val = chunks_flattened[0][arg_idx]
 
-            for chunk_idx in range(len(chunks_flattened)):
+            for chunk_idx in range(1, len(chunks_flattened)):
                 reduced_val = arg.reduce_fn(reduced_val, chunks_flattened[chunk_idx][arg_idx])
 
             args_flattened.append(reduced_val)

@@ -66,7 +66,7 @@ def test_main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    num_chunks = 1
+    num_chunks = world_size * 4 # 1
     dist.init_process_group(rank=rank, world_size=world_size)
 
     compile_device = torch.device('cpu')
@@ -75,8 +75,8 @@ def test_main():
     module.fc = torch.nn.Linear(512, 10).to(compile_device)
     _, module = split_into_equal_size(world_size)(module)
 
-    # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
     transform = transforms.Compose([
@@ -88,15 +88,17 @@ def test_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
     x, y = next(iter(train_dataloader))
+
     args = [x.to(compile_device), y.to(compile_device), module.to(compile_device), opt]
     kwargs = {}
 
     args_chunk_spec = [TensorChunkSpec(0), TensorChunkSpec(0), Replicate(), Replicate()]
     kwargs_chunk_spec = {}
-    output_chunk_spec = None #CustomReducer(0, lambda x, y: x + y.item())]
-    pipe = _compile_pp(train_step, None, SetParaInitHelper, None, args, kwargs,
+    output_chunk_spec = [TensorChunkSpec(0), CustomReducer(lambda x, y: x + y)]
+
+    compiled_fn = _compile_pp(train_step, None, SetParaInitHelper, None, args, kwargs,
                        ScheduleGPipe, args_chunk_spec, kwargs_chunk_spec,
-                       output_chunk_spec, 1)
+                       output_chunk_spec, num_chunks)
 
     epochs = 5
     for epoch in range(epochs):
@@ -109,7 +111,7 @@ def test_main():
                 continue
             args = (x_batch, y_batch, module, opt)
             kwargs = {}
-            ret = pipe(*args, **kwargs)
+            ret = compiled_fn(*args, **kwargs)
             if rank == world_size - 1:
                 out = ret[0]
                 loss = ret[-1]
@@ -124,7 +126,7 @@ def test_main():
                 f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
             )
 
-        outputs = pipe.all_gather_outputs(0)
+        outputs = compiled_fn.all_gather_outputs(0)
         if rank == 0:
             device = torch.device('cuda:0')
             def reduce_outputs(a, b):
@@ -166,93 +168,12 @@ def test_main():
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
 
-    state_dict = pipe.state_dict()
-    opt_state_dict = pipe.optimizer_state_dict()
+    state_dict = compiled_fn.state_dict()
+    opt_state_dict = compiled_fn.optimizer_state_dict()
 
     torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
 
-
-# def compile_resnet(module, num_chunks, opt, nstages, args, kwargs):
-#     params = dict(module.named_parameters())
-#     buffers = dict(module.named_buffers())
-
-#     named_states = {}
-#     if opt is not None:
-#         # assign grad and warm up optimizer
-#         mode = nullcontext()
-#         for name in dict(module.named_parameters()):
-#             with torch.no_grad():
-#                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-#                 if isinstance(rgetattr(module, name).data, FakeTensor):
-#                     mode = rgetattr(module, name).data.fake_mode
-
-#         with _enable_compile(), mode:
-#             opt.step()
-#             opt.zero_grad(True)
-
-#         for n, p in params.items():
-#             if p in opt.state:
-#                 named_states[n] = opt.state[p]  # type: ignore[index]
-#                 # if step in state, reduce one for warmup step.
-#                 if 'step' in named_states[n]:
-#                     named_states[n]['step'] -= 1
-
-#     flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-#     # fix for sgd withtout momentum
-#     if all(state is None for state in flat_named_states):
-#         named_states = {}
-#         flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-#     def stateless_func(func, params, buffers, named_states, args, kwargs):
-#         with stateless._reparametrize_module(
-#                 cast(torch.nn.Module, module), {
-#                     **params,
-#                     **buffers
-#                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-#                     opt, named_states, params) if opt else nullcontext():
-#             ret = func(*args, **kwargs)
-
-#         grads = {k: v.grad for k, v in params.items()}
-#         return params, buffers, named_states, grads, ret
-
-#     args_split, kwargs_split = split_args_kwargs_into_chunks(
-#         args,
-#         kwargs,
-#         num_chunks,
-#         None,  #self.pipe.kwargs_chunk_spec,
-#     )
-
-#     with _enable_compile(), SplitPatcher(module, opt):
-#         set_backward_flag(False)
-#         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step),
-#                                            tracing_mode='fake',
-#                                            decomposition_table=EASYDIST_DECOMP_TABLE,
-#                                            _allow_non_fake_inputs=False)(params, buffers,
-#                                                                          named_states,
-#                                                                          args_split[0],
-#                                                                          kwargs_split[0])
-
-#     traced_stateless_func.graph.eliminate_dead_code()
-#     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
-#     traced_stateless_func.recompile()
-
-#     save_graphviz_dot(traced_stateless_func, 'traced_graph')
-
-#     traced_stateless_func_node_metas = {
-#         node.name: node.meta
-#         for node in traced_stateless_func.graph.nodes
-#     }
-#     stateless_func_args = [params, buffers, named_states, args, kwargs]
-
-#     compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
-#                                                                 nstages,
-#                                                                 stateless_func_args,
-#                                                                 init_helper=SetParaInitHelper(module),
-#                                                                 strict=True)
-
-#     return traced_stateless_func_node_metas, compiled_meta, compiled_stages, local_gm
 
 
 if __name__ == '__main__':

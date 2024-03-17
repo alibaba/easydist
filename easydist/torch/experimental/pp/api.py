@@ -35,7 +35,7 @@ def _compile_pp(func,
                 args_chunk_spec,
                 kwargs_chunk_spec,
                 outputs_chunk_spec,
-                num_chunks=1):
+                num_chunks=1) -> PipelineStageBase:
 
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -68,7 +68,8 @@ def _compile_pp(func,
                 rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
                 if isinstance(rgetattr(module, name).data, FakeTensor):
                     mode = rgetattr(module, name).data.fake_mode
-        with mode:
+
+        with mode, _enable_compile():
             opt.step()
             opt.zero_grad(True)
 
