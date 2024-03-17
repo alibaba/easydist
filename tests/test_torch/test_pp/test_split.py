@@ -18,9 +18,9 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (
-    SplitPatcher, StateType, annotate_split_points, compile_pipeline,
-    graph_outputs_to_func_outputs, split_into_equal_size, set_backward_flag,
-    func_inputs_to_graph_inputs_by_stages)
+    SplitPatcher, StateType, after_split_register, annotate_split_points, before_split_register, compile_pipeline,
+    graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict, split_into_equal_size, set_backward_flag,
+    func_inputs_to_graph_inputs_by_stages, tuple_after_split, tuple_before_split)
 from easydist.torch.experimental.pp.PipelineStage import modify_graph_op_device
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
@@ -122,12 +122,12 @@ def train_step_t5(input, label, model, opt):
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
     compile_device = torch.device("cpu")
-    runtime_device = torch.device("cpu")
-    module = module.double().train().to(compile_device)
+    runtime_device = torch.device("cuda")
+    module = module.train().to(compile_device)
     opt = None  # inference only
-    opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
+    # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True, momentum=0.9)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.123456789, foreach=True)
     if opt is None:
         module = module.eval()
 
@@ -265,8 +265,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_unflatten = graph_outputs_to_func_outputs(compiled_meta, outputs)
-    out_flatten, _ = pytree.tree_flatten(out_unflatten)
+    out_unflatten = graph_outputs_to_func_outputs_non_strict(compiled_meta, outputs)
 
     seed()
     with torch.no_grad():
@@ -274,38 +273,38 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             stateless_func_args_copy[3][0] = rand_input
             stateless_func_args_copy[3][1] = label
             out_copy = traced_stateless_func(*stateless_func_args_copy)
+            
             stateless_func_args_copy[0] = out_copy[0]  # will update inplace?
             stateless_func_args_copy[1] = out_copy[1]
             stateless_func_args_copy[2] = out_copy[2]
 
-    out_flatten_copy, _ = pytree.tree_flatten(out_copy)
-
-    ignore_none = True
-    for i, (val, val_copy) in enumerate(zip(out_flatten, out_flatten_copy)):
-        if ignore_none:
-            if val is None:
-                continue
-        if isinstance(val, torch.Tensor):
-            assert torch.allclose(val, val_copy)
-        else:
-            assert val == val_copy
-
+    params, buffers, named_states, grads, ret = out_unflatten
+    params_, buffers_, named_states_, grads_, ret_ = out_copy
+    if not isinstance(ret_, tuple):
+        ret_ = (ret_,)
+    for k, v in params.items():
+        assert torch.allclose(v, params_[k])
+    for k, v in buffers.items():
+        assert torch.allclose(v, buffers_[k])
+    for k, v in named_states.items():
+        assert torch.allclose(v, named_states_[k])
+    for k, v in grads.items():
+        assert torch.allclose(v, grads_[k])
+    for v, v_ in zip(ret, ret_):
+        assert torch.allclose(v, v_)
 
 def gen_rand_input_foo():
-    return torch.rand(16, 1024).double()
-
+    return torch.rand(16, 1024)
 
 def gen_rand_input_imagenet():
-    return torch.rand(16, 3, 224, 224).double()
-
+    return torch.rand(16, 3, 224, 224)
 
 def factory_gen_rand_input_ids(vocab_size):
 
     def gen_rand_input_ids():
-        return torch.randint(0, vocab_size, (3, 200)).long()
+        return torch.randint(0, vocab_size, (3, 256))
 
     return gen_rand_input_ids
-
 
 if __name__ == '__main__':
     # test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
@@ -348,12 +347,16 @@ if __name__ == '__main__':
     #     'features.20',
     #     'classifier.3',
     # }, gen_rand_input_imagenet, train_step)
+
+
+    # def gen_rand_input_vit():
+    #     return torch.rand(16, 3, 224, 224).half()
     # test_main(
-    #     vit_b_16(), {
+    #     vit_b_16().half(), {
     #         'encoder.layers.encoder_layer_1.self_attention',
     #         'encoder.layers.encoder_layer_5.mlp.3',
     #         'encoder.layers.encoder_layer_9.ln_2',
-    #     }, gen_rand_input_imagenet, train_step)
+    #     }, gen_rand_input_vit, train_step)
 
     # test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
     # test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
@@ -365,7 +368,7 @@ if __name__ == '__main__':
     # test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
     # test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
 
-    # # ======== nlp models, might take long time and OOM ========
+    # # ======== nlp models ========
     # from transformers import OpenAIGPTModel, OpenAIGPTConfig
     # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
     #     'h.3',
@@ -380,6 +383,7 @@ if __name__ == '__main__':
     #     'encoder.layer.9',
     # }, factory_gen_rand_input_ids(30522), train_step_gpt)
 
+    # from transformers import GPT2Model, GPT2Config
     # test_main(GPT2Model(GPT2Config()), {
     #     'h.3',
     #     'h.6',
@@ -387,16 +391,21 @@ if __name__ == '__main__':
     # }, factory_gen_rand_input_ids(50257), train_step_gpt)
 
     # from transformers import LlamaModel, LlamaConfig
-    # test_main(LlamaModel(LlamaConfig()), {
-    #     'layers.8',
-    #     'layers.16',
-    #     'layers.24',
-    # }, factory_gen_rand_input_ids(LlamaConfig().vocab_size),
-    #           train_step_gpt)  # might OOM
+    # config = LlamaConfig()
+    # config.num_attention_heads = config.num_key_value_heads = 16
+    # config.num_hidden_layers = 16
+    # config.hidden_size = 768
+    # config.use_cache = False
+    # test_main(LlamaModel(config), {
+    #     'layers.3',
+    #     'layers.7',
+    #     'layers.11',
+    # }, factory_gen_rand_input_ids(config.vocab_size), train_step_gpt)
 
     # # ======== not working ========
 
     # from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+    # from transformers import T5ForConditionalGeneration
     # @before_split_register(BaseModelOutputWithPastAndCrossAttentions)
     # def before_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
     #     ctx['ori_model_output'] = input

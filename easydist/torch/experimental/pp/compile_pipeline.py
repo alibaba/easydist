@@ -1059,7 +1059,7 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule,
                 name = inv_params[arg.name] if arg.name in inv_params else inv_buffers[arg.name]
                 typ = StateType.PARAMS if arg.name in inv_params else StateType.BUFFERS
                 raise RuntimeError(
-                    f"{typ}:{name}({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}"
+                    f"{typ}: {name} ({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}"
                 )
 
         # process output
