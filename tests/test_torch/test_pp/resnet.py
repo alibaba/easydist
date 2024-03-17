@@ -97,7 +97,7 @@ def test_main():
     output_chunk_spec = [TensorChunkSpec(0), CustomReducer(lambda x, y: x + y)]
 
     compiled_fn = _compile_pp(train_step, None, SetParaInitHelper(), None, args, kwargs,
-                       ScheduleGPipe, args_chunk_spec, kwargs_chunk_spec,
+                       Schedule1F1B, args_chunk_spec, kwargs_chunk_spec,
                        output_chunk_spec, num_chunks)
 
     epochs = 5
@@ -107,43 +107,25 @@ def test_main():
         loss_sum = 0
         for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True)
                                  if rank == 0 else train_dataloader):
-            if x_batch.size(0) != batch_size:  # TODO how to solve this
+            if x_batch.size(0) != batch_size:  # TODO need to solve this
                 continue
             args = (x_batch, y_batch, module, opt)
             kwargs = {}
             ret = compiled_fn(*args, **kwargs)
             if rank == world_size - 1:
-                out = ret[0]
-                loss = ret[-1]
+                out, loss = ret
                 all_cnt += len(out)
                 preds = out.argmax(-1)
-                correct_cnt += \
-                    (preds == y_batch.to(f'cuda:{rank}')).sum()
-                loss_sum += loss.sum().item()
+                correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
+                loss_sum += loss.item()
 
         if rank == world_size - 1:
-            print(
-                f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
-            )
+            print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
 
         valid_rank = 0
         outputs = compiled_fn.all_gather_outputs(valid_rank)
         if rank == valid_rank:
-            device = torch.device('cuda:0')
-            params, buffers, _, _, _ = outputs
-            module.load_state_dict({**params, **buffers})
-            module.eval()
-            module.to(device)
-            correct_cnt = 0
-            all_cnt = 0
-            for x_batch, y_batch in (tqdm(valid_dataloader, dynamic_ncols=True)):
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
-                out = module(x_batch)
-                preds = out.argmax(-1)
-                correct_cnt += (preds == y_batch).sum()
-                all_cnt += len(y_batch)
-            print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
+            validation(module, valid_dataloader, epoch, outputs)
 
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
@@ -156,6 +138,22 @@ def test_main():
     torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
 
+def validation(module, valid_dataloader, epoch, outputs):
+    device = torch.device('cuda:0')
+    params, buffers, _, _, _ = outputs
+    module.load_state_dict({**params, **buffers})
+    module.eval()
+    module.to(device)
+    correct_cnt = 0
+    all_cnt = 0
+    for x_batch, y_batch in (tqdm(valid_dataloader, dynamic_ncols=True)):
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
+        out = module(x_batch)
+        preds = out.argmax(-1)
+        correct_cnt += (preds == y_batch).sum()
+        all_cnt += len(y_batch)
+    print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
 
 if __name__ == '__main__':
     test_main()
