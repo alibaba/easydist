@@ -545,6 +545,10 @@ class AutoFlowSolver:
         self.m.objective = mip.minimize(comm_cost + 0.00000001 * mem_cost)
 
         self.m.verbose = 0
+
+        #print("dump sharding model")
+        #self.m.write("./tmp/sharding.lp")
+
         status = self.m.optimize(max_seconds_same_incumbent=mdconfig.max_seconds_same_incumbent)
         logger.info(f'[AutoFlowSolver.status]:\t {status}')
         logger.info(f'[AutoFlowSolver.solution_cost]:\t {self.m.objective_value}')
@@ -693,6 +697,9 @@ class AutoFlowSolver:
         self.m.objective = mip.minimize(comm_cost + 0.00000001 * mem_cost)
 
         self.m.verbose = 0
+        #print("dump sharding model")
+        #self.m.write("./tmp/sharding.lp")
+
         status = self.m.optimize(max_seconds_same_incumbent=mdconfig.max_seconds_same_incumbent)
         logger.info(f'[AutoFlowSolver.status]:\t {status}')
         logger.info(f'[AutoFlowSolver.solution_cost]:\t {self.m.objective_value}')

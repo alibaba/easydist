@@ -21,10 +21,13 @@ from .tile_comm import tile_comm
 from .comm_optimize import comm_optimize
 from .rule_override import rule_override_by_graph
 from .runtime_prof import runtime_prof
-from .create_edinfo import create_edinfo
+from .edinfo_utils import create_edinfo, annotation_edinfo
+from .process_tag import process_tag
+from .allocator_profiler import AllocatorProfiler, ModuleProfilingInfo
 
 __all__ = [
     "fix_embedding", "fix_addmm_bias", "fix_convoluation_bias", "eliminate_detach",
     "sharding_transform", "sharding_transform_dtensor", "fix_meta_device", "tile_comm",
-    "comm_optimize", "rule_override_by_graph", "runtime_prof", "create_edinfo"
+    "comm_optimize", "rule_override_by_graph", "runtime_prof", "create_edinfo",
+    "AllocatorProfiler", "ModuleProfilingInfo", "annotation_edinfo", "process_tag"
 ]

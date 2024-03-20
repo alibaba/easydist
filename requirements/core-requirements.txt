@@ -4,3 +4,7 @@ mip>=1.13
 sortedcontainers
 ortools
 pandas # for ortools
+pydot==1.4.2
+intervaltree==3.1.0
+matplotlib
+

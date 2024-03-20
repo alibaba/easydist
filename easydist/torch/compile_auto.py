@@ -20,6 +20,7 @@ import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
+import ctypes
 
 import numpy
 import rich
@@ -30,7 +31,9 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribute_tensor)
 from torch.fx._pytree import tree_flatten_spec
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.graph_drawer import FxGraphDrawer
 from torch.nn.utils import stateless
+from torch._functorch.partitioners import default_partition
 
 import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
@@ -39,9 +42,13 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
-                                   sharding_transform, sharding_transform_dtensor)
+                                   sharding_transform, sharding_transform_dtensor,
+                                   AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
+from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
+from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
+from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
@@ -56,6 +63,9 @@ logger = logging.getLogger(__name__)
 
 sharding_sol = None
 sol_rdy_cond = threading.Condition()
+
+mem_sol = None
+mem_addr_rdy_cond = threading.Condition()
 
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
@@ -170,12 +180,17 @@ def dtensor_to_tensor(leaf):
         return replicate_leaf.to_local()
     return leaf
 
-
 def fetch_strategy():
     with sol_rdy_cond:
         sol_rdy_cond.wait()
 
     return sharding_sol
+
+def fetch_mem_sol():
+    with mem_addr_rdy_cond:
+        mem_addr_rdy_cond.wait()
+
+    return mem_sol
 
 
 def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
@@ -250,6 +265,30 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
 
+    if mdconfig.dump_fx_graph:
+        print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
+        drawer = FxGraphDrawer(traced_graph, "traced_fx", ignore_getattr=True)
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
+        # seperate fwd/bwd graph
+        fwd_graph, bwd_graph = default_partition(traced_graph, None, num_fwd_outputs=1)
+
+        fwd_drawer = FxGraphDrawer(fwd_graph, "fwd_traced_fx", ignore_getattr=True)
+        fwd_dot_graphs = fwd_drawer.get_all_dot_graphs()
+        for name, dot_graph in fwd_dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
+        bwd_drawer = FxGraphDrawer(bwd_graph, "bwd_traced_fx", ignore_getattr=True)
+        bwd_dot_graphs = bwd_drawer.get_all_dot_graphs()
+        for name, dot_graph in bwd_dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
+
+
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
@@ -277,7 +316,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     else:
         sharded_graph = sharding_transform(traced_graph, opt_strategy, state_io_map)
         if mdconfig.enable_tile_comm:
-            sharded_graph = runtime_prof(sharded_graph)
+            sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
             sharded_graph = tile_comm(sharded_graph)
 
     sharded_graph = fix_embedding(sharded_graph, recover=True)
@@ -285,14 +324,23 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     if not mdconfig.use_dtensor:
         if mdconfig.comm_optimization is True:
             sharded_graph = runtime_prof(sharded_graph)
-            sharded_graph = comm_optimize(sharded_graph, shape_info, 'rcpsp', grouping=True, mem_restrain=False)
+            sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
 
         # override pytorch dtensor propagate rules to optimize dispater behavior
         if mdconfig.override_dtensor_rule is True:
             sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
 
+
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
+
+    if mdconfig.dump_fx_graph:
+        print(f"node num in sharded graph: {len(sharded_graph.graph.nodes)}")
+        drawer = FxGraphDrawer(sharded_graph, "shard_fx", ignore_getattr=True)
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
@@ -377,6 +425,76 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
+    if mdconfig.enable_memory_opt:
+        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+        if rank == 0:
+            logging.info("profiling fx module's memory...")
+
+        import __main__
+        # setting allocator to profiling mode
+        __main__.allocator_mode = 'profile'
+
+        # save all profiling information in this dict
+        profiling_info = ModuleProfilingInfo(rank)
+        alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
+        _ = alloc_profiler.run([])
+
+        if rank == 0:
+            logging.info("finish profiling fx module's memory")
+            graph_mem_info = alloc_profiler.create_graph_mem_info()
+
+            if mdconfig.mem_opt_by_solver:
+                mem_sched = ILPMemoryScheduler(
+                                    sharded_graph, graph_mem_info, 1024*128)
+            else:
+                mem_sched = EfficientMemoryScheduler(
+                                    sharded_graph, graph_mem_info)
+
+            required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations = \
+                                                mem_sched.gen_mem_addresses()
+            #print(f"master proposes required_memory: {required_memory}")
+            #print(f"master creates mem locations:\n{mem_locations}")
+
+            with mem_addr_rdy_cond:
+                global mem_sol
+                mem_sol = [
+                    required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations
+                ]
+                mem_addr_rdy_cond.notify_all()
+
+            assert len(ordered_schedules) == len(mem_sched.nodes_to_schedule), \
+                f"schedule {len(ordered_schedules)} nodes, but totally {len(mem_sched.nodes_to_schedule)} nodes"
+        else:
+            required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations = rpc.rpc_sync(
+                                "ed_worker0", fetch_mem_sol, args=(), timeout=0)
+            #print(f"worker {rank} receives required_memory: {required_memory}")
+            #print(f"worker {rank} receives mem locations:\n{mem_locations}")
+
+        rpc.shutdown()
+
+        graph_mem_plan = GraphMemPlan(required_memory, temp_memory)
+
+        for name in ordered_schedules:
+            if name in mem_alloc_info:
+                alloc_list = mem_alloc_info[name]
+                for alloc_info in alloc_list:
+                    addr = alloc_info[1]
+                    size = alloc_info[2]
+                    if alloc_info[3] == 0:
+                        is_temp_mem = True
+                    else:
+                        is_temp_mem = False
+
+                    graph_mem_plan.append_addr_size(addr, size, is_temp_mem, name)
+
+        #print("graph memory plan:")
+        #print(str(graph_mem_plan))
+
+        # setting allocator back to runtime mode
+        alloc_profiler.load_memory_plan(graph_mem_plan)
+
+        #print(f"graph details:\n{str(sharded_graph.graph)}\nend of graph\n")
+
     class EDCompiledFunc:
 
         def __init__(self, graph) -> None:
@@ -407,14 +525,22 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
             args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
 
             # run the sharded_graph
-            params, buffers, named_states, grads, sharded_out = graph(
-                params, buffers, named_states, args, kwargs)
+            if mdconfig.enable_memory_opt:
+                __main__.allocator_mode = 'runtime'
+                __main__.is_customized = True
+                params, buffers, named_states, grads, sharded_out = graph(
+                    params, buffers, named_states, args, kwargs)
+                __main__.is_customized = False
+            else:
+                params, buffers, named_states, grads, sharded_out = graph(
+                    params, buffers, named_states, args, kwargs)
 
             for para_name in params:
                 params[para_name].grad = grads[para_name]
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
+            #print(f"local_out: {local_out}, \nshape: {local_out.shape}")
 
             return local_out
 

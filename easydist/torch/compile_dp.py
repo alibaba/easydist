@@ -12,29 +12,32 @@
 # limitations under the License.
 # ==============================================================================
 
+import time
 import logging
-import operator
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
 
+import rich
 import torch
 import torch._custom_ops
 import torch.utils._pytree as pytree
+from torch.fx._pytree import tree_flatten_spec
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.nn.utils import stateless
 
 import easydist.config as mdconfig
-from easydist.metashard import metair
+from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.passes import tile_comm, runtime_prof, comm_optimize, eliminate_detach
+from easydist.torch.passes import (tile_comm, runtime_prof, comm_optimize, eliminate_detach,
+                                   annotation_edinfo, create_edinfo)
 from easydist.torch.passes.sharding import (all_reduce_start, all_reduce_end, scatter_wrapper,
                                             all_gather_start, all_gather_end, reduce_scatter_start,
-                                            reduce_scatter_end, COMM_FUNCS)
-from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, EDInfo, EDNodeType,
-                                  create_meta_from_node)
+                                            reduce_scatter_end)
+from easydist.torch.utils import _enable_compile, _rematerialize_optimizer, _sharding_ann_env
+from easydist.torch.passes.process_tag import process_tag
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.device_mesh import get_device_mesh
 
@@ -52,6 +55,8 @@ def get_shape_info(node_output):
 def transform_ddp(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # (TODO) only support _fused_adam here
     device_mesh = get_device_mesh()
+    assert "dp" in device_mesh.mesh_dim_names
+    device_mesh = device_mesh["dp"]
     for node in traced_graph.graph.nodes:
         if node.target == torch.ops.aten._fused_adam.default:
             grad_nodes = node.args[1]
@@ -79,11 +84,11 @@ def transform_ddp(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
 def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> torch.fx.GraphModule:
     # (TODO) only support _fused_adam here
     device_mesh = get_device_mesh()
-    mesh_1d_axis = 0
-    if metair.DEVICE_MESH_1D == 0:
-        mesh_1d_axis = 1
-    my_coordinate = device_mesh.get_coordinate()
-    num_chunks = device_mesh.size(mesh_1d_axis)
+    assert "dp" in device_mesh.mesh_dim_names
+    device_mesh = device_mesh["dp"]
+
+    dp_rank = device_mesh.get_coordinate()[0]
+    dp_size = device_mesh.size(0)
 
     opt_state_nodes = []
 
@@ -132,9 +137,9 @@ def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> tor
                         scatter_dim = 0
                         flatten_node = traced_graph.graph.call_function(torch.ops.aten.flatten,
                                                                         args=(param_node, ))
-                        scatter_node = traced_graph.graph.call_function(
-                            scatter_wrapper,
-                            args=(flatten_node, num_chunks, 0, my_coordinate[mesh_1d_axis]))
+                        scatter_node = traced_graph.graph.call_function(scatter_wrapper,
+                                                                        args=(flatten_node,
+                                                                              dp_size, 0, dp_rank))
                         scattered_nodes.append(scatter_node)
 
                 node.update_arg(0, scattered_nodes)
@@ -187,37 +192,12 @@ def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> tor
     # fix the args meta
     if shard_param is True:
         for param_node in param_nodes_map.values():
-            fake_val = scatter_wrapper(param_node.meta['val'].flatten(), num_chunks, 0,
-                                       my_coordinate[mesh_1d_axis])
+            fake_val = scatter_wrapper(param_node.meta['val'].flatten(), dp_size, 0, dp_rank)
             param_node.meta = {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
     for opt_state_node in opt_state_nodes:
-        fake_val = scatter_wrapper(opt_state_node.meta['val'].flatten(), num_chunks, 0,
-                                   my_coordinate[mesh_1d_axis])
+        fake_val = scatter_wrapper(opt_state_node.meta['val'].flatten(), dp_size, 0, dp_rank)
         opt_state_node.meta = {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
-
-    return traced_graph
-
-
-def annotation_edinfo(traced_graph: torch.fx.GraphModule):
-    for node in traced_graph.graph.nodes:
-        if not hasattr(node, "ed_info"):
-            node.ed_info = EDInfo(ori_meta=node.meta)
-
-        if node.op == 'placeholder':
-            node.ed_info.node_type = EDNodeType.AUXILIARY
-        elif node.op == 'call_function':
-            # create meta for custom function
-            node.meta = create_meta_from_node(node)
-            # annotate node type
-            if node.target in COMM_FUNCS:
-                node.ed_info.node_type = EDNodeType.COMMUNICATION
-            elif node.target == operator.getitem:
-                node.ed_info.node_type = EDNodeType.AUXILIARY
-            else:
-                node.ed_info.node_type = EDNodeType.COMPUTATION
-        elif node.op == 'output':
-            node.ed_info.node_type = EDNodeType.AUXILIARY
 
     return traced_graph
 
@@ -292,17 +272,43 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
     traced_graph.graph.eliminate_dead_code()
     traced_graph.recompile()
 
+    traced_graph = process_tag(traced_graph)
+
     shard_opt_state = False
     shard_param = False
 
-    if parallel_mode == "ddp":
-        logger.info(f"parallel_mode: {parallel_mode}")
-        sharded_graph = transform_ddp(traced_graph)
-    elif parallel_mode in ["zero2", "zero3"]:
-        shard_opt_state = True
-        shard_param = (parallel_mode == "zero3")
-        logger.info(f"parallel_mode: {parallel_mode}")
-        sharded_graph = transform_fsdp(traced_graph, shard_param=shard_param)
+    # pre shard the parameter ot optimizer state
+    device_mesh = get_device_mesh()
+    assert "dp" in device_mesh.mesh_dim_names
+    device_mesh = device_mesh["dp"]
+    dp_rank = device_mesh.get_coordinate()[0]
+    dp_size = device_mesh.size(0)
+
+    if mdconfig.enable_tile_comm:
+        with _sharding_ann_env():
+            start_t = time.perf_counter()
+            sharding_interpreter = EDTorchShardingAnn(traced_graph)
+            flatten_args = tree_flatten_spec(
+                [params, buffers, named_states, args, kwargs], traced_graph._in_spec)
+            sharding_info, shape_info = sharding_interpreter.run(*flatten_args)
+            logger.info(f"[EDTorchShardingAnn.time]:\t {time.perf_counter() - start_t} s.")
+            if mdconfig.log_level <= logging.DEBUG:
+                rich.print("sharding_info:\n", sharding_info)
+                rich.print("shape_info:\n", shape_info)
+
+        traced_graph = create_edinfo(traced_graph, sharding_info, shape_info)
+
+    if dp_size > 1:
+        if parallel_mode == "ddp":
+            logger.info(f"parallel_mode: {parallel_mode}")
+            sharded_graph = transform_ddp(traced_graph)
+        elif parallel_mode in ["zero2", "zero3"]:
+            shard_opt_state = True
+            shard_param = (parallel_mode == "zero3")
+            logger.info(f"parallel_mode: {parallel_mode}")
+            sharded_graph = transform_fsdp(traced_graph, shard_param=shard_param)
+    else:
+        sharded_graph = traced_graph
 
     sharded_graph = annotation_edinfo(sharded_graph)
 
@@ -317,13 +323,12 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
             shape_info[node.name] = {}
 
     if mdconfig.enable_tile_comm:
-        sharded_graph = runtime_prof(sharded_graph)
+        sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
         sharded_graph = tile_comm(sharded_graph)
 
     if mdconfig.comm_optimization is True:
         sharded_graph = runtime_prof(sharded_graph)
         sharded_graph = comm_optimize(sharded_graph,
-                                      shape_info,
                                       'rcpsp',
                                       grouping=True,
                                       mem_restrain=False)
@@ -331,19 +336,10 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
     if mdconfig.log_level <= logging.DEBUG:
         sharded_graph.print_readable()
 
-    # pre shard the parameter ot optimizer state
-    mesh_1d_axis = 0
-    if metair.DEVICE_MESH_1D == 0:
-        mesh_1d_axis = 1
-    device_mesh = get_device_mesh()
-    my_coordinate = device_mesh.get_coordinate()
-    num_chunks = device_mesh.size(mesh_1d_axis)
-
     # (TODO) only support Adam here
     if shard_param is True:
         for param_name, param_var in params.items():
-            params[param_name] = scatter_wrapper(param_var.detach().flatten(), num_chunks, 0,
-                                                 my_coordinate[mesh_1d_axis])
+            params[param_name] = scatter_wrapper(param_var.detach().flatten(), dp_size, 0, dp_rank)
 
     # (TODO) only support Adam here
     if shard_opt_state is True:
@@ -351,7 +347,7 @@ def _compile_dp(func, parallel_mode, tracing_mode, args, kwargs):
             for opt_var_name, opt_var in param_opt_var.items():
                 if opt_var_name != "step":
                     named_states[param_name][opt_var_name] = scatter_wrapper(
-                        opt_var.flatten(), num_chunks, 0, my_coordinate[mesh_1d_axis])
+                        opt_var.flatten(), dp_size, 0, dp_rank)
 
     class EDCompiledFunc:
 

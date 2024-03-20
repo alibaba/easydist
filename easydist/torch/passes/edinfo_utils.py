@@ -12,11 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 
+import operator
+
 import torch
 from torch.fx.node import Node, _get_qualified_name
 import torch.utils._pytree as pytree
 
-from easydist.torch.utils import EDInfo, create_meta_from_node
+from easydist.torch.utils import EDInfo, EDNodeType, create_meta_from_node
+from easydist.torch.passes.sharding import CREATE_ATEN_OP, COMM_FUNCS
 
 
 def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, meta_info) -> torch.fx.GraphModule:
@@ -62,3 +65,28 @@ def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, meta_info) -> 
                 node.ed_info.spmd_annotation = node_sharding_info
 
     return fx_module
+
+
+def annotation_edinfo(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    for node in traced_graph.graph.nodes:
+        if not hasattr(node, "ed_info"):
+            node.ed_info = EDInfo(ori_meta=node.meta)
+
+        if node.op == 'placeholder':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
+        elif node.op == 'call_function':
+            # create meta for custom function
+            if node.target not in CREATE_ATEN_OP:
+                node.meta = create_meta_from_node(node)
+            # annotate node type
+            if node.target in COMM_FUNCS:
+                node.ed_info.node_type = EDNodeType.COMMUNICATION
+            # (TODO) hard code here to avoid to runtime profile torch.ops.aten._fused_adam.default
+            elif node.target in [operator.getitem, torch.ops.aten._fused_adam.default]:
+                node.ed_info.node_type = EDNodeType.AUXILIARY
+            else:
+                node.ed_info.node_type = EDNodeType.COMPUTATION
+        elif node.op == 'output':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
+
+    return traced_graph

@@ -6,6 +6,7 @@ import os
 import sys
 from functools import partial
 from contextlib import nullcontext
+import ctypes
 
 import torch
 import torch.optim as optim
@@ -134,17 +135,25 @@ def bench_easydist(model, data_in):
     train_step_partial()
 
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+
+    # TODO(wuhao): temporarily banned torch.cuda.reset_peak_memory_stats(), 
+    # because CUDAPluggableAllocator didn't support this method
+
+    # torch.cuda.reset_peak_memory_stats()
 
     timer = EDTimer(train_step_partial, in_ms=False)
 
     elaps_time = timer.time()
-    peak_memory = torch.cuda.max_memory_allocated()
+
+    # TODO(wuhao): temporarily banned torch.cuda.max_memory_allocated(), 
+    # because CUDAPluggableAllocator didn't support this method
+ 
+    # peak_memory = torch.cuda.max_memory_allocated()
+    peak_memory = 0
 
     local_rank = int(os.environ["LOCAL_RANK"])
     print(f"[{local_rank}] Memory: {peak_memory / 1024 / 1024 / 1024} GB")
     print(f"[{local_rank}] Time: {elaps_time}")
-
 
 def main():
 

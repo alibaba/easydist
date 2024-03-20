@@ -14,6 +14,7 @@
 
 import os
 import setuptools
+import sysconfig
 from importlib.machinery import SourceFileLoader
 
 version = (
@@ -43,6 +44,13 @@ def get_long_description():
         long_description = fh.read()
     return long_description
 
+python_include_path = sysconfig.get_path('include')
+cuda_include_path = '/usr/local/cuda/include'
+profiling_allocator = setuptools.Extension('profiling_allocator',
+                    sources = ['csrc/profiling_allocator/profiling_allocator.cpp'],
+                    include_dirs=[python_include_path, cuda_include_path],
+                    extra_compile_args=['-fPIC', '--shared'])
+
 
 setuptools.setup(
     name="pai-easydist",
@@ -65,4 +73,5 @@ setuptools.setup(
             "flax",
         ]
     },
+    ext_modules=[profiling_allocator]
 )

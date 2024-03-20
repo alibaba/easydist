@@ -18,7 +18,6 @@ import time
 from functools import reduce
 
 import torch
-import torch.utils._pytree as pytree
 from torch.fx.node import _get_qualified_name
 
 import easydist
@@ -26,12 +25,6 @@ import easydist.config as mdconfig
 import easydist.torch.schedule.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
 from easydist.torch.utils import EDInfo, EDNodeType
-from easydist.metashard.metair import (
-    SPMD,
-    NodeSPMDStrategy,
-    VarSPMDStrategyGroup,
-    VarSPMDStrategy,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +47,13 @@ def bandwidth_profile():
     return comm_v / res_t
 
 
-def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
+def rcpsp_schedule(fx_module: torch.fx.GraphModule, mem_constrain: bool):
     '''
     This function returns the best schedule executing given graph under rcpsp
 
     Args:
     fx_module: fx graph to be optimized
-    shape_info: generated shapes info of each node (holes remain)
+    mem_constrain: flag to turn on the memory constrain in scpsp model 
 
     Returns:
     An ordering of nodes
@@ -69,7 +62,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     # prepare RCPSP input
     task_data = []
     available_resources = {'comm': 1, 'comp': 1}
-    if mem_constrain:
+    if mem_constrain is True:
         available_resources['mem'] = int(0.95 * mdconfig.available_mem)
 
     # whether resource release only until all nodes depended on it have finished
@@ -88,14 +81,16 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
 
         resource = []
 
+        priority = 0
         if node.ed_info.is_communication():
+            priority = 1
             resource.append(('comm', 1))
-            if mem_constrain:
+            if mem_constrain is True:
                 mem_req = int(node.ed_info.comm_meta['comm_vol'] / 1024)
         else:
             resource.append(('comp', 1))
-            if mem_constrain:
-                output_shapes = shape_info[node.name]
+            if mem_constrain is True:
+                output_shapes = node.meta['val'].shape
                 if isinstance(output_shapes, tuple):
                     output_shapes = list(output_shapes)
                 elif not isinstance(output_shapes, list):
@@ -105,7 +100,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
                     if output_shape.get('shape') is not None:
                         mem_req += int(
                             reduce(lambda x, y: x * y, output_shape['shape'], 1) * 4 / 1024)
-        if mem_constrain:
+        if mem_constrain is True:
             resource.append(('mem', mem_req))
 
         precedence = []
@@ -114,7 +109,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
                 precedence.append(pre)
         precedence_relations.append(precedence)
 
-        task_data.append((node, duration, precedence, resource))
+        task_data.append((node, duration, precedence, resource, priority))
 
     assert (len(task_data) == len(fx_module.graph.nodes) - arg_num)
 
@@ -122,7 +117,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     if torch.distributed.get_rank() == 0:
         logger.info('enter rcpsp')
         logger.info(f'task cnt: {len(task_data)}')
-        if mem_constrain:
+        if mem_constrain is True:
             logger.info(f'[RCPSP]: Scheduling with Memory Constraint.')
         else:
             logger.info(f'[RCPSP]: Scheduling without Memory Constraint.')
@@ -146,7 +141,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     return sche
 
 
-def comm_nodes_group(fx_module, node_list, shape_info):
+def comm_nodes_group(fx_module, node_list):
     '''
     Group the nodes in node_list
     '''
@@ -183,7 +178,6 @@ def comm_nodes_group(fx_module, node_list, shape_info):
         new_from_node.meta = create_meta_from_node(new_from_node)
         new_from_node.ed_info = EDInfo()
         new_from_node.ed_info.node_type = EDNodeType.COMPUTATION
-        shape_info[new_from_node.name] = {'shape': torch.Size([total_size])}
 
         comm_op_name = _get_qualified_name(node_list[0].target)
         new_comm_node = fx_module.graph.call_function(eval(comm_op_name),
@@ -197,7 +191,6 @@ def comm_nodes_group(fx_module, node_list, shape_info):
         new_to_node.meta = create_meta_from_node(new_to_node)
         new_to_node.ed_info = EDInfo()
         new_to_node.ed_info.node_type = EDNodeType.COMPUTATION
-        shape_info[new_to_node.name] = [{'shape': s} for s in retrive_shapes]
 
     new_comm_node.ed_info = EDInfo()
     new_comm_node.ed_info.node_type = EDNodeType.COMMUNICATION
@@ -214,7 +207,6 @@ def comm_nodes_group(fx_module, node_list, shape_info):
         retrive_node.meta = create_meta_from_node(retrive_node)
         retrive_node.ed_info = EDInfo()
         retrive_node.ed_info.node_type = EDNodeType.COMPUTATION
-        shape_info[retrive_node.name] = {'shape': retrive_shapes[idx]}
 
     fx_module.graph.eliminate_dead_code()
     fx_module.recompile()
@@ -228,7 +220,7 @@ def groupable(n1, n2):
     return n1_op_name == n2_op_name and n1.args[1:] == n2.args[1:]
 
 
-def comm_group(fx_module, cap_limit, rg_limit, shape_info):
+def comm_group(fx_module, cap_limit, rg_limit):
     '''
     This function performs grouping on a fx graph
 
@@ -239,7 +231,6 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
     fx_module: fx graph to be optimized
     cap_limit:
     rg_limit: search range
-    shape_info: generated shapes info of each node (holes remain)
 
     Returns:
     A grouped fx_module
@@ -259,7 +250,7 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
             or cur_cap > cap_limit:
 
             cur_comm_list.reverse()
-            comm_nodes_group(fx_module, cur_comm_list, shape_info)
+            comm_nodes_group(fx_module, cur_comm_list)
             sche = [node for node in fx_module.graph.nodes]
 
             cur_cap = 0
@@ -295,7 +286,6 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
 
 
 def comm_optimize(fx_module: torch.fx.GraphModule,
-                  shape_info,
                   sche_method,
                   grouping=False,
                   mem_restrain=False):
@@ -304,7 +294,6 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
 
     Args:
     fx_module: fx graph to be optimized
-    shape_info: generated shapes info of each node (holes remain)
     grouping: whether or not grouping is to be performed
     mem_restrain: whether or not mem_restrain is added to rcpsp
 
@@ -322,7 +311,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
         if node.ed_info.is_communication():
             assert len(node.all_input_nodes) == 1
             from_node = node.all_input_nodes[0]
-            comm_shape = shape_info[from_node.name]['shape']
+            comm_shape = from_node.meta['val'].shape
             # TODO support mixed precision
             node.ed_info.comm_meta = {
                 'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1) * 4,  #Bytes
@@ -333,10 +322,8 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
                 if pre.ed_info.is_communication():
                     pre.ed_info.comm_meta['to_node'] = node
 
-    _shapeinfo_fill_up(shape_info, fx_module)
-
     if grouping:
-        fx_module = comm_group(fx_module, 1024 * 1024, 10000, shape_info)
+        fx_module = comm_group(fx_module, 1024 * 1024, 10000)
 
     # comm_map: node just computed -> commnications followed
     comm_map = {}
@@ -347,7 +334,11 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
                     comm_map[from_node] = []
                 comm_map[from_node].append(node)
     elif sche_method == 'rcpsp':
-        sche = rcpsp_schedule(fx_module, shape_info, mem_restrain)
+        sche = rcpsp_schedule(fx_module, mem_restrain)
+
+        # reserve the placeholder order
+        sche = [node for node in sche if node.op != "placeholder"]
+        sche = [node for node in fx_module.graph.nodes if node.op == "placeholder"] + sche
 
         _link_nodes(fx_module, sche)
 
@@ -396,83 +387,16 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     fx_module.recompile()
 
     if torch.distributed.get_rank() == 0:
+        # fx_module.print_readable()
         logger.info("Communication Optimization: Done!")
     return fx_module
-
-# TODO Utilize the logic to fill up opt_strategy generated before
-def _strategy_fill_up(opt_strategy, shape_info, fx_module):
-    '''
-    Rule-based filling up strategies of nodes in fx_module
-    '''
-    for node in fx_module.graph.nodes:
-        if not node.ed_info.is_communication():
-            if opt_strategy.get(node.name) is None:
-                if node.name.__contains__("getitem"):
-                    idx = node.args[1]
-                    pre_node = node.all_input_nodes[0]
-                    opt_strategy[node.name] = {
-                        'node':
-                        node.name,
-                        'strategy':
-                        NodeSPMDStrategy(
-                            VarSPMDStrategyGroup(
-                                opt_strategy[pre_node.name]['strategy'].get_invar_strtg(idx)),
-                            VarSPMDStrategyGroup(
-                                opt_strategy[pre_node.name]['strategy'].get_outvar_strtg(idx)))
-                    }
-                elif not (node.name.__contains__("arg") or node.name.__contains__("output")):
-                    # Assumption: nodes without strategy and not being args or output are constant tensor
-                    opt_strategy[node.name] = {
-                        'node':
-                        node,
-                        'strategy':
-                        NodeSPMDStrategy(
-                            VarSPMDStrategyGroup(
-                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] *
-                                                       len(shape_info[node.name]['shape'])))),
-                            VarSPMDStrategyGroup(
-                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] *
-                                                       len(shape_info[node.name]['shape'])))))
-                    }
-
-    if mdconfig.log_level <= logging.DEBUG:
-        print(f"opt_strategy: {opt_strategy}")
-
-
-def get_shape_info(node_output):
-    if isinstance(node_output, torch.Tensor) or isinstance(node_output,
-                                                        torch.nn.parameter.Parameter):
-        return {"shape": node_output.shape, "dtype": node_output.dtype}
-    else:
-        return {}
-
-
-def _shapeinfo_fill_up(shape_info, fx_module):
-    '''
-    Rule-based filling up shape_info of nodes in fx_module
-    '''
-    for node in fx_module.graph.nodes:
-        if not node.ed_info.is_communication():
-            if shape_info.get(node.name) is None:
-                if node.name.__contains__("scatter_wrapper"):
-                    pre_node = node.all_input_nodes[0]
-                    shape_info[node.name] = shape_info[pre_node.name]
-                elif node.name.__contains__("_end"):
-                    pre_node = node.all_input_nodes[0]
-                    shape_info[node.name] = shape_info[pre_node.all_input_nodes[0].name]
-                elif hasattr(node, "meta") and node.meta.get("val") is not None:
-                    shape_info[node.name] = pytree.tree_map(get_shape_info, node.meta['val'])
-                elif torch.distributed.get_rank() == 0:
-                    raise RuntimeError(f"_shapeinfo_fill_up: unmet node->{node.name}!")
-
-    if mdconfig.log_level <= logging.DEBUG:
-        print(f"shape_info: {shape_info}")
 
 
 def _link_nodes(fx_module, node_list):
     '''
     Change the topological order of fx_module according to node_list
     '''
+
     fx_module.graph._root._next = node_list[0]
     node_list[0]._prev = fx_module.graph._root
     for idx, node in enumerate(node_list[:-1]):
