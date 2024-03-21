@@ -203,16 +203,16 @@ class PipelineStageBase:
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
 
-    def _get_graph_inputs_chunk(self, compiled_meta, args_chunk_spec, kwargs_chunk_spec):
+    def _get_graph_inputs_chunk(self, compiled_meta: CompiledMeta, args_chunk_spec, kwargs_chunk_spec):
         node_val_chunk_spec = {}
         if args_chunk_spec is None:
-            args_chunk_spec = [None] * len(compiled_meta.args_names_unflatten)
-        assert len(args_chunk_spec) == len(compiled_meta.args_names_unflatten)
-        for node_name, arg_chunk_spec in zip(compiled_meta.args_names_unflatten, args_chunk_spec):
+            args_chunk_spec = [None] * len(compiled_meta.args_nodes_unflatten)
+        assert len(args_chunk_spec) == len(compiled_meta.args_nodes_unflatten)
+        for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec):
             node_val_chunk_spec = arg_chunk_spec
         if kwargs_chunk_spec is None:
-            kwargs_chunk_spec = {k: None for k in compiled_meta.kwargs_names_unflatten}
-        assert set(kwargs_chunk_spec.keys()) == set(compiled_meta.kwargs_names_unflatten)
+            kwargs_chunk_spec = {k: None for k in compiled_meta.kwargs_nodes_unflatten}
+        assert set(kwargs_chunk_spec.keys()) == set(compiled_meta.kwargs_nodes_unflatten)
         for node_name, kwarg_chunk_spec in kwargs_chunk_spec.items():
             node_val_chunk_spec[node_name] = kwarg_chunk_spec
         return node_val_chunk_spec
@@ -519,11 +519,11 @@ class PipelineStageBase:
         self.outputs_batch.clear()
 
     def merge_output_chunks(self) -> Dict[str, Any]:
-        maybe_updated_params_names_unflatten = self.compiled_meta.output_params_names_unflatten
-        maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_names_unflatten
-        updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_names_unflatten
-        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_names_unflatten
-        returns_names_unflatten = self.compiled_meta.returns_names_unflatten
+        maybe_updated_params_names_unflatten = self.compiled_meta.output_params_nodes_unflatten
+        maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_nodes_unflatten
+        updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_nodes_unflatten
+        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_nodes_unflatten
+        returns_names_unflatten = self.compiled_meta.returns_nodes_unflatten
 
         params = {}
         buffers = {}

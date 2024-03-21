@@ -1,3 +1,4 @@
+# torchrun --nproc_per_node 4 $(pwd)/examples/torch/pipeline_parallelism/resnet.py
 import os
 import random
 
@@ -60,7 +61,7 @@ def test_main():
     _, module = split_into_equal_size(world_size)(module)
 
     # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True, momentum=0.9)
 
     batch_size = 64
     num_chunks = world_size * 4 # high comm overhead
