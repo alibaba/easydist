@@ -300,134 +300,105 @@ def gen_rand_input_imagenet():
     return torch.rand(16, 3, 224, 224)
 
 def factory_gen_rand_input_ids(vocab_size):
-
     def gen_rand_input_ids():
         return torch.randint(0, vocab_size, (3, 256))
-
     return gen_rand_input_ids
 
+def gen_rand_input_vit():
+        return torch.rand(16, 3, 224, 224).half()
+
 if __name__ == '__main__':
-    # test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
-    # test_main(Foo1(), {
-    #     'norm',
-    #     'linear0_1',
-    # }, gen_rand_input_foo, train_step)
-    # test_main(alexnet(), {
-    #     'features.10',
-    #     'classifier.3',
-    # }, gen_rand_input_imagenet, train_step)
-    # test_main(
-    #     densenet121(), {
-    #         'features.denseblock1.denselayer4.norm2',
-    #         'features.transition2.conv',
-    #         'features.denseblock4.denselayer1.relu1',
-    #         'features',
-    #     }, gen_rand_input_imagenet, train_step)
-    # test_main(efficientnet_b0(), {
-    #     'features.2.0.block.1',
-    #     'features.4.1.block.3',
-    #     'features.6.1.block.3',
-    #     'features.8',
-    # }, gen_rand_input_imagenet, train_step)
-    # test_main(resnet18(), {
-    #     'layer1',
-    #     'layer2',
-    #     'layer3',
-    #     'layer4',
-    # }, gen_rand_input_imagenet, train_step)
-    # test_main(
-    #     swin_t(), {
-    #         'features.2.reduction',
-    #         'features.3.0.mlp.1',
-    #         'features.5.1.attn.qkv',
-    #         'features.7.0.stochastic_depth',
-    #     }, gen_rand_input_imagenet, train_step)
-    # test_main(vgg19(), {
-    #     'features.10',
-    #     'features.20',
-    #     'classifier.3',
-    # }, gen_rand_input_imagenet, train_step)
+    # human annotated split points
+    test_main(Foo(), {'norm'}, gen_rand_input_foo, train_step)
+    test_main(Foo1(), {
+        'norm',
+        'linear0_1',
+    }, gen_rand_input_foo, train_step)
+    test_main(alexnet(), {
+        'features.10',
+        'classifier.3',
+    }, gen_rand_input_imagenet, train_step)
+    test_main(
+        densenet121(), {
+            'features.denseblock1.denselayer4.norm2',
+            'features.transition2.conv',
+            'features.denseblock4.denselayer1.relu1',
+            'features',
+        }, gen_rand_input_imagenet, train_step)
+    test_main(efficientnet_b0(), {
+        'features.2.0.block.1',
+        'features.4.1.block.3',
+        'features.6.1.block.3',
+        'features.8',
+    }, gen_rand_input_imagenet, train_step)
+    test_main(resnet18(), {
+        'layer1',
+        'layer2',
+        'layer3',
+        'layer4',
+    }, gen_rand_input_imagenet, train_step)
+    test_main(
+        swin_t(), {
+            'features.2.reduction',
+            'features.3.0.mlp.1',
+            'features.5.1.attn.qkv',
+            'features.7.0.stochastic_depth',
+        }, gen_rand_input_imagenet, train_step)
+    test_main(vgg19(), {
+        'features.10',
+        'features.20',
+        'classifier.3',
+    }, gen_rand_input_imagenet, train_step)
+    test_main(
+        vit_b_16().half(), {
+            'encoder.layers.encoder_layer_1.self_attention',
+            'encoder.layers.encoder_layer_5.mlp.3',
+            'encoder.layers.encoder_layer_9.ln_2',
+        }, gen_rand_input_vit, train_step)
 
+    # test split_into_equal_size
+    test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
+    test_main(alexnet(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    test_main(densenet121(), split_into_equal_size(5), gen_rand_input_imagenet, train_step)
+    test_main(efficientnet_b0(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    test_main(resnet18(), split_into_equal_size(4), gen_rand_input_imagenet, train_step)
+    test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
+    test_main(vit_b_16().half(), split_into_equal_size(10), gen_rand_input_vit, train_step)
 
-    # def gen_rand_input_vit():
-    #     return torch.rand(16, 3, 224, 224).half()
-    # test_main(
-    #     vit_b_16().half(), {
-    #         'encoder.layers.encoder_layer_1.self_attention',
-    #         'encoder.layers.encoder_layer_5.mlp.3',
-    #         'encoder.layers.encoder_layer_9.ln_2',
-    #     }, gen_rand_input_vit, train_step)
+    # ======== nlp models (mainly transformers)========
+    from transformers import OpenAIGPTModel, OpenAIGPTConfig
+    test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
+        'h.3',
+        'h.6',
+        'h.9',
+    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
 
-    # test_main(Foo(), split_into_equal_size(2), gen_rand_input_foo, train_step)
-    # test_main(Foo1(), split_into_equal_size(2), gen_rand_input_foo, train_step)
-    # test_main(alexnet(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
-    # test_main(densenet121(), split_into_equal_size(5), gen_rand_input_imagenet, train_step)
-    # test_main(efficientnet_b0(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
-    # test_main(resnet18(), split_into_equal_size(4), gen_rand_input_imagenet, train_step)
-    # test_main(swin_t(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
-    # test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
-    # test_main(vit_b_16(), split_into_equal_size(10), gen_rand_input_imagenet, train_step)
+    from transformers import AutoModel
+    test_main(AutoModel.from_pretrained("bert-base-uncased"), {
+        'encoder.layer.3',
+        'encoder.layer.6',
+        'encoder.layer.9',
+    }, factory_gen_rand_input_ids(30522), train_step_gpt)
 
-    # # ======== nlp models ========
-    # from transformers import OpenAIGPTModel, OpenAIGPTConfig
-    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-    #     'h.3',
-    #     'h.6',
-    #     'h.9',
-    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size), train_step_gpt)
+    from transformers import GPT2Model, GPT2Config
+    test_main(GPT2Model(GPT2Config()), {
+        'h.3',
+        'h.6',
+        'h.9',
+    }, factory_gen_rand_input_ids(50257), train_step_gpt)
 
-    # from transformers import AutoModel
-    # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
-    #     'encoder.layer.3',
-    #     'encoder.layer.6',
-    #     'encoder.layer.9',
-    # }, factory_gen_rand_input_ids(30522), train_step_gpt)
-
-    # from transformers import GPT2Model, GPT2Config
-    # test_main(GPT2Model(GPT2Config()), {
-    #     'h.3',
-    #     'h.6',
-    #     'h.9',
-    # }, factory_gen_rand_input_ids(50257), train_step_gpt)
-
-    # from transformers import LlamaModel, LlamaConfig
-    # config = LlamaConfig()
-    # config.num_attention_heads = config.num_key_value_heads = 16
-    # config.num_hidden_layers = 16
-    # config.hidden_size = 768
-    # config.use_cache = False
-    # test_main(LlamaModel(config), {
-    #     'layers.3',
-    #     'layers.7',
-    #     'layers.11',
-    # }, factory_gen_rand_input_ids(config.vocab_size), train_step_gpt)
-
-    # # ======== not working ========
-
-    # from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-    # from transformers import T5ForConditionalGeneration
-    # @before_split_register(BaseModelOutputWithPastAndCrossAttentions)
-    # def before_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
-    #     ctx['ori_model_output'] = input
-    #     tup = (input.attentions, input.cross_attentions, input.hidden_states, input.last_hidden_state,
-    #            input.past_key_values, input['last_hidden_state'])
-    #     return tuple_before_split(ctx, tup)
-
-    # @after_split_register(BaseModelOutputWithPastAndCrossAttentions)
-    # def after_split_BaseModelOutputWithPastAndCrossAttentions(ctx, input):
-    #     tup = tuple_after_split(ctx, input)
-    #     ori_model_output = ctx['ori_model_output']
-    #     ori_model_output.attentions, ori_model_output.cross_attentions, ori_model_output.hidden_states, ori_model_output.last_hidden_state, ori_model_output.past_key_values, ori_model_output['last_hidden_state'] = tup
-    #     return ori_model_output
-
-    # test_main(T5ForConditionalGeneration.from_pretrained("t5-small"), {
-    #     'encoder.block.2',
-    #     'encoder',
-    #     'decoder.block.2',
-    # }, factory_gen_rand_input_ids(32128), train_step_t5) # params used in multiple forward stage
-
-    # test_main(OpenLlamaModel(OpenLlamaConfig()), {
-
-    # }, factory_gen_rand_input_ids(OpenLlamaConfig().vocab_size), train_step_gpt) # model init error?
+    from transformers import LlamaModel, LlamaConfig
+    config = LlamaConfig()
+    config.num_attention_heads = config.num_key_value_heads = 16
+    config.num_hidden_layers = 16
+    config.hidden_size = 768
+    config.use_cache = False
+    test_main(LlamaModel(config), {
+        'layers.3',
+        'layers.7',
+        'layers.11',
+    }, factory_gen_rand_input_ids(config.vocab_size), train_step_gpt)
 
     print("All tests passed!")

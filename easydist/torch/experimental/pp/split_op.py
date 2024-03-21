@@ -57,15 +57,13 @@ def fw_bw_split(args: fw_bw_param_type) -> fw_bw_ret_type:
 
 @torch._custom_ops.impl_abstract("easydist::fw_bw_split")
 def fw_bw_split_impl_abstract(args: fw_bw_param_type) -> fw_bw_ret_type:
-    need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
-    args = [arg.clone() if need_clone(arg) else arg for arg in args]
+    args = [arg.clone() for arg in args]
     return args
 
 
 @torch._custom_ops.impl("easydist::fw_bw_split")
 def fw_bw_split_impl(args: fw_bw_param_type) -> fw_bw_ret_type:
-    need_clone = lambda arg: isinstance(arg, torch.Tensor) and arg.requires_grad
-    args = [arg.clone() if need_clone(arg) else arg for arg in args]
+    args = [arg.clone() for arg in args]
     return args
 
 
@@ -84,6 +82,7 @@ class FWBWSplitFunc(torch.autograd.Function):
 
 
 def fw_bw_split_func(tensor_list: fw_bw_param_type) -> fw_bw_ret_type:
+    assert all(t.requires_grad for t in tensor_list), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     return FWBWSplitFunc.apply(*tensor_list)
 
 
@@ -100,7 +99,8 @@ class BeforeBWSplitFunc(torch.autograd.Function):
         return grad  # return must be tensor of tuple of tensors
 
 
-def before_bw_split_func(tensor):
+def before_bw_split_func(tensor: torch.Tensor) -> torch.Tensor:
+    assert tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     ret = BeforeBWSplitFunc.apply(tensor)
     return ret
 

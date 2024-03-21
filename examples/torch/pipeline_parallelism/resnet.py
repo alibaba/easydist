@@ -1,33 +1,19 @@
 import os
 import random
-from contextlib import nullcontext
-from functools import partial, reduce
-from typing import cast
 
 import numpy as np
 
 import torch
-import torch.utils._pytree as pytree
-from torch.nn.utils import stateless
-from torch._subclasses.fake_tensor import FakeTensor
 import torch.distributed as dist
 
 from torchvision import datasets, transforms
 from torchvision.models import resnet18
 
-from easydist.torch.compile_auto import preprocess_traced_graph
-from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.api import _compile_pp
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
-                                                             split_into_equal_size,
-                                                             set_backward_flag)
+from easydist.torch.experimental.pp.compile_pipeline import (split_into_equal_size)
 from easydist.torch.init_helper import SetParaInitHelper
-from easydist.utils import rgetattr, rsetattr
-from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
-from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
-from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase, Schedule1F1B, ScheduleGPipe
-from easydist.torch.experimental.pp.microbatch import CustomReducer, split_args_kwargs_into_chunks, TensorChunkSpec, Replicate
+from easydist.torch.experimental.pp.PipelineStage import Schedule1F1B
+from easydist.torch.experimental.pp.microbatch import CustomReducer, TensorChunkSpec, Replicate
 
 from tqdm import tqdm
 
@@ -65,7 +51,6 @@ def test_main():
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-
     dist.init_process_group(rank=rank, world_size=world_size)
 
     compile_device = torch.device('cpu')
@@ -75,10 +60,10 @@ def test_main():
     _, module = split_into_equal_size(world_size)(module)
 
     # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
 
     batch_size = 64
-    num_chunks = 1 # world_size * 4
+    num_chunks = world_size * 4 # high comm overhead
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -109,9 +94,7 @@ def test_main():
                                  if rank == 0 else train_dataloader):
             if x_batch.size(0) != batch_size:  # TODO need to solve this
                 continue
-            args = (x_batch, y_batch, module, opt)
-            kwargs = {}
-            ret = compiled_fn(*args, **kwargs)
+            ret = compiled_fn(x_batch, y_batch, module, opt)
             if rank == world_size - 1:
                 out, loss = ret
                 all_cnt += len(out)
