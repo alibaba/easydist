@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing
+
 import torch
 import torch._custom_ops
-import typing
 '''
 The valid parameters types are: 
 dict_keys([
@@ -82,7 +83,8 @@ class FWBWSplitFunc(torch.autograd.Function):
 
 
 def fw_bw_split_func(tensor_list: fw_bw_param_type) -> fw_bw_ret_type:
-    assert all(t.requires_grad for t in tensor_list), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
+    assert all(t.requires_grad for t in tensor_list
+               ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     return FWBWSplitFunc.apply(*tensor_list)
 
 

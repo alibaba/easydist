@@ -1,27 +1,23 @@
-import torch
-import torch
-
-
 from contextlib import nullcontext
 from functools import partial
 from typing import cast
 
 import torch
 import torch.utils._pytree as pytree
-
-from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from torch._subclasses.fake_tensor import FakeTensor
+from torch.nn.utils import stateless
 
 from easydist.torch.compile_auto import preprocess_traced_graph
-from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline, set_backward_flag
+from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
+                                                             set_backward_flag)
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase
-from easydist.torch.init_helper import (SetParaInitHelper)
+from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
-from torch._subclasses.fake_tensor import FakeTensor
-from torch.nn.utils import stateless
 
 
 # TODO @botbw: how to deal with dict?
@@ -101,13 +97,8 @@ def _compile_pp(func,
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
-    args_split, kwargs_split = split_args_kwargs_into_chunks(
-        args,
-        kwargs,
-        num_chunks,
-        args_chunk_spec,
-        kwargs_chunk_spec
-    )
+    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                             args_chunk_spec, kwargs_chunk_spec)
 
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)

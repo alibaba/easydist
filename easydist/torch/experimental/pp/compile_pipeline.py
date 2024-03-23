@@ -10,14 +10,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx._symbolic_trace import _Patcher
 
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.init_helper import (InitHelper, SetParaInitHelper,
-                                        materialize_zero)
+from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.fx._symbolic_trace import _Patcher
 
 
 class StateType(Enum):
@@ -69,6 +68,7 @@ class CompiledMeta:
     params_init_helpers: Dict[str, InitHelper]
     buffers_init_helpers: Dict[str, InitHelper]
     optimstates_init_helpers: Dict[str, InitHelper]
+
 
 @dataclass
 class EDGraphModule:
@@ -324,8 +324,9 @@ def get_tracer_global():
 def set_tracer_global(tracer):
     global __tracer_global
     __tracer_global = tracer
-# ================================= section end ========================================
 
+
+# ================================= section end ========================================
 
 __backward_flag = False
 
@@ -387,7 +388,6 @@ def get_registered_by_mro(registered, obj: Any) -> type:
     raise RuntimeError(f"no registered split function for {obj.__class__}")
 
 
-
 @before_split_register(torch.Tensor)
 def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
     return tuple([input])
@@ -441,8 +441,7 @@ def _to_tuple(x):
     return (x, )
 
 
-from easydist.torch.experimental.pp.split_op import (before_bw_split_func,
-                                                     fw_bw_split_func)
+from easydist.torch.experimental.pp.split_op import (before_bw_split_func, fw_bw_split_func)
 
 
 # ================================= section start ========================================
@@ -513,7 +512,8 @@ def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], tor
 
         total_size = param_size + buffer_size
         per_stage_size = total_size // nstages
-        logging.debug(f"Total model size: {total_size}, " f"per stage size: {per_stage_size}")
+        logging.debug(f"Total model size: {total_size}, "
+                      f"per stage size: {per_stage_size}")
 
         gm, rv_nstages = _split_on_size_threshold_with_max_stages(gm, per_stage_size, nstages)
         assert rv_nstages == nstages
@@ -600,8 +600,8 @@ def _split_on_size_threshold_with_max_stages(
             for param_name, size in param_sizes.items():
                 new_size += size
 
-        if (accumulate_size + new_size <=
-                threshold):  # can accommodate this node in current bucket
+        if (accumulate_size + new_size
+                <= threshold):  # can accommodate this node in current bucket
             accumulate_size += new_size
             accumulate_params.update(new_params)
         elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage
@@ -647,6 +647,8 @@ def _split_on_size_threshold_with_max_stages(
     gm.recompile()
 
     return gm, nstages
+
+
 # ================================= section end ========================================
 
 
@@ -772,7 +774,8 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
         elif node.op == 'call_function':
             if node.target == operator.getitem:
                 pass  # getitem is handled in foreach operators
-            elif '_foreach_' == node.name[:9]:  # handle foreach operators # TODO @botbw: better way of doing this? register foreach ops?
+            elif '_foreach_' == node.name[:
+                                          9]:  # handle foreach operators # TODO @botbw: better way of doing this? register foreach ops?
                 list_args_kwargs_mask = []
                 args = []
                 for arg in node.args:
@@ -815,7 +818,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                                                                        args=(env[node.name],
                                                                              getitem_idx))
                         getitem_idx += 1
-            else: # normal nodes like mul, add, etc.
+            else:  # normal nodes like mul, add, etc.
                 args = []
                 for arg in node.args:
                     if isinstance(arg, (list, tuple)):  # list of Tensors
@@ -840,16 +843,15 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                     assert not any(
                         isinstance(arg, torch.fx.Node) for arg in
                         args), "This node shall be completed removed since it has no tensor args"
-                    assert not any(
-                        isinstance(kwarg, torch.fx.Node) for kwarg in
-                        kwargs.values()), "This node shall be completed removed since it has no tensor kwargs"
+                    assert not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values(
+                    )), "This node shall be completed removed since it has no tensor kwargs"
                 else:
                     env[node.name] = new_graph.create_node(op='call_function',
-                                                        name=node.name,
-                                                        target=node.target,
-                                                        args=tuple(args))
+                                                           name=node.name,
+                                                           target=node.target,
+                                                           args=tuple(args))
         elif node.op == 'output':
-            for output in node.args[0]: # output is a tuple (node.args[0])
+            for output in node.args[0]:  # output is a tuple (node.args[0])
                 if output.name in env:
                     outputs.append(env[output.name])
         else:
@@ -974,24 +976,26 @@ def graph_outputs_to_func_outputs_non_strict(compiled_meta: CompiledMeta, output
     return ret
 
 
-def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless function with split op
-                     nstages: int, # number of stages, should be num_of_split_op * 2
-                     stateless_func_args, # args for stateless function
-                     init_helper: SetParaInitHelper=None, # whether to use SetParaInitHelper
-                     strict=True # report error if not all params and buffers are used
-                     ) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
+def compile_pipeline(
+    traced_stateless_func: fx.GraphModule,  # traced stateless function with split op
+    nstages: int,  # number of stages, should be num_of_split_op * 2
+    stateless_func_args,  # args for stateless function
+    init_helper: SetParaInitHelper = None,  # whether to use SetParaInitHelper
+    strict=True  # report error if not all params and buffers are used
+) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
     is_backward_called = get_backward_flag()
 
     input_nodes_flatten = [
         ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder'
     ]
-    inputs_nodes_unflatten = pytree.tree_unflatten(input_nodes_flatten, traced_stateless_func._in_spec)
+    inputs_nodes_unflatten = pytree.tree_unflatten(input_nodes_flatten,
+                                                   traced_stateless_func._in_spec)
 
     output_nodes_flatten = [
         node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]
     ]
     output_nodes_unflatten = pytree.tree_unflatten(output_nodes_flatten,
-                                                    traced_stateless_func._out_spec)
+                                                   traced_stateless_func._out_spec)
 
     # node name of input and output in stateless_func
     params, buffers, optimstates, args, kwargs = stateless_func_args
@@ -1001,8 +1005,14 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless f
     returns_nodes_unflatten = _to_tuple(returns_nodes_unflatten)  # returns might be value or tuple
 
     # given node name, use inv to find the torch name
-    inv_params = {node_name: torch_name for torch_name, node_name in params_nodes_unflatten.items()}
-    inv_buffers = {node_name: torch_name for torch_name, node_name in buffers_nodes_unflatten.items()}
+    inv_params = {
+        node_name: torch_name
+        for torch_name, node_name in params_nodes_unflatten.items()
+    }
+    inv_buffers = {
+        node_name: torch_name
+        for torch_name, node_name in buffers_nodes_unflatten.items()
+    }
     inv_optimstates = {}
     inv_optimstates_type = {}
     for torch_name, state in optimstates_nodes_unflatten.items():
@@ -1060,11 +1070,13 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless f
         params_buffers_materialize_fn = init_helper.get_materialize_fn()
         for torch_name, _ in params.items():
             node_name = params_nodes_unflatten[torch_name]
-            params_init_helpers[node_name] = partial(params_buffers_materialize_fn, param_buf_key=torch_name)
+            params_init_helpers[node_name] = partial(params_buffers_materialize_fn,
+                                                     param_buf_key=torch_name)
 
         for torch_name, _ in buffers.items():
             node_name = buffers_nodes_unflatten[torch_name]
-            buffers_init_helpers[node_name] = partial(params_buffers_materialize_fn, param_buf_key=torch_name)
+            buffers_init_helpers[node_name] = partial(params_buffers_materialize_fn,
+                                                      param_buf_key=torch_name)
 
         for _, input_name in output2input_optimstates.items():
             optimstates_init_helpers[input_name] = materialize_zero
@@ -1195,31 +1207,31 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless f
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
-        node_to_stage_idx=None, # this need to be filled later
+        node_to_stage_idx=None,  # this need to be filled later
         params_init_helpers=params_init_helpers,
         buffers_init_helpers=buffers_init_helpers,
-        optimstates_init_helpers=optimstates_init_helpers
-    )
+        optimstates_init_helpers=optimstates_init_helpers)
 
     current_stateful_fw_bw = None
     compiled_stages: List[CompiledStage] = []
-    is_fwbw = True # to check if it is fw_bw or step
+    is_fwbw = True  # to check if it is fw_bw or step
     for node in splited_global.graph.nodes:
-        if node.op == 'call_module': # find submodule
+        if node.op == 'call_module':  # find submodule
             assert len(node.kwargs) == 0, "splited_model should have no kwargs"
             submod = getattr(splited_global, node.target)
             if is_fwbw:  # this is a fw or fw_bw gm
-                fw_or_fwbw_gm, part_cnt = split_by(submod, torch.ops.easydist.fw_bw_split.default) # split the module
+                fw_or_fwbw_gm, part_cnt = split_by(
+                    submod, torch.ops.easydist.fw_bw_split.default)  # split the module
                 assert part_cnt == nstages * 2 if is_backward_called else nstages, "part_cnt should be nstages * 2 if backward is called"
                 stateful_fw_bw = []
                 submod_idx = 0
-                for n in fw_or_fwbw_gm.graph.nodes: # for each submod in  fw_or_fwbw_gm
+                for n in fw_or_fwbw_gm.graph.nodes:  # for each submod in  fw_or_fwbw_gm
                     if n.op == 'call_module':  # extract stateful submods
                         fw_or_bw_submod = getattr(fw_or_fwbw_gm, n.target)
                         is_fw = (not is_backward_called or submod_idx < part_cnt // 2)
                         stateful_fw_bw.append(
-                            _extract_fw_submod(n, fw_or_bw_submod) if is_fw else _extract_bw_submod(
-                                n, fw_or_bw_submod))
+                            _extract_fw_submod(n, fw_or_bw_submod)
+                            if is_fw else _extract_bw_submod(n, fw_or_bw_submod))
                         submod_idx += 1
                 assert current_stateful_fw_bw is None, "There should be no consecutive compiled_fw_bw"
                 current_stateful_fw_bw = stateful_fw_bw
@@ -1267,7 +1279,7 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless f
     g = fx.Graph()
     env = {}
     submod_idx = 0
-    name_to_stage_idx = {} # TODO @botbw: move this to constructor
+    name_to_stage_idx = {}  # TODO @botbw: move this to constructor
     all_states_names_flatten = set(
         pytree.tree_flatten(
             [params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten])[0])
@@ -1275,7 +1287,7 @@ def compile_pipeline(traced_stateless_func: fx.GraphModule, # traced stateless f
     # construct a local_gm TODO @botbw: simplify this
     for node in fw_or_fwbw_gm.graph.nodes:
         if node.op == 'placeholder':
-            if node.name not in all_states_names_flatten: # args that are not states
+            if node.name not in all_states_names_flatten:  # args that are not states
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
             if is_backward_called:  # fw_bw

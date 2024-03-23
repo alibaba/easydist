@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
-import logging
 import inspect
+import logging
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -18,13 +18,18 @@ class CustomReducer:
 
     def __init__(self, reduce_fn):
         signature = inspect.signature(reduce_fn)
-        assert len(signature.parameters) == 2, f"CustomReducer function {reduce_fn} must take exactly 2 arguments"
+        assert len(signature.parameters
+                   ) == 2, f"CustomReducer function {reduce_fn} must take exactly 2 arguments"
+
         def _reduce_fn(x, y):
             # x, y must be all None or all not None
-            assert (x is None) == (y is None), f"CustomReducer function {reduce_fn} must take either 2 None or 2 not None arguments"
+            assert (x is None) == (
+                y is None
+            ), f"CustomReducer function {reduce_fn} must take either 2 None or 2 not None arguments"
             if x is None:
                 return None
             return reduce_fn(x, y)
+
         self.reduce_fn = _reduce_fn
 
 

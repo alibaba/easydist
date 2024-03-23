@@ -1,8 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
-from functools import reduce
-from abc import ABC, abstractmethod
 import logging
 import operator
+from abc import ABC, abstractmethod
+from functools import reduce
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
@@ -11,9 +11,12 @@ import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
 
-from easydist.torch.experimental.pp.microbatch import CustomReducer, merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
+from easydist.torch.experimental.pp.compile_pipeline import (
+    CompiledMeta, CompiledStage, StateType, func_inputs_to_graph_inputs_by_stages,
+    graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict)
+from easydist.torch.experimental.pp.microbatch import (CustomReducer, TensorChunkSpec,
+                                                       merge_chunks, split_args_kwargs_into_chunks)
 from easydist.torch.experimental.pp.utils import modify_graph_op_device
-from easydist.torch.experimental.pp.compile_pipeline import CompiledMeta, StateType, CompiledStage, graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict, func_inputs_to_graph_inputs_by_stages
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +142,8 @@ class PipelineStageBase:
         node_metas: Dict[str, Dict[str, FakeTensor]],
         num_chunks: int,
         args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
-        kwargs_chunk_spec:Optional[ Dict[str, TensorChunkSpec]],
-        outputs_chunk_spec: Optional[Tuple[Union[TensorChunkSpec,CustomReducer]]],
+        kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
+        outputs_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
         device: torch.device,
         group: Optional[dist.ProcessGroup] = None,
     ):
@@ -203,7 +206,8 @@ class PipelineStageBase:
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
 
-    def _get_graph_inputs_chunk(self, compiled_meta: CompiledMeta, args_chunk_spec, kwargs_chunk_spec):
+    def _get_graph_inputs_chunk(self, compiled_meta: CompiledMeta, args_chunk_spec,
+                                kwargs_chunk_spec):
         node_val_chunk_spec = {}
         if args_chunk_spec is None:
             args_chunk_spec = [None] * len(compiled_meta.args_nodes_unflatten)
@@ -226,20 +230,16 @@ class PipelineStageBase:
             if isinstance(tensor, FakeTensor) or tensor.is_meta:
                 materialize_fn = self.compiled_meta.params_init_helpers[name]
                 self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = materialize_fn(
-                    tensor=tensor,
-                    materialization_device=self.device
-                )
+                    tensor=tensor, materialization_device=self.device)
             else:
                 self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
-                    self.device
-                )
+                    self.device)
         for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
             if isinstance(tensor, FakeTensor) or tensor.is_meta:
                 materialize_fn = self.compiled_meta.buffers_init_helpers[name]
-                self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = materialize_fn(
-                    tensor=tensor,
-                    materialization_device=self.device
-                )
+                self.compiled_stage.fw_gm.injected_states[
+                    StateType.BUFFERS][name] = materialize_fn(tensor=tensor,
+                                                              materialization_device=self.device)
             else:
                 self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
                     self.device)
@@ -248,10 +248,9 @@ class PipelineStageBase:
                     StateType.OPTIMSTATES].items():
                 if isinstance(tensor, FakeTensor) or tensor.is_meta:
                     materialize_fn = self.compiled_meta.optimstates_init_helpers[name]
-                    self.compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = materialize_fn(
-                        tensor=tensor,
-                        materialization_device=self.device
-                    )
+                    self.compiled_stage.step_gm.injected_states[
+                        StateType.OPTIMSTATES][name] = materialize_fn(
+                            tensor=tensor, materialization_device=self.device)
                 else:
                     self.compiled_stage.step_gm.injected_states[
                         StateType.OPTIMSTATES][name] = tensor.to(self.device)
@@ -326,7 +325,8 @@ class PipelineStageBase:
                 gi_dsts.append(dst_rank)
             # Next `getitem` will point to the next output index
 
-        logger.info(f"[{self.group_rank}] " f"Send info: {act_send_info}")
+        logger.info(f"[{self.group_rank}] "
+                    f"Send info: {act_send_info}")
         return dict(sorted(act_send_info.items()))
 
     def _create_recv_buffers(
@@ -451,7 +451,8 @@ class PipelineStageBase:
         for name, dst_stages in send_info.items():
             out = output_dict[name]
             for dst in dst_stages:
-                logger.debug(f"[{self.group_rank}] " f"Sending tensor to Rank {dst}: {out.size()}")
+                logger.debug(f"[{self.group_rank}] "
+                             f"Sending tensor to Rank {dst}: {out.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
                     out,
@@ -575,7 +576,7 @@ class PipelineStageBase:
                            outputs_all_stages if self.group_rank == rank else None,
                            dst=rank)
         all_graph_outputs = {}
-        if self.group_rank == rank: # other rank receive None s
+        if self.group_rank == rank:  # other rank receive None s
             for outputs in outputs_all_stages:
                 all_graph_outputs.update(outputs)
         return graph_outputs_to_func_outputs_non_strict(self.compiled_meta, all_graph_outputs)
