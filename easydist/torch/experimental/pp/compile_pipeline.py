@@ -1105,9 +1105,16 @@ def compile_pipeline(
         else:  # output is value
             assert not any(getitem_users)
             outputs_spec.append(node.name)
-            for user in node.users:
-                if user.op == 'call_module':
-                    call_module_users[node.name].add(user.name)
+            if len(node.users) == 1: # TODO @botbw: this is not "call_module_user"
+                user = next(iter(node.users))
+                if len(user.users) == 1:
+                    uuser = next(iter(user.users))
+                    if uuser.op == 'call_module':
+                        call_module_users[user.name].add(uuser.name)
+            else:
+                for user in node.users:
+                    if user.op == 'call_module':
+                        call_module_users[node.name].add(user.name)
         return outputs_spec, call_module_users
 
     def _extract_fw_submod(node, submod):
@@ -1292,25 +1299,7 @@ def compile_pipeline(
         elif node.op == 'call_module':
             if is_backward_called:  # fw_bw
                 if submod_idx < nstages:  # forward
-                    stage_idx = submod_idx
-                    stage = compiled_stages[submod_idx]
-                    node_name = f'stage_{submod_idx}_fw'
-                    out_maybe_tuple = g.create_node(
-                        name=node_name,
-                        op='call_function',
-                        target=stage.forward,
-                        kwargs={arg_name: env[arg_name]
-                                for arg_name in stage.fw_func_args})
-                    name_to_stage_idx[node_name] = stage_idx
-                    for arg_name in stage.fw_func_args:
-                        if env[arg_name].op == 'placeholder':
-                            name_to_stage_idx[arg_name] = stage_idx
-                    for output in stage.fw_func_returns:
-                        env[output] = g.create_node(name=output,
-                                                    op='call_function',
-                                                    target=operator.getitem,
-                                                    args=(out_maybe_tuple, output))
-                        name_to_stage_idx[output] = stage_idx
+                    construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
                 else:  # backward
                     stage_idx = 2 * nstages - submod_idx - 1
                     stage = compiled_stages[stage_idx]
@@ -1335,25 +1324,7 @@ def compile_pipeline(
                                       target=stage.step)
                         name_to_stage_idx[f'stage_{stage_idx}_step'] = stage_idx
             else:  # fw
-                stage_idx = submod_idx
-                stage = compiled_stages[submod_idx]
-                node_name = f'stage_{submod_idx}_fw'
-                out_maybe_tuple = g.create_node(
-                    name=node_name,
-                    op='call_function',
-                    target=stage.forward,
-                    kwargs={arg_name: env[arg_name]
-                            for arg_name in stage.fw_func_args})
-                name_to_stage_idx[node_name] = stage_idx
-                for arg_name in stage.fw_func_args:
-                    if env[arg_name].op == 'placeholder':
-                        name_to_stage_idx[arg_name] = stage_idx
-                for output in stage.fw_func_returns:
-                    env[output] = g.create_node(name=output,
-                                                op='call_function',
-                                                target=operator.getitem,
-                                                args=(out_maybe_tuple, output))
-                    name_to_stage_idx[output] = stage_idx
+                construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
             submod_idx += 1
 
     compiled_meta.node_to_stage_idx = name_to_stage_idx  # TODO @botbw move this to constructor?
@@ -1365,3 +1336,24 @@ def compile_pipeline(
     local_gm = fx.GraphModule({}, g)
 
     return compiled_meta, compiled_stages, local_gm
+
+def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
+    stage_idx = submod_idx
+    stage = compiled_stages[submod_idx]
+    node_name = f'stage_{submod_idx}_fw'
+    out_maybe_tuple = g.create_node(
+                        name=node_name,
+                        op='call_function',
+                        target=stage.forward,
+                        kwargs={arg_name: env[arg_name]
+                                for arg_name in stage.fw_func_args})
+    name_to_stage_idx[node_name] = stage_idx
+    for arg_name in stage.fw_func_args:
+        if env[arg_name].op == 'placeholder':
+            name_to_stage_idx[arg_name] = stage_idx
+    for output in stage.fw_func_returns:
+        env[output] = g.create_node(name=output,
+                                                    op='call_function',
+                                                    target=operator.getitem,
+                                                    args=(out_maybe_tuple, output))
+        name_to_stage_idx[output] = stage_idx

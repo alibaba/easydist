@@ -346,15 +346,14 @@ def ed_split_module(
                 node.name = output_name
                 base_mod_env[output_name] = node  # type: ignore[index]
         elif num_outputs == 1:
-            # This could be tricky, otherwise submod_x might have node name if it's a single output
+            # Introduce one redudant node
             output_name = list(partition.outputs)[0]
-            output_val = base_mod_graph.create_node(
+            base_mod_env[output_name] = base_mod_graph.create_node(
                 op='call_function',
                 target=lambda x: x,
                 args=(output_val,),
                 name=output_name
             )
-            base_mod_env[output_name] = output_val
 
     for node in m.graph.nodes:
         if node.op == "output":
