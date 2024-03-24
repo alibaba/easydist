@@ -330,9 +330,11 @@ def ed_split_module(
             partition.targets, partition.graph)  # noqa: B950
 
         # Emit call in base graph to this submodule
-        output_val = base_mod_graph.call_module(
-            partition.submod_name,
-            tuple(base_mod_env[name] for name in partition.inputs),
+        output_val = base_mod_graph.create_node(
+            op='call_module',
+            target=partition.submod_name,
+            args=tuple(base_mod_env[name] for name in partition.inputs),
+            name=partition.submod_name
         )
 
         num_outputs = len(partition.outputs)
@@ -344,8 +346,14 @@ def ed_split_module(
                 node.name = output_name
                 base_mod_env[output_name] = node  # type: ignore[index]
         elif num_outputs == 1:
+            # This could be tricky, otherwise submod_x might have node name if it's a single output
             output_name = list(partition.outputs)[0]
-            output_val.name = output_name
+            output_val = base_mod_graph.create_node(
+                op='call_function',
+                target=lambda x: x,
+                args=(output_val,),
+                name=output_name
+            )
             base_mod_env[output_name] = output_val
 
     for node in m.graph.nodes:
