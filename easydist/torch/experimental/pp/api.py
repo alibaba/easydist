@@ -31,7 +31,8 @@ def _compile_pp(func,
                 args_chunk_spec,
                 kwargs_chunk_spec,
                 outputs_chunk_spec,
-                num_chunks=1) -> PipelineStageBase:
+                num_chunks=1,
+                strict=True) -> PipelineStageBase:
 
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -124,7 +125,7 @@ def _compile_pp(func,
                                                                 world_size,
                                                                 stateless_func_args,
                                                                 init_helper=init_helper,
-                                                                strict=True)
+                                                                strict=strict)
 
     pipe = PipelineStageBase(schedule_cls=schedule_cls,
                              local_gm=local_gm,
