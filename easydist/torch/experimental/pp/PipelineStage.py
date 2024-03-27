@@ -74,14 +74,12 @@ class ScheduleGPipe(Schedule):
 
         # Forward pass of all chunks
         for chunk in range(self.pipeline_stage.num_chunks):
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(chunk)
-            logger.debug(f"[{self.pipeline_stage.group_rank}] Forwarded chunk {chunk}")
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
 
         # Backward starts here
         if self.pipeline_stage.bw_node is not None:
             for bwd_chunk in range(self.pipeline_stage.num_chunks):
-                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk(bwd_chunk)
-                logger.debug(f"[{self.pipeline_stage.group_rank}] Backwarded chunk {bwd_chunk}")
+                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
 
         # Wait for all sends to finish
         # TODO okay to delay the sync till completion of all chunks?
@@ -99,11 +97,11 @@ class ScheduleGPipe(Schedule):
             self.pipeline_stage.step()
 
 
-class Schedule1F1B(Schedule):
+class ScheduleDAPPLE(Schedule):
 
     def __init__(self, pipeline_stage: 'PipelineStageBase'):
         super().__init__(pipeline_stage)
-        assert pipeline_stage.bw_node is not None, "Schedule1F1B requires backward node"
+        assert pipeline_stage.bw_node is not None, f"{type(self).__name__} requires backward node"
 
     def __call__(self) -> None:
         all_fw_send_reqs: List[dist.Work] = []
@@ -113,18 +111,18 @@ class Schedule1F1B(Schedule):
 
         # Warm-up phase: forward number of chunks equal to pipeline depth.
         for chunk in range(num_warmup):
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(chunk)
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
 
         # 1F1B phase
         for fwd_chunk in range(num_warmup, self.pipeline_stage.num_chunks):
-            bwd_chunk = fwd_chunk - num_warmup
-            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk_if_exists(bwd_chunk)
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk(fwd_chunk)
+            if self.pipeline_stage.bw_node is not None:
+                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
 
         # Cool-down phase: backward for the rest of the chunks
         for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup,
-                               self.pipeline_stage.num_chunks):
-            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk(bwd_chunk)
+                                self.pipeline_stage.num_chunks):
+            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
 
         # Wait for all sends to finish
         # TODO: okay to delay the sync till completion of all chunks?
@@ -182,6 +180,9 @@ class PipelineStageBase:
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
         # runtimes
+        self.cur_fw_chunk_id = 0
+        self.cur_bw_chunk_id = 0
+        self.cur_step_chunk_id = 0
         self.kwargs_chunks = [{} for _ in range(self.num_chunks)]
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
@@ -227,7 +228,7 @@ class PipelineStageBase:
         assert len(args_chunk_spec_flatten) == len(args_nodes_flatten)
         for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec_flatten):
             node_val_chunk_spec[node_name] = arg_chunk_spec
-        
+
         kwargs_nodes_flatten, spec1 = pytree.tree_flatten(compiled_meta.kwargs_nodes_unflatten)
         kwargs_chunk_spec = kwargs_chunk_spec or {node_name: TensorChunkSpec(DEFAULT_CHUNK_DIM) for node_name in kwargs_nodes_flatten}
         kwargs_chunk_spec_flatten, spec2 = pytree.tree_flatten(kwargs_chunk_spec)
@@ -335,7 +336,7 @@ class PipelineStageBase:
             for gi_user in user.users:
                 dst_rank = self.find_dst_rank(gi_user)
                 to_sort.append((dst_rank, out_str))
-        
+
         to_sort.sort(key=lambda x: (x[0], x[1])) # send lower rank first and in alphabetical order
 
         act_send_info_by_stage = defaultdict(list)
@@ -425,6 +426,7 @@ class PipelineStageBase:
         act_recv = self.bind_with_recev_tensor_fn(recv_reqs)
 
         chunk_kwargs = self.kwargs_chunks[chunk]
+
         composite_kwargs = {}
         for rank, info_list in kwargs_recv_info.items():
             for info in info_list:
@@ -432,6 +434,8 @@ class PipelineStageBase:
                     composite_kwargs[info.input_name] = act_recv(info)
                 else:
                     composite_kwargs[info.input_name] = chunk_kwargs[info.input_name]
+
+        chunk_kwargs.clear()
 
         # Wait for all recvs to finish
         for work in recv_reqs:
@@ -465,51 +469,54 @@ class PipelineStageBase:
 
         return send_reqs
 
-    def forward_one_chunk(
-        self,
-        chunk: int,
-    ) -> List[dist.Work]:
-        # Receive activations
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.fw_kwargs_recv_info, chunk)
+    def forward_one_chunk(self) -> List[dist.Work]:
+        # Receive activations and get args kwargs
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.fw_kwargs_recv_info, self.cur_fw_chunk_id)
 
         # Compute forward
-        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[chunk],
-                                                    self.outputs_chunks[chunk],
+        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
+                                                    self.outputs_chunks[self.cur_fw_chunk_id],
                                                     **composite_kwargs_chunk)
+
+        # next chunk
+        self.cur_fw_chunk_id += 1
 
         # Send activations
         fw_send_reqs = self._send_output_dict(self.fw_act_send_info, outputs_chunk)
         return fw_send_reqs
 
-    def backward_one_chunk(
-        self,
-        chunk: int,
-    ) -> List[dist.Work]:
+    def backward_one_chunk(self) -> List[dist.Work]:
         # Receive grads
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_kwargs_recv_info, chunk)
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_kwargs_recv_info, self.cur_bw_chunk_id)
 
         # Compute backward
-        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk],
-                                                     self.outputs_chunks[chunk],
+        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
+                                                     self.outputs_chunks[self.cur_bw_chunk_id],
                                                      **composite_kwargs_chunk)
+
+        # next chunk
+        self.cur_bw_chunk_id += 1
 
         # send grads
         bw_send_reqs = self._send_output_dict(self.bw_grad_send_info, outputs_chunk)
         return bw_send_reqs
 
-    def backward_one_chunk_if_exists(self, chunk: int) -> List[dist.Work]:
+    def backward_one_chunk_if_exists(self) -> List[dist.Work]:
         if self.bw_node is not None:
-            return self.backward_one_chunk(chunk)
+            return self.backward_one_chunk()
         return []
 
-    def step(self):
+    def step(self, step_chunk=False):
+        if step_chunk:
+            self.compiled_stage.step(self.outputs_chunks(self.cur_step_chunk_id))
+            self.cur_step_chunk_id += 1
+            return
         self.compiled_stage.step(self.outputs_batch)
 
-    def step_if_exists(self):
-        if self.step_node is not None:
-            self.step()
-
     def clear_runtime_states(self):
+        self.cur_fw_chunk_id = 0
+        self.cur_bw_chunk_id = 0
+        self.cur_step_chunk_id = 0
         # Caching chunk outputs for final output merge or reduction
         for kwargs_chunk in self.kwargs_chunks:
             kwargs_chunk.clear()
@@ -543,6 +550,7 @@ class PipelineStageBase:
                     rets_chunk[node_name] = tensor
                 else:
                     raise RuntimeError(f"Unknown output {node_name}")
+            chunk.clear()
             grads.append(grads_chunk)
             rets.append(rets_chunk)
 

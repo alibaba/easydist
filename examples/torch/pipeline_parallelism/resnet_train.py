@@ -13,7 +13,7 @@ from torchvision.models import resnet18
 from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.experimental.pp.compile_pipeline import (split_into_equal_size)
 from easydist.torch.init_helper import SetParaInitHelper
-from easydist.torch.experimental.pp.PipelineStage import Schedule1F1B
+from easydist.torch.experimental.pp.PipelineStage import ScheduleGPipe, ScheduleDAPPLE
 from easydist.torch.experimental.pp.microbatch import CustomReducer, TensorChunkSpec, Replicate
 
 from tqdm import tqdm
@@ -83,7 +83,7 @@ def test_main():
     output_chunk_spec = [TensorChunkSpec(0), CustomReducer(lambda x, y: x + y)]
 
     compiled_fn = _compile_pp(train_step, 'fake', SetParaInitHelper(), None, args, kwargs,
-                       Schedule1F1B, args_chunk_spec, kwargs_chunk_spec,
+                       ScheduleDAPPLE, args_chunk_spec, kwargs_chunk_spec,
                        output_chunk_spec, num_chunks)
 
     epochs = 5

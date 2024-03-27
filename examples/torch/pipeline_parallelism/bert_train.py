@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points)
 from easydist.torch.init_helper import SetParaInitHelper
-from easydist.torch.experimental.pp.PipelineStage import Schedule1F1B
+from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE
 
 from torchtext.datasets import IMDB, AG_NEWS
 
@@ -82,7 +82,7 @@ def train_bert():
     kwargs = {}
 
     compiled_fn = _compile_pp(train_step, "fake", None, None,
-                              args, kwargs, Schedule1F1B, None, None, None,
+                              args, kwargs, ScheduleDAPPLE, None, None, None,
                               num_chunks)
 
     def test(module, valid_dataloader, epoch, outputs):
