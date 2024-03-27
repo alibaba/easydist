@@ -82,7 +82,7 @@ def test_main():
     kwargs_chunk_spec = {}
     output_chunk_spec = [TensorChunkSpec(0), CustomReducer(lambda x, y: x + y)]
 
-    compiled_fn = _compile_pp(train_step, None, SetParaInitHelper(), None, args, kwargs,
+    compiled_fn = _compile_pp(train_step, 'fake', SetParaInitHelper(), None, args, kwargs,
                        Schedule1F1B, args_chunk_spec, kwargs_chunk_spec,
                        output_chunk_spec, num_chunks)
 

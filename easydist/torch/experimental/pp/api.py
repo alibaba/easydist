@@ -105,7 +105,7 @@ def _compile_pp(func,
         set_backward_flag(False)
         set_step_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, func),
-                                           tracing_mode='fake',
+                                           tracing_mode=tracing_mode,
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
                                            _allow_non_fake_inputs=False)(params, buffers,
                                                                          named_states,
