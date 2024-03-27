@@ -1201,7 +1201,7 @@ def compile_pipeline(
                 Buffers: 
                     {' '.join(buffers)}
                 Optimstates: 
-                    {' '.join(optimstates)}
+                    {' '.join([torch_name for torch_name, state in optimstates.items() if state])}
             """)
         if strict:
             raise RuntimeError(debugging_info)

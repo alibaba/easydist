@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+from collections import defaultdict
 import logging
 import operator
 from abc import ABC, abstractmethod
@@ -29,8 +30,11 @@ def _make_tensor_from_meta(
 ) -> torch.Tensor:
     return torch.empty(example_value.size(), dtype=example_value.dtype, device=device)
 
+class RecvBase:
+    def __init__(self, input_name):
+        self.input_name = input_name
 
-class RecvInfo:
+class RecvInfo(RecvBase):
 
     def __init__(
         self,
@@ -38,16 +42,16 @@ class RecvInfo:
         source: int,
         example_tensor: FakeTensor,
     ):
-        self.input_name = input_name
+        super().__init__(input_name)
         self.source = source
         self.example_tensor = example_tensor
 
     def __repr__(self):
         return f"RecvInfo(input={self.input_name}, source={self.source}, shape={self.example_tensor.size()})"
 
-
-class StageKwargPlaceholder:
-    pass
+class StageKwargPlaceholder(RecvBase):
+    def __init__(self, input_name: str):
+        super().__init__(input_name)
 
 
 class Schedule(ABC):
@@ -178,9 +182,10 @@ class PipelineStageBase:
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
         # runtimes
-        self.outputs_batch = {}  # Activation send requests of all chunk
+        self.kwargs_chunks = [{} for _ in range(self.num_chunks)]
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
+        self.outputs_batch = {}  # Activation send requests of all chunk
 
         # Prepare send/recv infrastructure
         self._init_communication(node_metas)
@@ -308,11 +313,11 @@ class PipelineStageBase:
         self.stage_index_to_group_rank = stage_index_to_group_rank
 
         # chunk : Dict of kwarg buffers
-        self.fw_kwargs_recv_info = self._create_recv_buffers(node_metas, self.fw_node)
+        self.fw_kwargs_recv_info = self._create_recv_info(node_metas, self.fw_node)
         self.fw_act_send_info = self._create_send_info(self.fw_node)
 
         if self.bw_node is not None:
-            self.bw_kwargs_recv_info = self._create_recv_buffers(node_metas, self.bw_node)
+            self.bw_kwargs_recv_info = self._create_recv_info(node_metas, self.bw_node)
             self.bw_grad_send_info = self._create_send_info(self.bw_node)
 
     def get_stage_index_of_node_name(
@@ -321,62 +326,51 @@ class PipelineStageBase:
     ):
         return self.node_to_stage_idx[node_name]
 
-    def _create_send_info(self, node):
-        # Output index: List of receiver ranks
-        act_send_info: Dict[str, List] = {}
-
+    def _create_send_info(self, node):  # TODO @botbw: simplify
+        to_sort = []
         for user in node.users:
             assert user.target is operator.getitem, "Output must be a dict"
             out_str = user.args[-1]
             assert isinstance(out_str, str)
-            # Recursively find the real destination
-            gi_dsts = act_send_info.setdefault(out_str, [])
             for gi_user in user.users:
                 dst_rank = self.find_dst_rank(gi_user)
-                gi_dsts.append(dst_rank)
-            # Next `getitem` will point to the next output index
+                to_sort.append((dst_rank, out_str))
+        
+        to_sort.sort(key=lambda x: (x[0], x[1])) # send lower rank first and in alphabetical order
 
-        logger.info(f"[{self.group_rank}] "
-                    f"Send info: {act_send_info}")
-        return dict(sorted(act_send_info.items()))
+        act_send_info_by_stage = defaultdict(list)
+        for dst_rank, out_str in to_sort:
+            act_send_info_by_stage[dst_rank].append(out_str)
 
-    def _create_recv_buffers(
+        return act_send_info_by_stage
+
+    def _create_recv_info(
         self,
         node_metas,
-        node,
+        kwarg,
     ):
-
-        def create_recv_tensor(
-            input_node,
-            output_idx: Optional[int] = None,
-        ):
-            """
-            Create a tensor for receiving the `output_idx`-th value from
-            `input_node`
-            """
-            if input_node.op == "placeholder":
-                # Do not create buffer for placeholder
-                return StageKwargPlaceholder()
-
-            example_value = node_metas[input_node.name]["val"]
-
-            logger.info(f"[{self.group_rank}] "
-                        f"Creating recv buffer for input '{input_node.name}' "
-                        f"value index {output_idx}: {example_value.size()}")
-
-            src_rank = self.get_stage_index_of_node_name(input_node.name)
-
-            return RecvInfo(
-                input_node.name,
-                src_rank,
-                example_value,
-            )
-
         # `kwargs` is a Dict, hence we will have:
         # Dict[keyword, RecvInfo]
-        kwargs_recv_info = map_arg(node.kwargs, create_recv_tensor)
+        to_sort = []
+        for _, kwarg in kwarg.kwargs.items():
+            if kwarg.op == "placeholder":
+                to_sort.append((-1, kwarg.name))
+                continue
+            example_value = node_metas[kwarg.name]["val"]
+            src_rank = self.get_stage_index_of_node_name(kwarg.name)
+            to_sort.append((src_rank, kwarg.name, example_value))
 
-        return dict(sorted(kwargs_recv_info.items()))
+        to_sort.sort(key=lambda x: (x[0], x[1]))  # receive lower rank first and in alphabetical order
+
+        kwargs_recv_info = defaultdict(list)
+        for x in to_sort:
+            if x[0] == -1:
+                kwargs_recv_info[0].append(StageKwargPlaceholder(x[1])) # args recev with rank 0 (lowest rank)
+            else:
+                src_rank, name, example_value = x
+                kwargs_recv_info[src_rank].append(RecvInfo(name, src_rank, example_value))
+
+        return kwargs_recv_info
 
     def find_dst_rank(
         self,
@@ -388,12 +382,13 @@ class PipelineStageBase:
         """
         return self.get_stage_index_of_node_name(user.name)
 
-    def _recv_tensor(self, info, recv_reqs):
+    def _recv_tensor(self, info: RecvInfo, recv_reqs: List[dist.Work]):
         logger.debug(f"[{self.group_rank}] "
                      f"Receiving tensor '{info.input_name}' from Rank {info.source}: "
                      f"{info.example_tensor.size()}")
         # Use async to parallelize recv of tensors
         peer_rank = self.stage_index_to_group_rank[info.source]
+        # Create a buffer for receiving the tensor
         buffer = _make_tensor_from_meta(info.example_tensor, self.device)
         work = dist.irecv(
             buffer,
@@ -403,16 +398,15 @@ class PipelineStageBase:
         recv_reqs.append(work)
         return buffer
 
-    def recv_tensor_fn(
+    def bind_with_recev_tensor_fn(
         self,
-        reqs,
+        reqs: List[dist.Work],
     ):
         return lambda info: self._recv_tensor(info, reqs)
 
     def split_input_kwargs(self, kwargs):
-        self.kwargs_split = None
         if kwargs:
-            _, self.kwargs_split = split_args_kwargs_into_chunks(
+            _, self.kwargs_chunks = split_args_kwargs_into_chunks(
                 (),
                 kwargs,
                 self.num_chunks,
@@ -422,26 +416,22 @@ class PipelineStageBase:
 
     def _recv_and_fill_inputs(
         self,
-        kwargs_split,
         kwargs_recv_info,
         chunk: int,
     ):
         # Receive requests of a chunk
         recv_reqs: List[dist.Work] = []
 
-        act_recv = self.recv_tensor_fn(recv_reqs)
+        act_recv = self.bind_with_recev_tensor_fn(recv_reqs)
 
-        chunk_kwargs = {}
-        if kwargs_split:
-            chunk_kwargs = kwargs_split[chunk]
-
+        chunk_kwargs = self.kwargs_chunks[chunk]
         composite_kwargs = {}
-
-        for kw, info in kwargs_recv_info.items():
-            if isinstance(info, RecvInfo):
-                composite_kwargs[kw] = act_recv(info)
-            else:
-                composite_kwargs[kw] = chunk_kwargs[kw]
+        for rank, info_list in kwargs_recv_info.items():
+            for info in info_list:
+                if isinstance(info, RecvInfo):
+                    composite_kwargs[info.input_name] = act_recv(info)
+                else:
+                    composite_kwargs[info.input_name] = chunk_kwargs[info.input_name]
 
         # Wait for all recvs to finish
         for work in recv_reqs:
@@ -459,14 +449,14 @@ class PipelineStageBase:
         # Send requests of a chunk
         send_reqs: List[dist.Work] = []
 
-        for name, dst_stages in send_info.items():
-            out = output_dict[name]
-            for dst in dst_stages:
+        for dst, nodes in send_info.items():
+            for node in nodes:
+                val = output_dict[node]
                 logger.debug(f"[{self.group_rank}] "
-                             f"Sending tensor to Rank {dst}: {out.size()}")
+                             f"Sending tensor to Rank {dst}: {val.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
-                    out,
+                    val,
                     peer_rank if self.group is None else dist.get_global_rank(
                         self.group, peer_rank),  # TODO
                     group=self.group,
@@ -480,8 +470,7 @@ class PipelineStageBase:
         chunk: int,
     ) -> List[dist.Work]:
         # Receive activations
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.kwargs_split,
-                                                            self.fw_kwargs_recv_info, chunk)
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.fw_kwargs_recv_info, chunk)
 
         # Compute forward
         outputs_chunk = self.compiled_stage.forward(self.activations_chunks[chunk],
@@ -497,8 +486,7 @@ class PipelineStageBase:
         chunk: int,
     ) -> List[dist.Work]:
         # Receive grads
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.kwargs_split,
-                                                            self.bw_kwargs_recv_info, chunk)
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_kwargs_recv_info, chunk)
 
         # Compute backward
         outputs_chunk = self.compiled_stage.backward(self.activations_chunks[chunk],
@@ -523,6 +511,8 @@ class PipelineStageBase:
 
     def clear_runtime_states(self):
         # Caching chunk outputs for final output merge or reduction
+        for kwargs_chunk in self.kwargs_chunks:
+            kwargs_chunk.clear()
         for act_chunk in self.activations_chunks:
             assert len(act_chunk) == 0, "Activations should be cleared"
         # self.activations_chunks.clear()
@@ -537,14 +527,9 @@ class PipelineStageBase:
         nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_nodes_unflatten
         returns_names_flatten = self.compiled_meta.returns_nodes_flatten
 
-        params = {}
-        buffers = {}
-        optimstates = {}
-        grads = []
-        rets = []
+        params, buffers, optimstates, grads, rets = {}, {}, {}, [], []
         for chunk in self.outputs_chunks:
-            grads_chunk = {}
-            rets_chunk = {node_name: None for node_name in returns_names_flatten}
+            grads_chunk, rets_chunk = {}, {node_name: None for node_name in returns_names_flatten}
             for node_name, tensor in chunk.items():
                 if node_name in maybe_updated_params_names_unflatten.values():
                     params[node_name] = tensor

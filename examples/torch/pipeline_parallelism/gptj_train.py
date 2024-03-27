@@ -1,6 +1,8 @@
-# torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/bert_train.py
+# torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/gptj_train.py
+from email.policy import strict
 import os
 import random
+from functools import partial
 
 from tqdm import tqdm
 
@@ -15,10 +17,10 @@ from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_poin
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.experimental.pp.PipelineStage import Schedule1F1B
 
-from torchtext.datasets import IMDB, AG_NEWS
+from torchtext.datasets import IMDB
 
-from transformers import BertForSequenceClassification, BertTokenizer
-
+from transformers import AutoTokenizer, GPTJForSequenceClassification
+from transformers.models.gptj.modeling_gptj import GPTJAttention
 
 def seed(seed=42):
     # Set seed for PyTorch
@@ -43,27 +45,34 @@ def train_step(model, input_ids, attn_mask, labels, opt):
     opt.step()
     return outputs.logits, loss
 
+compile_device = torch.device('cpu')
+
 def train_bert():
     seed()
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group(rank=rank, world_size=world_size)
+    model_name = "ydshieh/tiny-random-gptj-for-sequence-classification"
+    model = GPTJForSequenceClassification.from_pretrained(model_name).to(compile_device)
+    fix_attention(model)
+    model.train()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        model.resize_token_embeddings(len(tokenizer))
 
-    compile_device = torch.device('cpu')
-    model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=10).to(compile_device).train()
-    split_points = {
-        "bert.embeddings.position_embeddings",
-        "bert.encoder.layer.0",
-        "bert.encoder.layer.8"
-    }
-    assert len(split_points) + 1 == world_size
-    annotate_split_points(model, split_points)
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     def tokenize(x):
         encodings =  tokenizer(x, return_tensors='pt', padding="max_length", max_length=128, truncation=True)
         return encodings['input_ids'], encodings['attention_mask']
-    
+    split_points = {
+        "transformer.drop",
+        "transformer.h.2",
+        "transformer.h.4",
+    }
+    assert len(split_points) + 1 == world_size
+    annotate_split_points(model, split_points)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, foreach=True, capturable=True)
     # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, foreach=True)
 
@@ -71,8 +80,8 @@ def train_bert():
     num_chunks = world_size * 4
 
     def get_iters():
-        return iter(DataLoader(AG_NEWS(split="train"), batch_size=batch_size, shuffle=True)),\
-              iter(DataLoader(AG_NEWS(split="test"), batch_size=batch_size, shuffle=True))
+        return iter(DataLoader(IMDB(split="train"), batch_size=batch_size, shuffle=True)),\
+              iter(DataLoader(IMDB(split="test"), batch_size=batch_size, shuffle=True))
 
     train_iter, test_iter = get_iters()
 
@@ -83,7 +92,7 @@ def train_bert():
 
     compiled_fn = _compile_pp(train_step, "fake", None, None,
                               args, kwargs, Schedule1F1B, None, None, None,
-                              num_chunks)
+                              num_chunks, strict=False)
 
     def test(module, valid_dataloader, epoch, outputs):
         device = torch.device('cuda:0')
@@ -144,6 +153,73 @@ def train_bert():
     torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
 
+
+
+def fix_attention(
+        model):  # GPTJAttention wasn't natively compilable, need to fix it
+    dtype = torch.float32
+    mask_value = torch.finfo(dtype).min
+
+    # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+    # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+
+    def _attn(
+        self,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        head_mask=None,
+    ):
+        # compute causal mask from causal mask buffer
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length -
+                                query_length:key_length, :key_length]
+
+        # Keep the attention weights computation in fp32 to avoid overflow issues
+        query = query.to(torch.float32)
+        key = key.to(torch.float32)
+
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+        # mask_value = torch.finfo(attn_weights.dtype).min
+        # # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+        # # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+        # mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+        attn_weights = torch.where(
+            causal_mask, attn_weights,
+            self.mask_value)  # make this mask value traceable
+
+        attn_weights = attn_weights / self.scale_attn
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        attn_output = torch.matmul(attn_weights, value)
+
+        return attn_output, attn_weights
+
+    for submod in model.modules():
+        if isinstance(submod, GPTJAttention):
+            submod.register_buffer(
+                "mask_value",
+                torch.tensor(mask_value, dtype=dtype).to(compile_device))
+            submod._attn = partial(_attn, submod)
+            scale_attn = submod.scale_attn
+            del submod.scale_attn
+            submod.register_buffer("scale_attn", scale_attn)
+            embed_positions = submod.embed_positions
+            del submod.embed_positions
+            submod.register_buffer("embed_positions", embed_positions)
 
 if __name__ == '__main__':
     train_bert()
