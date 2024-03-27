@@ -137,3 +137,12 @@ dmypy.json
 # setup
 dist/
 build/
+
+# graphviz output
+*.dot
+
+# torchvision dataset
+data
+
+# pt file
+*.pt
