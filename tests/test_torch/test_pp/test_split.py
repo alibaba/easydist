@@ -119,7 +119,7 @@ def train_step_t5(input, label, model, opt):
 
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
-    compile_device = runtime_device = torch.device("cpu")
+    compile_device = runtime_device = torch.device("cuda")
     module = module.train().to(compile_device)
     opt = None  # inference only
     # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
@@ -187,7 +187,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
-                                           tracing_mode='fake',
+                                           tracing_mode='symbolic',
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
                                            _allow_non_fake_inputs=False)(params, buffers,
                                                                          named_states, args,
@@ -210,7 +210,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     stateless_func_args_copy = pytree.tree_map(arg_copy_func, stateless_func_args)
 
-    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
+    compiled_meta, compiled_stages, local_gm, erased_tensor_keys = compile_pipeline(traced_stateless_func,
                                                                 nstages,
                                                                 stateless_func_args,
                                                                 strict=False)
@@ -259,18 +259,18 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
             stateless_func_args_copy[1] = out_copy[1]
             stateless_func_args_copy[2] = out_copy[2]
 
+    for di, di_ in zip(out_unflatten[:-1], out_copy[:-1]):
+        for k, v in di.items():
+            if v is None:
+                assert k in erased_tensor_keys
+                continue
+            assert torch.allclose(v, di_[k])
+
     ret, ret_= out_unflatten[-1], out_copy[-1]
 
     if not isinstance(ret, tuple): # orig traced func migh not be tuple
         ret = (ret, )
         ret_ = (ret_,)
-    
-    for di, di_ in zip(out_unflatten[:-1], out_copy[:-1]):
-        for k, v in di.items():
-            if v is None:
-                assert di_[k] is None
-                continue
-            assert torch.allclose(v, di_[k])
 
     for v, v_ in zip(ret, ret_):
         assert torch.allclose(v, v_)
@@ -349,7 +349,7 @@ if __name__ == '__main__':
     test_main(vgg19(), split_into_equal_size(3), gen_rand_input_imagenet, train_step)
     test_main(vit_b_16().half(), split_into_equal_size(10), gen_rand_input_vit, train_step)
 
-    # ======== nlp models (mainly transformers)========
+    # ======== transformers ========
     from transformers import OpenAIGPTModel, OpenAIGPTConfig
     test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
         'h.3',

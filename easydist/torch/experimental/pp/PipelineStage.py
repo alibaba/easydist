@@ -174,7 +174,7 @@ class PipelineStageBase:
         self.group_rank = dist.get_rank(group)
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
-        self.gather_output = gather_output
+        self.return_to_all_stages = gather_output
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
@@ -573,16 +573,16 @@ class PipelineStageBase:
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
 
-    def gather_outputs(self, rank):
-        outputs_all_stages = [None for _ in range(self.num_stages)]
-        dist.gather_object(self.outputs_batch,
-                           outputs_all_stages if self.group_rank == rank else None,
-                           dst=rank)
-        all_graph_outputs = {}
-        if self.group_rank == rank:  # other rank receive None s
-            for outputs in outputs_all_stages:
-                all_graph_outputs.update(outputs)
-        return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
+    # def gather_outputs(self, rank):
+    #     outputs_all_stages = [None for _ in range(self.num_stages)]
+    #     dist.gather_object(self.outputs_batch,
+    #                        outputs_all_stages if self.group_rank == rank else None,
+    #                        dst=rank)
+    #     all_graph_outputs = {}
+    #     if self.group_rank == rank:  # other rank receive None s
+    #         for outputs in outputs_all_stages:
+    #             all_graph_outputs.update(outputs)
+    #     return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
 
     def gather_state_dict(self, rank):
         state_dicts = [None for _ in range(self.num_stages)]
@@ -604,7 +604,9 @@ class PipelineStageBase:
         all_graph_outputs = {}
         for output_stage in outputs_all_gather:
             all_graph_outputs.update(output_stage)
-        return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)[-1] # TODO @botbw: should be strict, but some states are erased
+        outputs = graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
+        outputs = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), outputs)
+        return outputs  # TODO @botbw: should be strict, but some states are erased
 
     def all_gather_returns(self):
         returns_all_gather = [None for _ in range(self.num_stages)]
@@ -616,7 +618,9 @@ class PipelineStageBase:
             for k, v, in returns_stage.items():
                 if v is not None:
                     all_returns[k] = v
-        return graph_outputs_to_func_outputs(self.compiled_meta, all_returns, strict=False)[-1]
+        ret = graph_outputs_to_func_outputs(self.compiled_meta, all_returns, strict=False)[-1]
+        ret = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), ret)
+        return ret
 
     def __call__(self, *args, **kwargs) -> None:
         args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
@@ -639,11 +643,10 @@ class PipelineStageBase:
 
         logger.debug(f"[{self.group_rank}] All sends finished")
 
-        if self.gather_output:
+        if self.return_to_all_stages:
             ret = self.all_gather_returns()
         else:
             ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
-        ret = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), ret)
         return ret
 
 

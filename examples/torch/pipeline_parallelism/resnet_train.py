@@ -1,5 +1,6 @@
 # torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
 import os
+import sys
 import random
 
 import numpy as np
@@ -16,7 +17,6 @@ from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.experimental.pp.PipelineStage import ScheduleGPipe, ScheduleDAPPLE
 from easydist.torch.experimental.pp.microbatch import CustomReducer, TensorChunkSpec, Replicate
 
-from tqdm import tqdm
 
 
 def seed(seed=42):
@@ -52,6 +52,11 @@ def test_main():
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    if rank != 0:
+        f = open(os.devnull, 'w')
+        sys.stdout = f
+
+
     dist.init_process_group(rank=rank, world_size=world_size)
 
     compile_device = torch.device('cpu')
@@ -60,8 +65,8 @@ def test_main():
     module.fc = torch.nn.Linear(512, 10).to(compile_device)
     _, module = split_into_equal_size(world_size)(module)
 
-    # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True, momentum=0.9)
+    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
     num_chunks = world_size * 4 # high comm overhead
@@ -86,30 +91,38 @@ def test_main():
                        ScheduleDAPPLE, args_chunk_spec, kwargs_chunk_spec,
                        output_chunk_spec, num_chunks)
 
+
+    def validation(module, valid_dataloader, epoch, params, buffers):
+        module.load_state_dict({**params, **buffers})
+        module.to(rank)
+        module.eval()
+        correct_cnt = 0
+        all_cnt = 0
+        for x_batch, y_batch in valid_dataloader:
+            x_batch = x_batch.to(f'cuda:{rank}')
+            y_batch = y_batch.to(f'cuda:{rank}')
+            out = module(x_batch)
+            preds = out.argmax(-1)
+            correct_cnt += (preds == y_batch).sum()
+            all_cnt += len(y_batch)
+        print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
+
     epochs = 5
     for epoch in range(epochs):
-        all_cnt = 0
-        correct_cnt = 0
-        loss_sum = 0
-        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True)
-                                 if rank == 0 else train_dataloader):
+        all_cnt, correct_cnt, loss_sum = 0, 0, 0
+        for x_batch, y_batch in train_dataloader:
             if x_batch.size(0) != batch_size:  # TODO need to solve this
                 continue
-            ret = compiled_fn(x_batch, y_batch, module, opt)
-            if rank == world_size - 1:
-                out, loss = ret
-                all_cnt += len(out)
-                preds = out.argmax(-1)
-                correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
-                loss_sum += loss.item()
+            out, loss = compiled_fn(x_batch, y_batch, module, opt)
+            all_cnt += len(out)
+            preds = out.argmax(-1)
+            correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
+            loss_sum += loss.item()
 
-        if rank == world_size - 1:
-            print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
+        print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
 
-        valid_rank = 0
-        outputs = compiled_fn.gather_outputs(valid_rank)
-        if rank == valid_rank:
-            validation(module, valid_dataloader, epoch, outputs)
+        params, buffers, _, _, _ = compiled_fn.all_gather_outputs()
+        validation(module, valid_dataloader, epoch, params, buffers)
 
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
@@ -121,23 +134,6 @@ def test_main():
 
     torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
     torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
-
-def validation(module, valid_dataloader, epoch, outputs):
-    device = torch.device('cuda:0')
-    params, buffers, _, _, _ = outputs
-    module.load_state_dict({**params, **buffers})
-    module.eval()
-    module.to(device)
-    correct_cnt = 0
-    all_cnt = 0
-    for x_batch, y_batch in (tqdm(valid_dataloader, dynamic_ncols=True)):
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
-        out = module(x_batch)
-        preds = out.argmax(-1)
-        correct_cnt += (preds == y_batch).sum()
-        all_cnt += len(y_batch)
-    print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
 
 if __name__ == '__main__':
     test_main()
