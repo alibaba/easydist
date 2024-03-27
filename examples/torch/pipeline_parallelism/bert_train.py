@@ -81,7 +81,7 @@ def train_bert():
     args = [model, input_ids.to(compile_device), attn_mask.to(compile_device), y.to(compile_device), optimizer]
     kwargs = {}
 
-    compiled_fn = _compile_pp(train_step, None, SetParaInitHelper(), None,
+    compiled_fn = _compile_pp(train_step, "fake", SetParaInitHelper(), None,
                               args, kwargs, Schedule1F1B, None, None, None,
                               num_chunks)
 

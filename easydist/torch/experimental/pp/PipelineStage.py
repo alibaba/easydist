@@ -217,7 +217,7 @@ class PipelineStageBase:
                                 kwargs_chunk_spec):
         node_val_chunk_spec = {}
         args_nodes_flatten, _ = pytree.tree_flatten(compiled_meta.args_nodes_unflatten)
-        args_chunk_spec = args_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(args_nodes_flatten)
+        args_chunk_spec = args_chunk_spec or [None] * len(args_nodes_flatten)  # input could be non tensor, use None instead of TensorChunkSpec
         args_chunk_spec_flatten, _ = pytree.tree_flatten(args_chunk_spec)
         assert len(args_chunk_spec_flatten) == len(args_nodes_flatten)
         for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec_flatten):
@@ -308,19 +308,11 @@ class PipelineStageBase:
         self.stage_index_to_group_rank = stage_index_to_group_rank
 
         # chunk : Dict of kwarg buffers
-        self.fw_kwargs_recv_info: Dict[int, Dict] = {}
-        for chunk in range(self.num_chunks):
-            self.fw_kwargs_recv_info[chunk] = self._create_recv_buffers(node_metas, self.fw_node)
-
+        self.fw_kwargs_recv_info = self._create_recv_buffers(node_metas, self.fw_node)
         self.fw_act_send_info = self._create_send_info(self.fw_node)
 
         if self.bw_node is not None:
-            self.bw_args_recv_info: Dict[int, Tuple] = {}
-            self.bw_kwargs_recv_info: Dict[int, Dict] = {}
-            for chunk in range(self.num_chunks):
-                self.bw_kwargs_recv_info[chunk] = self._create_recv_buffers(
-                    node_metas, self.bw_node)
-
+            self.bw_kwargs_recv_info = self._create_recv_buffers(node_metas, self.bw_node)
             self.bw_grad_send_info = self._create_send_info(self.bw_node)
 
     def get_stage_index_of_node_name(
@@ -425,7 +417,7 @@ class PipelineStageBase:
                 kwargs,
                 self.num_chunks,
                 None,
-                None,
+                self.inputs_nodes_chunk_spec,
             )
 
     def _recv_and_fill_inputs(
@@ -445,7 +437,7 @@ class PipelineStageBase:
 
         composite_kwargs = {}
 
-        for kw, info in kwargs_recv_info[chunk].items():
+        for kw, info in kwargs_recv_info.items():
             if isinstance(info, RecvInfo):
                 composite_kwargs[kw] = act_recv(info)
             else:
@@ -505,7 +497,7 @@ class PipelineStageBase:
         chunk: int,
     ) -> List[dist.Work]:
         # Receive grads
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_args_recv_info,
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.kwargs_split,
                                                             self.bw_kwargs_recv_info, chunk)
 
         # Compute backward
