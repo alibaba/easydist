@@ -138,7 +138,7 @@ def _compile_pp(func,
                              num_chunks=num_chunks,
                              args_chunk_spec=args_chunk_spec,
                              kwargs_chunk_spec=kwargs_chunk_spec,
-                             outputs_chunk_spec=outputs_chunk_spec,
+                             returns_chunk_spec=outputs_chunk_spec,
                              device=torch.device(f"cuda:{rank % torch.cuda.device_count()}"))
 
     return pipe

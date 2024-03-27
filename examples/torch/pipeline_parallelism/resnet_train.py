@@ -1,4 +1,4 @@
-# torchrun --nproc_per_node 4 $(pwd)/examples/torch/pipeline_parallelism/resnet.py
+# torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
 import os
 import random
 

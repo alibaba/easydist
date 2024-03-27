@@ -16,7 +16,7 @@ import torch.utils._pytree as pytree
 from easydist.torch.experimental.pp.compile_pipeline import (
     CompiledMeta, CompiledStage, StateType,
     graph_outputs_to_func_outputs)
-from easydist.torch.experimental.pp.microbatch import (CustomReducer, TensorChunkSpec,
+from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer, TensorChunkSpec,
                                                        merge_chunks, split_args_kwargs_into_chunks)
 from easydist.torch.experimental.pp.utils import modify_graph_op_device
 
@@ -149,7 +149,7 @@ class PipelineStageBase:
         num_chunks: int,
         args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
         kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
-        outputs_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
+        returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
         device: torch.device,
         group: Optional[dist.ProcessGroup] = None,
         gather_output=True
@@ -163,10 +163,9 @@ class PipelineStageBase:
         self.stage_idx = stage_idx
         self.compiled_stage = compiled_stage
         self.num_chunks = num_chunks
-        self.node_val_chunk_spec = self._get_graph_inputs_chunk(compiled_meta, args_chunk_spec,
+        self.inputs_nodes_chunk_spec = self._get_inputs_nodes_spec(compiled_meta, args_chunk_spec,
                                                                 kwargs_chunk_spec)
-        assert outputs_chunk_spec is None, "Don't support custom merge for now"
-        self.outputs_chunk_spec = outputs_chunk_spec
+        self.returns_nodes_chunk_spec = self._get_returns_nodes_spec(compiled_meta, returns_chunk_spec)
         self.device = device
         self.group = group
 
@@ -214,20 +213,32 @@ class PipelineStageBase:
                 assert self.step_node is None, "Multiple step nodes found"
                 self.step_node = node
 
-    def _get_graph_inputs_chunk(self, compiled_meta: CompiledMeta, args_chunk_spec,
+    def _get_inputs_nodes_spec(self, compiled_meta: CompiledMeta, args_chunk_spec,
                                 kwargs_chunk_spec):
         node_val_chunk_spec = {}
-        if args_chunk_spec is None:
-            args_chunk_spec = [None] * len(compiled_meta.args_nodes_unflatten)
-        assert len(args_chunk_spec) == len(compiled_meta.args_nodes_unflatten)
-        for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec):
+        args_nodes_flatten, _ = pytree.tree_flatten(compiled_meta.args_nodes_unflatten)
+        args_chunk_spec = args_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(args_nodes_flatten)
+        args_chunk_spec_flatten, _ = pytree.tree_flatten(args_chunk_spec)
+        assert len(args_chunk_spec_flatten) == len(args_nodes_flatten)
+        for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec_flatten):
             node_val_chunk_spec[node_name] = arg_chunk_spec
-        if kwargs_chunk_spec is None:
-            kwargs_chunk_spec = {k: None for k in compiled_meta.kwargs_nodes_unflatten}
-        assert set(kwargs_chunk_spec.keys()) == set(compiled_meta.kwargs_nodes_unflatten)
-        for node_name, kwarg_chunk_spec in kwargs_chunk_spec.items():
+        
+        kwargs_nodes_flatten, spec1 = pytree.tree_flatten(compiled_meta.kwargs_nodes_unflatten)
+        kwargs_chunk_spec = kwargs_chunk_spec or {node_name: TensorChunkSpec(DEFAULT_CHUNK_DIM) for node_name in kwargs_nodes_flatten}
+        kwargs_chunk_spec_flatten, spec2 = pytree.tree_flatten(kwargs_chunk_spec)
+        assert spec1 == spec2
+        for node_name, kwarg_chunk_spec in zip(kwargs_nodes_flatten, kwargs_chunk_spec_flatten):
             node_val_chunk_spec[node_name] = kwarg_chunk_spec
         return node_val_chunk_spec
+
+    def _get_returns_nodes_spec(self, compiled_meta, returns_chunk_spec):
+        returns_nodes_chunk_spec = {}
+        returns_chunk_spec = returns_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(compiled_meta.returns_nodes_flatten)
+        returns_chunk_spec_flatten, _ = pytree.tree_flatten(returns_chunk_spec)
+        assert len(returns_chunk_spec_flatten) == len(compiled_meta.returns_nodes_flatten)
+        for name, spec in zip(compiled_meta.returns_nodes_flatten, returns_chunk_spec_flatten):
+            returns_nodes_chunk_spec[name] = spec
+        return returns_nodes_chunk_spec
 
     def _move_or_init_inject_states(self):
         # Move submodule to indicated device if possible
@@ -533,7 +544,6 @@ class PipelineStageBase:
         updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_nodes_unflatten
         nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_nodes_unflatten
         returns_names_flatten = self.compiled_meta.returns_nodes_flatten
-        returns_spec = self.compiled_meta.out_spec.children_specs[-1]
 
         params = {}
         buffers = {}
@@ -542,7 +552,7 @@ class PipelineStageBase:
         rets = []
         for chunk in self.outputs_chunks:
             grads_chunk = {}
-            rets_chunk = [None for _ in range(len(returns_names_flatten))]
+            rets_chunk = {node_name: None for node_name in returns_names_flatten}
             for node_name, tensor in chunk.items():
                 if node_name in maybe_updated_params_names_unflatten.values():
                     params[node_name] = tensor
@@ -553,14 +563,13 @@ class PipelineStageBase:
                 elif node_name in nones_or_grads_names_unflatten.values():
                     grads_chunk[node_name] = tensor
                 elif node_name in returns_names_flatten:
-                    rets_chunk[returns_names_flatten.index(node_name)] = tensor
+                    rets_chunk[node_name] = tensor
                 else:
                     raise RuntimeError(f"Unknown output {node_name}")
             grads.append(grads_chunk)
             rets.append(rets_chunk)
 
-        rets = merge_chunks(rets, self.outputs_chunk_spec)
-        rets = {k: v for k, v in zip(returns_names_flatten, rets)}
+        rets = merge_chunks(rets, self.returns_nodes_chunk_spec)
         grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
         self.outputs_batch = {**params, **buffers, **optimstates, **grads, **rets}
