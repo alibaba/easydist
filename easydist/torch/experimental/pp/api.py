@@ -10,7 +10,7 @@ from torch.nn.utils import stateless
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
-                                                             set_backward_flag)
+                                                             set_backward_flag, set_step_flag)
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
@@ -103,6 +103,7 @@ def _compile_pp(func,
 
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)
+        set_step_flag(False)
         traced_stateless_func = ed_make_fx(partial(stateless_func, func),
                                            tracing_mode='fake',
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -122,7 +123,7 @@ def _compile_pp(func,
     }
     stateless_func_args = [params, buffers, named_states, args, kwargs]
 
-    compiled_meta, compiled_stages, local_gm = compile_pipeline(traced_stateless_func,
+    compiled_meta, compiled_stages, local_gm, _ = compile_pipeline(traced_stateless_func,
                                                                 world_size,
                                                                 stateless_func_args,
                                                                 init_helper=init_helper,

@@ -1,3 +1,4 @@
+# torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/bert_train.py
 import os
 import random
 
@@ -63,7 +64,7 @@ def train_bert():
         encodings =  tokenizer(x, return_tensors='pt', padding="max_length", max_length=128, truncation=True)
         return encodings['input_ids'], encodings['attention_mask']
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, foreach=True, capturable=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, foreach=True, capturable=True)
     # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, foreach=True)
 
     batch_size = 64 # ~ 50 iters
@@ -126,7 +127,7 @@ def train_bert():
             print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
 
         valid_rank = 0
-        outputs = compiled_fn.all_gather_outputs(valid_rank)
+        outputs = compiled_fn.gather_outputs(valid_rank)
         if rank == valid_rank:
             test(model, test_iter, epoch, outputs)
         

@@ -107,7 +107,7 @@ def test_main():
             print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
 
         valid_rank = 0
-        outputs = compiled_fn.all_gather_outputs(valid_rank)
+        outputs = compiled_fn.gather_outputs(valid_rank)
         if rank == valid_rank:
             validation(module, valid_dataloader, epoch, outputs)
 

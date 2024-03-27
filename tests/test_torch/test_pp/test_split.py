@@ -18,10 +18,8 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (
-    SplitPatcher, StateType, after_split_register, annotate_split_points, before_split_register, compile_pipeline,
-    graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict, split_into_equal_size, set_backward_flag,
-    func_inputs_to_graph_inputs_by_stages, tuple_after_split, tuple_before_split)
-from easydist.torch.experimental.pp.PipelineStage import modify_graph_op_device
+    SplitPatcher, annotate_split_points, compile_pipeline,
+    graph_outputs_to_func_outputs, split_into_equal_size, set_backward_flag)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
@@ -121,8 +119,7 @@ def train_step_t5(input, label, model, opt):
 
 
 def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_func):
-    compile_device = torch.device("cpu")
-    runtime_device = torch.device("cuda")
+    compile_device = runtime_device = torch.device("cpu")
     module = module.train().to(compile_device)
     opt = None  # inference only
     # opt = torch.optim.Adam(module.parameters(), lr=0.123456789, foreach=True, capturable=True)
@@ -139,7 +136,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
 
     rand_input = rand_input_gen_method().to(compile_device)
     label = torch.tensor([random.random() for _ in range(rand_input.shape[0])]).to(compile_device)
-    args = [rand_input, label, module, opt]
+    args = (rand_input, label, module, opt)
     kwargs = {}
 
     # Copied from _compile
@@ -201,7 +198,6 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
     traced_stateless_func.recompile()
     ##################################################################################################
 
-    # print("traced_graph:\n", traced_graph.code)
     save_graphviz_dot(traced_stateless_func, 'traced_graph')
 
     stateless_func_args = [params, buffers, named_states, args, kwargs]
@@ -219,28 +215,6 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                                                                 stateless_func_args,
                                                                 strict=False)
 
-    modify_graph_op_device(local_gm, runtime_device)
-    for compiled_stage in compiled_stages:
-        for name, tensor in compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
-                runtime_device)
-        for name, tensor in compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
-                runtime_device)
-        for name, tensor in compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES].items():
-            assert not (isinstance(tensor, FakeTensor) or tensor.is_meta)
-            compiled_stage.step_gm.injected_states[StateType.OPTIMSTATES][name] = tensor.to(
-                runtime_device)
-
-    def move_to_runtime_device(x):
-        if isinstance(x, torch.Tensor):
-            return x.to(runtime_device)
-        else:
-            return x
-
-    stateless_func_args_copy = pytree.tree_map(move_to_runtime_device, stateless_func_args_copy)
 
     epochs = 2
     dataset = []
@@ -255,41 +229,49 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         for rand_input, label in dataset:
             args = (rand_input, label, module, opt)
             kwargs = {}
-            kwargs_stage = func_inputs_to_graph_inputs_by_stages(compiled_meta, *args, **kwargs)
-            input_dict = {}
-            for di in kwargs_stage:
-                input_dict.update(di)
-            local_gm(**input_dict)
+            args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
+            args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten((compiled_meta.args_nodes_unflatten, compiled_meta.kwargs_nodes_unflatten))
+            assert spec_val == spec_node, "Mismatched args/kwargs"
+
+            input_node_vals = {}
+            for node, val in zip(args_kwargs_nodes_flatten, args_kwargs_vals_flatten):
+                if isinstance(val, torch.Tensor):
+                    val = val.to(runtime_device)
+                input_node_vals[node] = val
+            local_gm(**input_node_vals)
 
     outputs = {}
     for stage in compiled_stages:
         outputs.update(stage.outputs)
 
-    out_unflatten = graph_outputs_to_func_outputs_non_strict(compiled_meta, outputs)
+    out_unflatten = graph_outputs_to_func_outputs(compiled_meta, outputs, strict=False)
 
     seed()
     with torch.no_grad():
         for rand_input, label in dataset:
+            stateless_func_args_copy[3] = list(stateless_func_args_copy[3])
             stateless_func_args_copy[3][0] = rand_input
             stateless_func_args_copy[3][1] = label
+
             out_copy = traced_stateless_func(*stateless_func_args_copy)
-            
+
             stateless_func_args_copy[0] = out_copy[0]  # will update inplace?
             stateless_func_args_copy[1] = out_copy[1]
             stateless_func_args_copy[2] = out_copy[2]
 
-    params, buffers, named_states, grads, ret = out_unflatten
-    params_, buffers_, named_states_, grads_, ret_ = out_copy
-    if not isinstance(ret_, tuple):
+    ret, ret_= out_unflatten[-1], out_copy[-1]
+
+    if not isinstance(ret, tuple): # orig traced func migh not be tuple
+        ret = (ret, )
         ret_ = (ret_,)
-    for k, v in params.items():
-        assert torch.allclose(v, params_[k])
-    for k, v in buffers.items():
-        assert torch.allclose(v, buffers_[k])
-    for k, v in named_states.items():
-        assert torch.allclose(v, named_states_[k])
-    for k, v in grads.items():
-        assert torch.allclose(v, grads_[k])
+    
+    for di, di_ in zip(out_unflatten[:-1], out_copy[:-1]):
+        for k, v in di.items():
+            if v is None:
+                assert di_[k] is None
+                continue
+            assert torch.allclose(v, di_[k])
+
     for v, v_ in zip(ret, ret_):
         assert torch.allclose(v, v_)
 

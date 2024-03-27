@@ -30,12 +30,17 @@ class SubmodType(Enum):
     BW = "bw"
     STEP = "step"
 
-
+# TODO @botbw simplify this
 @dataclass
 class CompiledMeta:
     nstages: int
 
+    # tracestateless_func spec
+    in_spec: pytree.TreeSpec
+    out_spec: pytree.TreeSpec
+
     # input meta
+    input_nodes_flatten: Tuple[str, ...]
     params_nodes_unflatten: Dict[str, str]
     buffers_nodes_unflatten: Dict[str, str]
     optimstates_nodes_unflatten: Dict[str, Dict[str, str]]
@@ -49,12 +54,13 @@ class CompiledMeta:
     inv_optimstates_type: Dict[str, str]
 
     # output meta
+    output_nodes_flatten: Tuple[str, ...]
     output_params_nodes_unflatten: Dict[str, str]
     output_buffers_nodes_unflatten: Dict[str, str]
     output_optimstates_nodes_unflatten: Dict[str, Dict[str, str]]
-    output_optimstates_nodes_flatten: List[str]
+    output_optimstates_nodes_flatten: Tuple[str, ...]
     nones_or_grads_nodes_unflatten: Dict[str, str]
-    returns_nodes_unflatten: Union[Tuple[str, ...]]
+    returns_nodes_flatten: Tuple[str, ...]
 
     # output node to input node mapping
     output2input_params: Dict[str, str]
@@ -87,7 +93,8 @@ class EDGraphModule:
 class CompiledStage:  # TODO @botbw: make this picklable
 
     def __init__(self, compiled_meta: CompiledMeta, fw_gm: EDGraphModule,
-                 bw_gm: Optional[EDGraphModule], full_step_gm: Optional[EDGraphModule]):
+                 bw_gm: Optional[EDGraphModule], full_step_gm: Optional[EDGraphModule], strict: bool = True):
+        self.strict = strict
         self.compiled_meta = compiled_meta
         self.fw_gm = fw_gm
         params_and_buffers = (set(fw_gm.injected_states[StateType.PARAMS].keys())
@@ -163,13 +170,13 @@ class CompiledStage:  # TODO @botbw: make this picklable
         for output_name, output in zip(self.fw_gm.outputs_spec, output_from_gm):
             if (output_name in self.fw_func_returns) \
                 or (self.has_bw() and output_name in self.activation_nodes) \
-                    or (output_name in self.compiled_meta.returns_nodes_unflatten) \
+                    or (output_name in self.compiled_meta.returns_nodes_flatten) \
                         or (output_name in self.compiled_meta.output2input_buffers): # TODO @botbw: simplify this
                 if output_name in self.fw_func_returns:  # output in next stages
                     ret[output_name] = output
                 if self.has_bw() and output_name in self.activation_nodes:  # output in activations
                     activations_chunk[output_name] = output
-                if output_name in self.compiled_meta.returns_nodes_unflatten:  # output in returns
+                if output_name in self.compiled_meta.returns_nodes_flatten:  # output in returns
                     outputs_chunk[output_name] = output
                 if (output_name
                         in self.compiled_meta.output2input_buffers):  # output is updated buffer
@@ -178,7 +185,10 @@ class CompiledStage:  # TODO @botbw: make this picklable
                     self.fw_gm.injected_states[StateType.BUFFERS][
                         input_node_name] = output  # update buffer in case it's not updated in place.
             else:
-                raise RuntimeError(f"output {output_name} not sure where to go")
+                if self.strict:
+                    raise RuntimeError(f"output {output_name} not sure where to go")
+                else:
+                    logging.warning(f"output {output_name} not sure where to go")
 
         return ret
 
@@ -221,7 +231,10 @@ class CompiledStage:  # TODO @botbw: make this picklable
             elif output_name in self.bw_gm.call_module_users:
                 ret[output_name] = output
             else:
-                raise RuntimeError(f"output {output_name} not sure where to go")
+                if self.strict:
+                    raise RuntimeError(f"output {output_name} not sure where to go")
+                else:
+                    logging.warning(f"output {output_name} not sure where to go")
         return ret
 
     @torch.no_grad
@@ -258,8 +271,10 @@ class CompiledStage:  # TODO @botbw: make this picklable
                 self.step_gm.injected_states[StateType.OPTIMSTATES][
                     input_node_name] = ret  # update optimstates in case it's not updated in place.
             else:
-                raise RuntimeError(f"output {output} not sure where to go")
-
+                if self.strict:
+                    raise RuntimeError(f"output {output} not sure where to go")
+                else:
+                    logging.warning(f"output {output} not sure where to go")
         return None  # step should always return None
 
     def has_step(self):
@@ -329,7 +344,7 @@ def set_tracer_global(tracer):
 # ================================= section end ========================================
 
 __backward_flag = False
-
+__step_flag = False
 
 def get_backward_flag():
     global __backward_flag
@@ -339,6 +354,16 @@ def get_backward_flag():
 def set_backward_flag(flag):
     global __backward_flag
     __backward_flag = flag
+
+
+def get_step_flag():
+    global __step_flag
+    return __step_flag
+
+
+def set_step_flag(flag):
+    global __step_flag
+    __step_flag = flag
 
 
 @fx.has_side_effect
@@ -680,6 +705,7 @@ class SplitPatcher(_Patcher):
             def step_wrapper(opt, *args, **kwargs):
                 step_split_point()
                 orig_step(opt, *args, **kwargs)
+                set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
 
@@ -880,100 +906,10 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                          ed_gm.call_module_users, ed_gm.name)
 
 
-def func_inputs_to_graph_inputs_by_stages(compiled_meta: CompiledMeta,
-                                          *args,
-                                          move_to_device=False,
-                                          **kwargs):
-    nstages = compiled_meta.nstages
-    args_names_unflatten = compiled_meta.args_nodes_unflatten
-    kwargs_names_unflatten = compiled_meta.kwargs_nodes_unflatten
-    name_to_stage_idx = compiled_meta.node_to_stage_idx
-
-    stage_kwargs = [{} for _ in range(nstages)]
-    assert len(args) == len(args_names_unflatten), "args should have the same length as args_names"
-    for arg_name, arg_val in zip(args_names_unflatten, args):
-        if not arg_name in name_to_stage_idx:
-            continue
-        stage_idx = name_to_stage_idx[arg_name]
-        if move_to_device:
-            arg_val = arg_val.to(f'cuda:{stage_idx}')  # TODO @botbw: improve this
-        stage_kwargs[stage_idx][arg_name] = arg_val
-
-    assert set(kwargs.keys()) == set(
-        kwargs_names_unflatten.keys()), "kwargs should have the same keys as kwargs_names"
-    for k, v in kwargs.items():
-        if not k in name_to_stage_idx:
-            continue
-        stage_idx = name_to_stage_idx[k]
-        stage_kwargs[stage_idx][kwargs_names_unflatten[k]] = v
-    return stage_kwargs
-
-
-def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str,
-                                                                                  torch.Tensor]):
-    maybe_updated_params_names_unflatten = compiled_meta.output_params_nodes_unflatten
-    maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_nodes_unflatten
-    updated_optimstates_names_unflatten = compiled_meta.output_optimstates_nodes_unflatten
-    nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_nodes_unflatten
-    returns_names_unflatten = compiled_meta.returns_nodes_unflatten
-
-    ret = []
-    ret.append({
-        torch_name: node_outputs[node_name]
-        for torch_name, node_name in maybe_updated_params_names_unflatten.items()
-    })
-    ret.append({
-        torch_name: node_outputs[node_name]
-        for torch_name, node_name in maybe_updated_buffers_names_unflatten.items()
-    })
-    optimstates = defaultdict(dict)
-    for torch_name, state_dict in updated_optimstates_names_unflatten.items():
-        for typ, ph_name in state_dict.items():
-            optimstates[torch_name][typ] = node_outputs[ph_name]
-
-    ret.append(dict(optimstates))
-    ret.append({
-        torch_name: node_outputs[node_name]
-        for torch_name, node_name in nones_or_grads_names_unflatten.items()
-    })
-    ret.append(tuple(node_outputs[node_name] for node_name in returns_names_unflatten))
-    return ret
-
-
-def graph_outputs_to_func_outputs_non_strict(compiled_meta: CompiledMeta, outputs_dict):
-    maybe_updated_params_names_unflatten = compiled_meta.output_params_nodes_unflatten
-    maybe_updated_buffers_names_unflatten = compiled_meta.output_buffers_nodes_unflatten
-    updated_optimstates_names_unflatten = compiled_meta.output_optimstates_nodes_unflatten
-    nones_or_grads_names_unflatten = compiled_meta.nones_or_grads_nodes_unflatten
-    returns_names_unflatten = compiled_meta.returns_nodes_unflatten
-
-    ret = []
-    ret.append({
-        torch_name: outputs_dict[node_name]
-        for torch_name, node_name in maybe_updated_params_names_unflatten.items()
-        if node_name in outputs_dict
-    })
-    ret.append({
-        torch_name: outputs_dict[node_name]
-        for torch_name, node_name in maybe_updated_buffers_names_unflatten.items()
-        if node_name in outputs_dict
-    })
-    optimstates = defaultdict(dict)
-    for torch_name, state_dict in updated_optimstates_names_unflatten.items():
-        for typ, ph_name in state_dict.items():
-            if ph_name in outputs_dict:
-                optimstates[torch_name][typ] = outputs_dict[ph_name]
-
-    ret.append(dict(optimstates))
-    ret.append({
-        torch_name: outputs_dict[node_name]
-        for torch_name, node_name in nones_or_grads_names_unflatten.items()
-        if node_name in outputs_dict
-    })
-    ret.append(
-        tuple(outputs_dict[node_name] if node_name in outputs_dict else None
-              for node_name in returns_names_unflatten))
-    return ret
+def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str, torch.Tensor], strict: bool=True):
+    return pytree.tree_unflatten(
+        [node_outputs[node_name] if (strict or node_name in node_outputs) else None for node_name in compiled_meta.output_nodes_flatten],
+        compiled_meta.out_spec)
 
 
 def compile_pipeline(
@@ -984,16 +920,17 @@ def compile_pipeline(
     strict=True  # report error if not all params and buffers are used
 ) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
     is_backward_called = get_backward_flag()
+    is_step_called = get_step_flag()
 
-    input_nodes_flatten = [
+    input_nodes_flatten = tuple(
         ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder'
-    ]
+    )
     inputs_nodes_unflatten = pytree.tree_unflatten(input_nodes_flatten,
                                                    traced_stateless_func._in_spec)
 
-    output_nodes_flatten = [
+    output_nodes_flatten = tuple(
         node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]
-    ]
+    )
     output_nodes_unflatten = pytree.tree_unflatten(output_nodes_flatten,
                                                    traced_stateless_func._out_spec)
 
@@ -1001,8 +938,8 @@ def compile_pipeline(
     params, buffers, optimstates, args, kwargs = stateless_func_args
     params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten, args_nodes_unflatten, kwargs_nodes_unflatten = inputs_nodes_unflatten
     output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, nones_or_grads_nodes_unflatten, returns_nodes_unflatten = output_nodes_unflatten
+    returns_nodes_flatten, _ = pytree.tree_flatten(returns_nodes_unflatten)
     output_optimstates_nodes_flatten, _ = pytree.tree_flatten(output_optimstates_nodes_unflatten)
-    returns_nodes_unflatten = _to_tuple(returns_nodes_unflatten)  # returns might be value or tuple
 
     # given node name, use inv to find the torch name
     inv_params = {
@@ -1103,18 +1040,12 @@ def compile_pipeline(
                     if gi_user.op == 'call_module':
                         call_module_users[gi.name].add(gi_user.name)
         else:  # output is value
-            assert not any(getitem_users)
-            outputs_spec.append(node.name)
-            if len(node.users) == 1: # TODO @botbw: this is not "call_module_user"
-                user = next(iter(node.users))
-                if len(user.users) == 1:
-                    uuser = next(iter(user.users))
-                    if uuser.op == 'call_module':
-                        call_module_users[user.name].add(uuser.name)
-            else:
-                for user in node.users:
-                    if user.op == 'call_module':
-                        call_module_users[node.name].add(user.name)
+            assert len(node.users) == 1, "Output should be value"
+            user = next(iter(node.users))
+            outputs_spec.append(user.name)
+            for uuser in user.users:
+                if uuser.op == 'call_module':
+                    call_module_users[user.name].add(uuser.name)
         return outputs_spec, call_module_users
 
     def _extract_fw_submod(node, submod):
@@ -1196,6 +1127,9 @@ def compile_pipeline(
     # meta data
     compiled_meta = CompiledMeta(
         nstages=nstages,
+        in_spec=traced_stateless_func._in_spec,
+        out_spec=traced_stateless_func._out_spec,
+        input_nodes_flatten=input_nodes_flatten,
         params_nodes_unflatten=params_nodes_unflatten,
         buffers_nodes_unflatten=buffers_nodes_unflatten,
         optimstates_nodes_unflatten=optimstates_nodes_unflatten,
@@ -1205,12 +1139,13 @@ def compile_pipeline(
         inv_buffers=inv_buffers,
         inv_optimstates=inv_optimstates,
         inv_optimstates_type=inv_optimstates_type,
+        output_nodes_flatten=output_nodes_flatten,
         output_params_nodes_unflatten=output_params_nodes_unflatten,
         output_buffers_nodes_unflatten=output_buffers_nodes_unflatten,
         output_optimstates_nodes_unflatten=output_optimstates_nodes_unflatten,
         output_optimstates_nodes_flatten=output_optimstates_nodes_flatten,
         nones_or_grads_nodes_unflatten=nones_or_grads_nodes_unflatten,
-        returns_nodes_unflatten=returns_nodes_unflatten,
+        returns_nodes_flatten=returns_nodes_flatten,
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
@@ -1247,7 +1182,7 @@ def compile_pipeline(
                 step_gm_global = _extract_step_submod(node, submod)
                 for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                         reversed(current_stateful_fw_bw[nstages:])):
-                    compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, step_gm_global)
+                    compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, step_gm_global, strict=strict)
                     compiled_stages.append(compiled_stage)
                 assert len(
                     step_gm_global.injected_states[StateType.OPTIMSTATES]
@@ -1255,9 +1190,11 @@ def compile_pipeline(
                 current_stateful_fw_bw = None
             is_fwbw = not is_fwbw
 
+    # some post check
+    erased_tensor_keys = set(params.keys()) | set(buffers.keys()) | set(optimstates.keys())
     if params or buffers or any(optimstates.values()):
         debugging_info = textwrap.dedent(f"""
-            Some states were erased, if this is as intended, set strict=False
+            Some states were erased, please make sure this is as intended
             Erased: 
                 Params: 
                     {' '.join(params)}
@@ -1275,11 +1212,11 @@ def compile_pipeline(
         if is_backward_called:
             for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                     reversed(current_stateful_fw_bw[nstages:])):
-                compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, None)
+                compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, None, strict=strict)
                 compiled_stages.append(compiled_stage)
         else:
             for fw_gm in current_stateful_fw_bw:
-                compiled_stage = CompiledStage(compiled_meta, fw_gm, None, None)
+                compiled_stage = CompiledStage(compiled_meta, fw_gm, None, None, strict=strict)
                 compiled_stages.append(compiled_stage)
         current_stateful_fw_bw = None
 
@@ -1297,6 +1234,10 @@ def compile_pipeline(
             if node.name not in all_states_names_flatten:  # args that are not states
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
+            for dump_ph in splited_global.graph.nodes: # args that are not used in fwbw
+                if dump_ph.op == 'placeholder' and dump_ph.name not in all_states_names_flatten and dump_ph.name not in env:
+                    env[dump_ph.name] = g.placeholder(dump_ph.name)
+
             if is_backward_called:  # fw_bw
                 if submod_idx < nstages:  # forward
                     construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
@@ -1327,6 +1268,7 @@ def compile_pipeline(
                 construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
             submod_idx += 1
 
+
     compiled_meta.node_to_stage_idx = name_to_stage_idx  # TODO @botbw move this to constructor?
 
     def eliminate_dead_node():
@@ -1335,7 +1277,7 @@ def compile_pipeline(
     setattr(g, 'eliminate_dead_node', eliminate_dead_node)
     local_gm = fx.GraphModule({}, g)
 
-    return compiled_meta, compiled_stages, local_gm
+    return compiled_meta, compiled_stages, local_gm, erased_tensor_keys
 
 def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
     stage_idx = submod_idx

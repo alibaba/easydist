@@ -5,15 +5,17 @@ from abc import ABC, abstractmethod
 from functools import reduce
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
+import torch.utils._pytree as pytree
 
 from easydist.torch.experimental.pp.compile_pipeline import (
-    CompiledMeta, CompiledStage, StateType, func_inputs_to_graph_inputs_by_stages,
-    graph_outputs_to_func_outputs, graph_outputs_to_func_outputs_non_strict)
+    CompiledMeta, CompiledStage, StateType,
+    graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import (CustomReducer, TensorChunkSpec,
                                                        merge_chunks, split_args_kwargs_into_chunks)
 from easydist.torch.experimental.pp.utils import modify_graph_op_device
@@ -95,6 +97,10 @@ class ScheduleGPipe(Schedule):
 
 class Schedule1F1B(Schedule):
 
+    def __init__(self, pipeline_stage: 'PipelineStageBase'):
+        super().__init__(pipeline_stage)
+        assert pipeline_stage.bw_node is not None, "Schedule1F1B requires backward node"
+
     def __call__(self) -> None:
         all_fw_send_reqs: List[dist.Work] = []
         all_bw_send_reqs: List[dist.Work] = []
@@ -146,6 +152,7 @@ class PipelineStageBase:
         outputs_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
         device: torch.device,
         group: Optional[dist.ProcessGroup] = None,
+        gather_output=True
     ):
         # meta info
         self.name = f'stage_{stage_idx}'
@@ -158,6 +165,7 @@ class PipelineStageBase:
         self.num_chunks = num_chunks
         self.node_val_chunk_spec = self._get_graph_inputs_chunk(compiled_meta, args_chunk_spec,
                                                                 kwargs_chunk_spec)
+        assert outputs_chunk_spec is None, "Don't support custom merge for now"
         self.outputs_chunk_spec = outputs_chunk_spec
         self.device = device
         self.group = group
@@ -165,7 +173,7 @@ class PipelineStageBase:
         self.group_rank = dist.get_rank(group)
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
-
+        self.gather_output = gather_output
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
@@ -213,7 +221,7 @@ class PipelineStageBase:
             args_chunk_spec = [None] * len(compiled_meta.args_nodes_unflatten)
         assert len(args_chunk_spec) == len(compiled_meta.args_nodes_unflatten)
         for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec):
-            node_val_chunk_spec = arg_chunk_spec
+            node_val_chunk_spec[node_name] = arg_chunk_spec
         if kwargs_chunk_spec is None:
             kwargs_chunk_spec = {k: None for k in compiled_meta.kwargs_nodes_unflatten}
         assert set(kwargs_chunk_spec.keys()) == set(compiled_meta.kwargs_nodes_unflatten)
@@ -524,7 +532,8 @@ class PipelineStageBase:
         maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_nodes_unflatten
         updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_nodes_unflatten
         nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_nodes_unflatten
-        returns_names_unflatten = self.compiled_meta.returns_nodes_unflatten
+        returns_names_flatten = self.compiled_meta.returns_nodes_flatten
+        returns_spec = self.compiled_meta.out_spec.children_specs[-1]
 
         params = {}
         buffers = {}
@@ -533,7 +542,7 @@ class PipelineStageBase:
         rets = []
         for chunk in self.outputs_chunks:
             grads_chunk = {}
-            rets_chunk = [None for _ in range(len(returns_names_unflatten))]
+            rets_chunk = [None for _ in range(len(returns_names_flatten))]
             for node_name, tensor in chunk.items():
                 if node_name in maybe_updated_params_names_unflatten.values():
                     params[node_name] = tensor
@@ -543,15 +552,15 @@ class PipelineStageBase:
                     optimstates[node_name] = tensor
                 elif node_name in nones_or_grads_names_unflatten.values():
                     grads_chunk[node_name] = tensor
-                elif node_name in returns_names_unflatten:
-                    rets_chunk[returns_names_unflatten.index(node_name)] = tensor
+                elif node_name in returns_names_flatten:
+                    rets_chunk[returns_names_flatten.index(node_name)] = tensor
                 else:
                     raise RuntimeError(f"Unknown output {node_name}")
             grads.append(grads_chunk)
             rets.append(rets_chunk)
 
         rets = merge_chunks(rets, self.outputs_chunk_spec)
-        rets = {k: v for k, v in zip(returns_names_unflatten, rets)}
+        rets = {k: v for k, v in zip(returns_names_flatten, rets)}
         grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
         self.outputs_batch = {**params, **buffers, **optimstates, **grads, **rets}
@@ -570,7 +579,7 @@ class PipelineStageBase:
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
 
-    def all_gather_outputs(self, rank):
+    def gather_outputs(self, rank):
         outputs_all_stages = [None for _ in range(self.num_stages)]
         dist.gather_object(self.outputs_batch,
                            outputs_all_stages if self.group_rank == rank else None,
@@ -579,15 +588,15 @@ class PipelineStageBase:
         if self.group_rank == rank:  # other rank receive None s
             for outputs in outputs_all_stages:
                 all_graph_outputs.update(outputs)
-        return graph_outputs_to_func_outputs_non_strict(self.compiled_meta, all_graph_outputs)
+        return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
 
-    def all_gather_state_dict(self, rank):
+    def gather_state_dict(self, rank):
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()
         dist.gather_object(state_dict, state_dicts if self.group_rank == rank else None, dst=rank)
         return state_dicts
 
-    def all_gather_optimizer_state_dict(self, rank):
+    def gather_optimizer_state_dict(self, rank):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
         dist.gather_object(optimizer_state_dict,
@@ -595,35 +604,53 @@ class PipelineStageBase:
                            dst=rank)
         return optimizer_state_dicts
 
+    def all_gather_outputs(self):
+        outputs_all_gather = [None for _ in range(self.num_stages)]
+        dist.all_gather_object(outputs_all_gather, self.outputs_batch)
+        all_graph_outputs = {}
+        for output_stage in outputs_all_gather:
+            all_graph_outputs.update(output_stage)
+        return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)[-1] # TODO @botbw: should be strict, but some states are erased
+
+    def all_gather_returns(self):
+        returns_all_gather = [None for _ in range(self.num_stages)]
+        returns_nodes_flatten = {node_name: None for node_name in self.compiled_meta.returns_nodes_flatten}
+        returns_batch = {node_name: val for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten}
+        dist.all_gather_object(returns_all_gather, returns_batch)
+        all_returns = {}
+        for returns_stage in returns_all_gather:
+            for k, v, in returns_stage.items():
+                if v is not None:
+                    all_returns[k] = v
+        return graph_outputs_to_func_outputs(self.compiled_meta, all_returns, strict=False)[-1]
+
     def __call__(self, *args, **kwargs) -> None:
-        node_input_this_stage = [None]
-        if self.is_first():
-            node_inputs_all_stages = func_inputs_to_graph_inputs_by_stages(self.compiled_meta,
-                                                                           *args,
-                                                                           **kwargs,
-                                                                           move_to_device=False)
-        else:
-            node_inputs_all_stages = [None] * self.num_stages
+        args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
+        args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten((self.compiled_meta.args_nodes_unflatten, self.compiled_meta.kwargs_nodes_unflatten))
+        assert spec_val == spec_node, "Mismatched args/kwargs"
 
-        # TODO: this is slow
-        dist.scatter_object_list(node_input_this_stage, node_inputs_all_stages, src=0)
-
-        node_input_this_stage = node_input_this_stage[0]
-        for k, v in node_input_this_stage.items():
-            if isinstance(v, torch.Tensor):
-                node_input_this_stage[k] = v.to(self.device)
+        input_node_vals = {}
+        for node, val in zip(args_kwargs_nodes_flatten, args_kwargs_vals_flatten):
+            if isinstance(val, torch.Tensor):
+                val = val.to(self.device)
+            input_node_vals[node] = val
 
         # Clean per iteration
         self.clear_runtime_states()
 
         # Split inputs into chunks
-        self.split_input_kwargs(node_input_this_stage)
+        self.split_input_kwargs(input_node_vals)
 
         self.schedule()
 
         logger.debug(f"[{self.group_rank}] All sends finished")
 
-        return graph_outputs_to_func_outputs_non_strict(self.compiled_meta, self.outputs_batch)[-1]
+        if self.gather_output:
+            ret = self.all_gather_returns()
+        else:
+            ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
+        ret = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), ret)
+        return ret
 
 
 def print_tensor_dict(chunk, di):

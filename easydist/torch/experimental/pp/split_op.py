@@ -17,6 +17,8 @@ import typing
 
 import torch
 import torch._custom_ops
+
+from .compile_pipeline import get_backward_flag
 '''
 The valid parameters types are: 
 dict_keys([
@@ -83,7 +85,7 @@ class FWBWSplitFunc(torch.autograd.Function):
 
 
 def fw_bw_split_func(tensor_list: fw_bw_param_type) -> fw_bw_ret_type:
-    assert all(t.requires_grad for t in tensor_list
+    assert not get_backward_flag() or all(t.requires_grad for t in tensor_list
                ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     return FWBWSplitFunc.apply(*tensor_list)
 
@@ -102,7 +104,7 @@ class BeforeBWSplitFunc(torch.autograd.Function):
 
 
 def before_bw_split_func(tensor: torch.Tensor) -> torch.Tensor:
-    assert tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
+    assert not get_backward_flag() or tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     ret = BeforeBWSplitFunc.apply(tensor)
     return ret
 
