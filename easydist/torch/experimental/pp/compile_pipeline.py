@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import logging
 import operator
 import textwrap
@@ -5,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
 
 import torch
 import torch.fx as fx
@@ -17,6 +18,8 @@ from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
+from easydist.torch.utils import _rematerialize_optimizer
+from torch.nn.utils import stateless
 
 
 class StateType(Enum):
@@ -324,27 +327,17 @@ class CompiledStage:  # TODO @botbw: make this picklable
                 self.compiled_meta.inv_optimstates_type[name]] = tensor
         return dict(optim_state)
 
-
-# ================================= section start ========================================
-# The idea of functions in this section are borrowed from
-# https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L346
-__tracer_global = None
-
-
-def get_tracer_global():
-    global __tracer_global
-    return __tracer_global
-
-
-def set_tracer_global(tracer):
-    global __tracer_global
-    __tracer_global = tracer
-
-
-# ================================= section end ========================================
-
+__updated_params = None
 __backward_flag = False
 __step_flag = False
+
+def get_updated_params():
+    global __updated_params
+    return __updated_params
+
+def set_updated_params(updated_params):
+    global __updated_params
+    __updated_params = updated_params
 
 def get_backward_flag():
     global __backward_flag
@@ -365,20 +358,7 @@ def set_step_flag(flag):
     global __step_flag
     __step_flag = flag
 
-
-@fx.has_side_effect
-def fw_bw_split_point():
-    tracer_current = get_tracer_global()
-    if tracer_current is not None and hasattr(tracer_current, "graph"):
-        tracer_current.graph.call_function(fw_bw_split_point, (), {})
-
-
-@fx.has_side_effect
-def step_split_point():
-    tracer_current = get_tracer_global()
-    if tracer_current is not None and hasattr(tracer_current, "graph"):
-        tracer_current.graph.call_function(step_split_point, (), {})
-
+from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func, step_split_func
 
 _before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
 _after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
@@ -466,7 +446,6 @@ def _to_tuple(x):
     return (x, )
 
 
-from easydist.torch.experimental.pp.split_op import (before_bw_split_func, fw_bw_split_func)
 
 
 # ================================= section start ========================================
@@ -701,10 +680,44 @@ class SplitPatcher(_Patcher):
         if self.opt:
             opt_cls = type(self.opt)
             orig_step = opt_cls.step
+            
 
             def step_wrapper(opt, *args, **kwargs):
-                step_split_point()
+                params = dict(self.mod.named_parameters()) if self.mod else {}
+                grads = {
+                    n: p.grad for n, p in params.items() if p.grad is not None
+                }
+                named_states = {}
+                for n, p in params.items():
+                    if p in self.opt.state:
+                        named_states[n] = self.opt.state[p]
+            
+                states, spec = pytree.tree_flatten((params, grads, named_states))
+                
+                ctx = {}
+                states = list_before_split(ctx, states)
+                states = step_split_func(states)
+                states = list_after_split(ctx, states)
+                params, split_grads, named_states = pytree.tree_unflatten(states, spec)
+                for n, p in params.items():
+                    p.grad = split_grads[n]
+                
+                # don't swap back
+                rematerialize_params = stateless._reparametrize_module(
+                    cast(torch.nn.Module, self.mod), {
+                        **params,
+                    }, tie_weights=True) if self.mod else nullcontext()
+                rematerialize_opt = _rematerialize_optimizer(
+                        opt, named_states, params) if opt else nullcontext()
+                next(rematerialize_params.gen)
+                next(rematerialize_opt.gen)
+
                 orig_step(opt, *args, **kwargs)
+                updated_params = dict(self.mod.named_parameters()) if self.mod else {}
+                # grads remain the same
+                for n, p in updated_params.items():
+                    p.grad = grads[n]
+                set_updated_params(updated_params)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
@@ -754,8 +767,8 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
     # into the submodules?
     split = ed_split_module(traced, None, split_callback, qualname_map)
 
-    # peephole to remove pipe_split
-    for submodule in split.modules():
+    # remove pipe_split point
+    for submodule in split.children():
         if isinstance(submodule, torch.fx.GraphModule):
             for node in submodule.graph.nodes:
                 if (node.op, node.target) == ("call_function", split_point):
@@ -766,7 +779,7 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
                     except Exception as e:  # nodes which are in graph
                         assert len(
                             node.args
-                        ) == 1, "split_point should have only one argument (list) or None"
+                        ) == 1 and len(node.args[0]) == len(node.users), "split_point should have only one argument (list) or None"
                         args_prev = node.args[0]
                         to_erase = []
                         for gi in node.users:
@@ -1019,7 +1032,7 @@ def compile_pipeline(
             optimstates_init_helpers[input_name] = materialize_zero
 
     # split fw_bw and step
-    splited_global, part_cnt = split_by(traced_stateless_func, step_split_point)
+    splited_global, part_cnt = split_by(traced_stateless_func, torch.ops.easydist.step_split.default)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
 
     states_used_by = defaultdict(list)

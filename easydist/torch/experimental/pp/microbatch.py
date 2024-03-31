@@ -397,3 +397,18 @@ def gen_output_chunk_spec(loss_spec, loss_reducer):
     )
     return output_chunk_spec
 """
+
+
+if __name__ == '__main__':
+    args = (torch.randn(16, 3, 3), torch.randn(80, 4, 4), 3)
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            print(f"arg {i}: {arg.size()}")
+        else:
+            print(f"arg {i}: {arg}")
+    splited_arg, _ = split_args_kwargs_into_chunks(args, {}, 4)
+    for i, arg in enumerate(splited_arg[0]):
+        if isinstance(arg, torch.Tensor):
+            print(f"split arg {i}: {arg.size()}")
+        else:
+            print(f"split arg {i}: {arg}")

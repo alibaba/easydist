@@ -17,8 +17,7 @@ import typing
 
 import torch
 import torch._custom_ops
-
-from .compile_pipeline import get_backward_flag
+from easydist.torch.experimental.pp.compile_pipeline import get_backward_flag
 '''
 The valid parameters types are: 
 dict_keys([
@@ -49,23 +48,23 @@ dict_keys([
     typing.Optional[torch.device]]
     )
 '''
-fw_bw_param_type = typing.Sequence[typing.Optional[torch.Tensor]]
-fw_bw_ret_type = typing.List[torch.Tensor]
+op_param_type = typing.Sequence[typing.Optional[torch.Tensor]]
+op_ret_type = typing.List[torch.Tensor]
 
 
 @torch._custom_ops.custom_op("easydist::fw_bw_split")
-def fw_bw_split(args: fw_bw_param_type) -> fw_bw_ret_type:
+def fw_bw_split(args: op_param_type) -> op_ret_type:
     ...
 
 
 @torch._custom_ops.impl_abstract("easydist::fw_bw_split")
-def fw_bw_split_impl_abstract(args: fw_bw_param_type) -> fw_bw_ret_type:
+def fw_bw_split_impl_abstract(args: op_param_type) -> op_ret_type:
     args = [arg.clone() for arg in args]
     return args
 
 
 @torch._custom_ops.impl("easydist::fw_bw_split")
-def fw_bw_split_impl(args: fw_bw_param_type) -> fw_bw_ret_type:
+def fw_bw_split_impl(args: op_param_type) -> op_ret_type:
     args = [arg.clone() for arg in args]
     return args
 
@@ -74,8 +73,8 @@ def fw_bw_split_impl(args: fw_bw_param_type) -> fw_bw_ret_type:
 class FWBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, *tensor_list):  # tensors must be passed as args
-        tensor_list = list(tensor_list)  # custom op requires list
+    def forward(ctx, *tensor_tuple):  # tensors must be passed as args
+        tensor_list = list(tensor_tuple)  # custom op requires list
         return tuple(torch.ops.easydist.fw_bw_split(
             tensor_list))  # return must be tensor of tuple of tensors
 
@@ -84,19 +83,19 @@ class FWBWSplitFunc(torch.autograd.Function):
         return tuple(torch.ops.easydist.fw_bw_split(grads))
 
 
-def fw_bw_split_func(tensor_list: fw_bw_param_type) -> fw_bw_ret_type:
-    assert not get_backward_flag() or all(t.requires_grad for t in tensor_list
-               ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
+def fw_bw_split_func(tensor_list: op_param_type) -> op_ret_type:
+    assert not get_backward_flag() or all(
+        t.requires_grad for t in tensor_list
+    ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     return FWBWSplitFunc.apply(*tensor_list)
 
 
-# doc https://pytorch.org/docs/stable/notes/extending.html#how-to-use
 class BeforeBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor):  # tensors must be passed as args
-        return torch.ops.easydist.fw_bw_split([tensor
-                                               ])[0]  # return must be tensor of tuple of tensors
+        return torch.ops.easydist.fw_bw_split(
+            [tensor])[0]  # return must be tensor of tuple of tensors
 
     @staticmethod
     def backward(ctx, grad):
@@ -104,8 +103,45 @@ class BeforeBWSplitFunc(torch.autograd.Function):
 
 
 def before_bw_split_func(tensor: torch.Tensor) -> torch.Tensor:
-    assert not get_backward_flag() or tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
+    assert not get_backward_flag(
+    ) or tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
     ret = BeforeBWSplitFunc.apply(tensor)
+    return ret
+
+
+@torch._custom_ops.custom_op("easydist::step_split")
+def step_split(args: op_param_type) -> op_ret_type:
+    ...
+
+
+@torch._custom_ops.impl_abstract("easydist::step_split")
+def step_split_impl_abstract(args: op_param_type) -> op_ret_type:
+    args = [arg.clone() for arg in args]
+    return args
+
+
+@torch._custom_ops.impl("easydist::step_split")
+def step_split_impl(args: op_param_type) -> op_ret_type:
+    args = [arg.clone() for arg in args]
+    return args
+
+
+# doc https://pytorch.org/docs/stable/notes/extending.html#how-to-use
+class StepSplit(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, *tensor_tuple):  # tensors must be passed as args
+        tensor_list = list(tensor_tuple)
+        return tuple(torch.ops.easydist.step_split(
+            tensor_list))  # return must be tensor of tuple of tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        return grads  # return must be tensor of tuple of tensors
+
+
+def step_split_func(tensor_list: op_param_type) -> op_ret_type:
+    ret = StepSplit.apply(*tensor_list)
     return ret
 
 
@@ -118,5 +154,10 @@ if __name__ == '__main__':
 
     a = torch.rand(10, 10, requires_grad=True)
     res = before_bw_split_func(a)
+    print(res.requires_grad)
+    res.mean().backward()
+
+    a = torch.rand(10, 10, requires_grad=True)
+    res = step_split_func([a])[0]
     print(res.requires_grad)
     res.mean().backward()

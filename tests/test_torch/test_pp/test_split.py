@@ -18,10 +18,11 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (
-    SplitPatcher, annotate_split_points, compile_pipeline,
-    graph_outputs_to_func_outputs, split_into_equal_size, set_backward_flag)
+    SplitPatcher, annotate_split_points, compile_pipeline, get_updated_params,
+    graph_outputs_to_func_outputs, set_updated_params, split_into_equal_size, set_backward_flag)
 from easydist.utils import rgetattr, rsetattr
-from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
+from torch.fx.experimental.proxy_tensor import make_fx
+# from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 
@@ -173,6 +174,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        set_updated_params(params)
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -180,14 +182,14 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-
+        params = get_updated_params()
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)
-        traced_stateless_func = ed_make_fx(partial(stateless_func, train_step_func),
-                                           tracing_mode='symbolic',
+        traced_stateless_func = make_fx(partial(stateless_func, train_step_func),
+                                           tracing_mode='fake',
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
                                            _allow_non_fake_inputs=False)(params, buffers,
                                                                          named_states, args,

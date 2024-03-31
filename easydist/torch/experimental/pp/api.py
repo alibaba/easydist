@@ -6,12 +6,11 @@ import torch
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.nn.utils import stateless
-
+from torch.fx.experimental.proxy_tensor import make_fx
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline,
-                                                             set_backward_flag, set_step_flag)
-from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
+from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline, get_updated_params,
+                                                             set_backward_flag, set_step_flag, set_updated_params)
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase
@@ -87,6 +86,7 @@ def _compile_pp(func,
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        set_updated_params(params)
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -94,7 +94,7 @@ def _compile_pp(func,
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-
+        params = get_updated_params()
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
@@ -104,7 +104,7 @@ def _compile_pp(func,
     with _enable_compile(), SplitPatcher(module, opt):
         set_backward_flag(False)
         set_step_flag(False)
-        traced_stateless_func = ed_make_fx(partial(stateless_func, func),
+        traced_stateless_func = make_fx(partial(stateless_func, func),
                                            tracing_mode=tracing_mode,
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
                                            _allow_non_fake_inputs=False)(params, buffers,
