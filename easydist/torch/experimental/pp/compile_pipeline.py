@@ -584,21 +584,17 @@ class SplitPatcher(_Patcher):
                     p.grad = split_grads[n]
                 
                 # don't swap back
-                rematerialize_params = stateless._reparametrize_module(
+                with stateless._reparametrize_module(
                     cast(torch.nn.Module, self.mod), {
                         **params,
-                    }, tie_weights=True) if self.mod else nullcontext()
-                rematerialize_opt = _rematerialize_optimizer(
-                        opt, named_states, params) if opt else nullcontext()
-                next(rematerialize_params.gen)
-                next(rematerialize_opt.gen)
-
-                orig_step(opt, *args, **kwargs)
-                updated_params = dict(self.mod.named_parameters()) if self.mod else {}
-                # grads remain the same
-                for n, p in updated_params.items():
+                    }, tie_weights=True) if self.mod else nullcontext(), _rematerialize_optimizer(
+                        opt, named_states, params) if opt else nullcontext():
+                    orig_step(opt, *args, **kwargs)
+                
+                # don't return grads passed in step
+                for n, p in params.items():
                     p.grad = grads[n]
-                set_updated_params(updated_params)
+                set_updated_params(params)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)

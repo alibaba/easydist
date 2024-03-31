@@ -246,7 +246,6 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
-        set_updated_params(params)  # faked params
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
