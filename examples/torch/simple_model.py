@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
+from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
 
 
 def broadcast_module(model):
@@ -105,6 +106,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
+        annotate_split_points(model, {
+            "norm"
+        })
+
         randn_input = torch.randn(1024, 1024)
 
         if not fake_init:
@@ -112,10 +117,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
             model = broadcast_module(model)
             torch.distributed.broadcast(randn_input, src=0)
 
-        opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
+        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True) #, capturable=True)
 
         model_2 = copy.deepcopy(model)
-        opt_2 = torch.optim.Adam(model_2.parameters(), lr=0.001, foreach=True, capturable=True)
+        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True) #, capturable=True)
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)

@@ -19,7 +19,7 @@ from easydist.torch.experimental.pp.compile_pipeline import (
     graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer, TensorChunkSpec,
                                                        merge_chunks, split_args_kwargs_into_chunks)
-from easydist.torch.experimental.pp.utils import modify_graph_op_device
+from easydist.torch.experimental.pp.split_utils import modify_graph_op_device
 
 logger = logging.getLogger(__name__)
 

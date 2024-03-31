@@ -39,6 +39,9 @@ import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher
+from easydist.torch.experimental.pp.split_utils import get_updated_params, set_backward_flag, set_step_flag, set_updated_params
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
@@ -243,6 +246,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        set_updated_params(params)  # faked params
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -250,11 +254,14 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-
+        params = get_updated_params() or params
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
-    with _enable_compile():
+    with _enable_compile(), SplitPatcher(module, opt):
+        set_backward_flag(False)
+        set_updated_params(None)
+        set_step_flag(False)
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -264,6 +271,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
+
+    save_graphviz_dot(traced_graph, 'traced_graph')
 
     if mdconfig.dump_fx_graph:
         print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
@@ -584,5 +593,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     # the param maintain in the local of compiled function.
     if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
+
+    save_graphviz_dot(sharded_graph, 'sharded_graph')
 
     return EDCompiledFunc(sharded_graph)

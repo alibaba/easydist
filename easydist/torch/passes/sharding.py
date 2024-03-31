@@ -27,6 +27,7 @@ from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes
                                                     compute_local_shape)
 
 from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
+from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
 from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
@@ -485,10 +486,10 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                     fx_module = insert_comm_node(fx_module, node, var_, sorted_placements)
 
             shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
-            if len(shard_env[node.name]) == 1:
+            if len(shard_env[node.name]) == 1 and node.target not in ANNOTATION_OPS:  # ANNOTATION_OPS returns list TODO @botbw: fix this
                 shard_env[node.name] = shard_env[node.name][0]
 
-        if node.op == 'output':
+        elif node.op == 'output':
             need_replicate_node = node.args[0][-1 * num_return_value:]
             need_replicate_node = [i for i in need_replicate_node if i is not None]
             for o_node in need_replicate_node:

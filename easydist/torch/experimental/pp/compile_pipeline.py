@@ -15,10 +15,13 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx._symbolic_trace import _Patcher
 
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
-from easydist.torch.experimental.pp.utils import save_graphviz_dot
+from easydist.torch.experimental.pp.split_utils import set_backward_flag, split
+from easydist.torch.experimental.pp.utils import save_graphviz_dot, _to_tuple
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.utils import _rematerialize_optimizer
+from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
+
 from torch.nn.utils import stateless
 
 
@@ -327,126 +330,6 @@ class CompiledStage:  # TODO @botbw: make this picklable
                 self.compiled_meta.inv_optimstates_type[name]] = tensor
         return dict(optim_state)
 
-__updated_params = None
-__backward_flag = False
-__step_flag = False
-
-def get_updated_params():
-    global __updated_params
-    return __updated_params
-
-def set_updated_params(updated_params):
-    global __updated_params
-    __updated_params = updated_params
-
-def get_backward_flag():
-    global __backward_flag
-    return __backward_flag
-
-
-def set_backward_flag(flag):
-    global __backward_flag
-    __backward_flag = flag
-
-
-def get_step_flag():
-    global __step_flag
-    return __step_flag
-
-
-def set_step_flag(flag):
-    global __step_flag
-    __step_flag = flag
-
-from easydist.torch.experimental.pp.split_op import fw_bw_split_func, before_bw_split_func, step_split_func
-
-_before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
-_after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
-
-
-def before_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _before_split, f"split function for {cls} already registered"
-            _before_split[cls] = func
-        return func
-
-    return _register
-
-
-def after_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _after_split, f"split function for {cls} already registered"
-            _after_split[cls] = func
-        return func
-
-    return _register
-
-
-def get_registered_by_mro(registered, obj: Any) -> type:
-    for cls in obj.__class__.mro():
-        if cls in registered:
-            return registered[cls]
-    raise RuntimeError(f"no registered split function for {obj.__class__}")
-
-
-@before_split_register(torch.Tensor)
-def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
-    return tuple([input])
-
-
-@after_split_register(torch.Tensor)
-def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
-    return output[0]
-
-
-@before_split_register(list)
-def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    ctx['is_tensor'] = []
-    ctx['non_tensor_vals'] = []
-    tup = []
-    for x in input:
-        ctx['is_tensor'].append(isinstance(x, torch.Tensor))
-        if ctx['is_tensor'][-1]:
-            tup.append(x)
-        else:
-            ctx['non_tensor_vals'].append(x)
-
-    return tuple(tup)
-
-
-@after_split_register(list)
-def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
-    ret = []
-    output = list(output)
-    for is_tensor in ctx['is_tensor']:
-        if is_tensor:
-            ret.append(output.pop(0))
-        else:
-            ret.append(ctx['non_tensor_vals'].pop(0))
-    return ret
-
-
-@before_split_register(tuple)
-def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    return list_before_split(ctx, list(input))
-
-
-@after_split_register(tuple)
-def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
-    return tuple(list_after_split(ctx, output))
-
-
-def _to_tuple(x):
-    if isinstance(x, tuple):
-        return x
-    return (x, )
-
-
-
 
 # ================================= section start ========================================
 # The idea of functions in this section are modified from
@@ -458,12 +341,10 @@ class PipeSplitWrapper(torch.nn.Module):
         self.mod = mod
 
     def forward(self, *args, **kwargs):
-        ret = self.mod(*args, **kwargs)
-        ctx = {}
-        tensor_tuple: Tuple[torch.Tensor] = get_registered_by_mro(_before_split, ret)(ctx, ret)
-        tensor_tuple: Tuple[torch.Tensor] = fw_bw_split_func(tensor_tuple)
-        ret = get_registered_by_mro(_after_split, ret)(ctx, tensor_tuple)
-        return ret
+        ret: Any = self.mod(*args, **kwargs)
+        ret_on_new_stage: Any = split(ret)
+        assert type(ret) == type(ret_on_new_stage), f"Please make sure you register the unflatten func correctly"
+        return ret_on_new_stage
 
     def __getattr__(self, name: str):
         if '_parameters' in self.__dict__:
