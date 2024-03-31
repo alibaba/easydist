@@ -590,10 +590,7 @@ class SplitPatcher(_Patcher):
                     }, tie_weights=True) if self.mod else nullcontext(), _rematerialize_optimizer(
                         opt, named_states, params) if opt else nullcontext():
                     orig_step(opt, *args, **kwargs)
-                
-                # don't return grads passed in step
-                for n, p in params.items():
-                    p.grad = grads[n]
+
                 set_updated_params(params)
                 set_step_flag(True)
 
