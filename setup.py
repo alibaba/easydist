@@ -46,9 +46,21 @@ def get_long_description():
 
 python_include_path = sysconfig.get_path('include')
 cuda_include_path = '/usr/local/cuda/include'
+import site
+pybind11_include_path = site.getsitepackages()[0] + '/pybind11/include'
+cupti_lib_path = '/usr/local/cuda/extras/CUPTI/lib64'
 profiling_allocator = setuptools.Extension('profiling_allocator',
-                    sources = ['csrc/profiling_allocator/profiling_allocator.cpp'],
-                    include_dirs=[python_include_path, cuda_include_path],
+                    sources = [
+                      'csrc/profiling_allocator/profiling_allocator.cpp',
+                      'csrc/profiling_allocator/stream_tracer.cpp',
+                      'csrc/profiling_allocator/cupti_callback_api.cpp',
+                      'csrc/profiling_allocator/python_tracer_init.cpp',],
+                    include_dirs=[
+                      python_include_path,
+                      cuda_include_path,
+                      pybind11_include_path,],
+                    libraries = ['cupti'],
+                    library_dirs=[cupti_lib_path],
                     extra_compile_args=['-fPIC', '--shared'])
 
 

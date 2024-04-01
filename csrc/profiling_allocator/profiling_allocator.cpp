@@ -259,7 +259,8 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
     }
 
     std::pair<void*, uintptr_t> addr_size = graph_memory_plan.get_mem_address(device);
-    /*
+//#define DEBUG_MEMORY
+#ifdef DEBUG_MEMORY
     if (device == 0) {
       std::string malloc_str = "(fake malloc) rank: " + std::to_string(device) + ", ptr: ";
       malloc_str += std::to_string((uintptr_t)addr_size.first) + ", alloced size: ";
@@ -268,12 +269,12 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
       malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
       std::cout << malloc_str;
     }
-    */
+#endif
     return addr_size.first;
   } else {
     void *ptr = nullptr;
     cudaMalloc(&ptr, size);
-    /*
+#ifdef DEBUG_MEMORY
     if (device == 0) {
       std::string malloc_str = "(real malloc) rank: " + std::to_string(device) + ", ptr: ";
       malloc_str += std::to_string((uintptr_t)ptr) + ", alloced size: ";
@@ -281,7 +282,7 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
       malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
       std::cout << malloc_str;
     }
-    */
+#endif
     return ptr;
   }
 }

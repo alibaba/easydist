@@ -53,6 +53,7 @@ from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
+import easydist.torch.profiler.stream_tracer as ed_stream_tracer
 
 # for pickle dump opt_strategy
 import sys
@@ -209,6 +210,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         params = dict(module.named_parameters())
         buffers = dict(module.named_buffers())
 
+        #print(f"initial params: {params}")
+        #print(f"initial buffers: {buffers}")
         if isinstance(init_helper, SetParaInitHelper):
             init_helper.module = module
 
@@ -437,7 +440,11 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         # save all profiling information in this dict
         profiling_info = ModuleProfilingInfo(rank)
         alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
-        _ = alloc_profiler.run([])
+        with ed_stream_tracer.StreamTracer() as stream_tracer:
+            _ = alloc_profiler.run([])
+            trace_data = stream_tracer.get_stream_trace_data()
+        print(f"py op_streams:\n{trace_data.op_streams}")
+        print(f"py op_extra_streams:\n{trace_data.op_extra_streams}")
 
         if rank == 0:
             logging.info("finish profiling fx module's memory")
@@ -540,7 +547,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-            #print(f"local_out: {local_out}, \nshape: {local_out.shape}")
+            print(f"local_out: {local_out}, \nshape: {local_out.shape}")
 
             return local_out
 
