@@ -24,7 +24,7 @@ import torch.utils._pytree as pytree
 from torch.distributed._tensor import DeviceMesh
 
 import easydist.config as mdconfig
-from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
+from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh, set_with_pp_parallelism)
 from easydist.torch.compile_auto import _compile_auto
 from easydist.torch.compile_dp import _compile_dp
 from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
@@ -119,6 +119,7 @@ class CompiledFuncWrapper:
             mesh = DeviceMesh("cuda", mesh_shape.tolist())
 
             if get_device_mesh() == None:
+                set_with_pp_parallelism(False)  # use 2 dim mesh
                 set_device_mesh(mesh)
 
             if self.parallel_mode == "auto":

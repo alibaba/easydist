@@ -18,7 +18,7 @@ import operator
 
 import numpy
 import torch
-from torch.distributed._tensor import DeviceMesh
+from torch.distributed._tensor import DeviceMesh, mesh_resources
 
 from easydist.metashard import metair
 from easydist.utils.testing import TorchMockDeviceMesh
@@ -38,12 +38,6 @@ def set_device_mesh(device_mesh):
         metair.DEVICE_MESH_1D = 1
 
     logger.info(f"set_device_mesh: {device_mesh}")
-
-
-def get_device_mesh():
-    global TORCH_DEVICE_MESH
-    return TORCH_DEVICE_MESH
-
 
 def device_mesh_world_size(device_mesh=None):
     if device_mesh is None:
@@ -77,3 +71,30 @@ def device_mesh_rank(device_mesh, dim):
         raise RuntimeError("DeviceMesh not support or not initialize")
 
     return rank
+
+
+WITH_PP_PARALLELISM = True
+
+def set_with_pp_parallelism(with_pp_parallelism):
+    global WITH_PP_PARALLELISM
+    WITH_PP_PARALLELISM = with_pp_parallelism
+
+def get_device_mesh():
+    global TORCH_DEVICE_MESH
+    if WITH_PP_PARALLELISM:
+        return get_spmd_device_mesh(TORCH_DEVICE_MESH)
+    return TORCH_DEVICE_MESH
+
+def get_spmd_device_mesh(device_mesh):
+    assert WITH_PP_PARALLELISM 
+
+    if device_mesh is None:
+        return None
+    
+    ranks = device_mesh.mesh[:, :, device_mesh.get_coordinate_on_dim(2)]
+    spmd_mesh = DeviceMesh(
+        device_mesh.device_type, ranks, _init_process_groups=False
+    )
+    spmd_mesh._dim_group_infos = device_mesh._dim_group_infos[:2]
+    mesh_resources.child_to_parent_mapping[device_mesh] = spmd_mesh
+    return spmd_mesh
