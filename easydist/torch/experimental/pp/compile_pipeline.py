@@ -15,7 +15,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx._symbolic_trace import _Patcher
 
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
-from easydist.torch.experimental.pp.split_utils import set_backward_flag, split
+from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, set_backward_flag, split
 from easydist.torch.experimental.pp.utils import save_graphviz_dot, _to_tuple
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
@@ -1078,8 +1078,8 @@ def compile_pipeline(
             is_fwbw = not is_fwbw
 
     # some post check
-    erased_tensor_keys = set(params.keys()) | set(buffers.keys()) | set(optimstates.keys())
-    if params or buffers or any(optimstates.values()):
+    erased_tensor_keys = set(params.keys()) | set(buffers.keys()) | set(k for k, v in optimstates.items() if v)
+    if erased_tensor_keys:
         debugging_info = textwrap.dedent(f"""
             Some states were erased, please make sure this is as intended
             Erased: 
@@ -1088,7 +1088,7 @@ def compile_pipeline(
                 Buffers: 
                     {' '.join(buffers)}
                 Optimstates: 
-                    {' '.join([torch_name for torch_name, state in optimstates.items() if state])}
+                    {' '.join(k for k, v in optimstates.items() if v)}
             """)
         if strict:
             raise RuntimeError(debugging_info)

@@ -13,7 +13,7 @@ from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compi
                                                              set_backward_flag, set_step_flag, set_updated_params)
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.PipelineStage import PipelineStageBase
+from easydist.torch.experimental.pp.PipelineStage import PipelineStage
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
@@ -31,7 +31,7 @@ def _compile_pp(func,
                 kwargs_chunk_spec,
                 outputs_chunk_spec,
                 num_chunks=1,
-                strict=True) -> PipelineStageBase:
+                strict=True) -> PipelineStage:
 
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -129,7 +129,7 @@ def _compile_pp(func,
                                                                 init_helper=init_helper,
                                                                 strict=strict)
 
-    pipe = PipelineStageBase(schedule_cls=schedule_cls,
+    pipe = PipelineStage(schedule_cls=schedule_cls,
                              local_gm=local_gm,
                              compiled_meta=compiled_meta,
                              stage_idx=rank,

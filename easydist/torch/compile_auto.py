@@ -39,8 +39,10 @@ import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher
-from easydist.torch.experimental.pp.split_utils import get_updated_params, set_backward_flag, set_step_flag, set_updated_params
+from easydist.torch.experimental.pp.PipelineStage import PipelineStage
+from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
+from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params, set_backward_flag, set_step_flag, set_updated_params
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
@@ -196,7 +198,18 @@ def fetch_mem_sol():
     return mem_sol
 
 
-def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
+def _compile_auto(func,
+                  tracing_mode,
+                  init_helper,
+                  input_signature,
+                  args,
+                  kwargs,
+                  schedule_cls=None,
+                  args_chunk_spec=None,
+                  kwargs_chunk_spec=None,
+                  outputs_chunk_spec=None,
+                  num_chunks=1,
+                  strict=True):
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -257,15 +270,16 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
+    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                             args_chunk_spec, kwargs_chunk_spec)
+
     with _enable_compile(), SplitPatcher(module, opt):
-        set_backward_flag(False)
-        set_updated_params(None)
-        set_step_flag(False)
+        clear_pp_compile_states()
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
-                               _allow_non_fake_inputs=False)(params, buffers, named_states, args,
-                                                             kwargs)
+                               _allow_non_fake_inputs=False)(params, buffers, named_states, args_split[0],
+                                                             kwargs_split[0])
 
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
@@ -503,6 +517,29 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
         #print(f"graph details:\n{str(sharded_graph.graph)}\nend of graph\n")
 
+    if schedule_cls is not None:
+        traced_graph_node_metas = {
+            node.name: node.meta
+            for node in traced_graph.graph.nodes
+        }
+        stateless_func_args = (params, buffers, named_states, args, kwargs)
+
+        pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(sharded_graph,
+                                                                    world_size,
+                                                                    stateless_func_args,
+                                                                    init_helper=init_helper,
+                                                                    strict=strict)
+        pipe = PipelineStage(schedule_cls=schedule_cls,
+                            local_gm=pp_local_gm,
+                            compiled_meta=pp_compiled_meta,
+                            stage_idx=rank,
+                            compiled_stage=pp_compiled_stages[rank],
+                            node_metas=traced_graph_node_metas,
+                            num_chunks=num_chunks,
+                            args_chunk_spec=args_chunk_spec,
+                            kwargs_chunk_spec=kwargs_chunk_spec,
+                            returns_chunk_spec=outputs_chunk_spec,
+                            device=torch.device(f"cuda:{rank % torch.cuda.device_count()}"))
     class EDCompiledFunc:
 
         def __init__(self, graph) -> None:
@@ -593,6 +630,6 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
 
-    save_graphviz_dot(sharded_graph, 'sharded_graph')
+    save_graphviz_dot(sharded_graph, f'sharded_graph_{rank}')
 
     return EDCompiledFunc(sharded_graph)

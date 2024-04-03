@@ -138,6 +138,9 @@ dmypy.json
 dist/
 build/
 
+# temporary files
+tmp
+
 # graphviz output
 *.dot
 

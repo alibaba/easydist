@@ -486,7 +486,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                     fx_module = insert_comm_node(fx_module, node, var_, sorted_placements)
 
             shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
-            if len(shard_env[node.name]) == 1 and node.target not in ANNOTATION_OPS:  # ANNOTATION_OPS returns list TODO @botbw: fix this
+            if len(shard_env[node.name]) == 1 and node.target not in ANNOTATION_OPS:  # ANNOTATION_OPS returns tensor list, no need to unwrap
                 shard_env[node.name] = shard_env[node.name][0]
 
         elif node.op == 'output':

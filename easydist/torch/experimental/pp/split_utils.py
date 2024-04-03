@@ -169,6 +169,11 @@ def set_step_flag(flag):
     global __step_flag
     __step_flag = flag
 
+def clear_pp_compile_states():
+    set_backward_flag(False)
+    set_updated_params(None)
+    set_step_flag(False)
+
 
 _before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
 _after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}

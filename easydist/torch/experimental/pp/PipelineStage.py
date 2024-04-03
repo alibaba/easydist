@@ -19,7 +19,6 @@ from easydist.torch.experimental.pp.compile_pipeline import (
     graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer, TensorChunkSpec,
                                                        merge_chunks, split_args_kwargs_into_chunks)
-from easydist.torch.experimental.pp.split_utils import modify_graph_op_device
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +55,8 @@ class StageKwargPlaceholder(RecvBase):
 
 class Schedule(ABC):
 
-    def __init__(self, pipeline_stage: 'PipelineStageBase'):
-        assert isinstance(pipeline_stage, PipelineStageBase)
+    def __init__(self, pipeline_stage: 'PipelineStage'):
+        assert isinstance(pipeline_stage, PipelineStage)
         self.pipeline_stage = pipeline_stage
 
     @abstractmethod
@@ -99,7 +98,7 @@ class ScheduleGPipe(Schedule):
 
 class ScheduleDAPPLE(Schedule):
 
-    def __init__(self, pipeline_stage: 'PipelineStageBase'):
+    def __init__(self, pipeline_stage: 'PipelineStage'):
         super().__init__(pipeline_stage)
         assert pipeline_stage.bw_node is not None, f"{type(self).__name__} requires backward node"
 
@@ -138,7 +137,27 @@ class ScheduleDAPPLE(Schedule):
             self.pipeline_stage.step()
 
 
-class PipelineStageBase:
+def modify_graph_op_device(
+    gm: torch.fx.GraphModule,
+    new_device: torch.device,
+):
+    modified = False
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            for arg in node.args:
+                if isinstance(arg, torch.device) and arg != new_device:
+                    logger.debug(f"Changing device of Node {node.name} from {arg} to {new_device}")
+                    arg = new_device
+                    modified = True
+            if "device" in node.kwargs and node.kwargs["device"] != new_device:
+                logger.debug(
+                    f"Changing device of Node {node.name} from {node.kwargs['device']} to {new_device}"
+                )
+                node.update_kwarg("device", new_device)
+                modified = True
+    if modified:
+        gm.recompile()
+class PipelineStage:
 
     def __init__(
         self,

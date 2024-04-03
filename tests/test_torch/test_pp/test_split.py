@@ -18,12 +18,13 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (
-    SplitPatcher, annotate_split_points, compile_pipeline, get_updated_params,
-    graph_outputs_to_func_outputs, set_updated_params, split_into_equal_size, set_backward_flag)
+    SplitPatcher, annotate_split_points, compile_pipeline,
+    graph_outputs_to_func_outputs, split_into_equal_size, set_backward_flag)
 from easydist.utils import rgetattr, rsetattr
 from torch.fx.experimental.proxy_tensor import make_fx
 # from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
+from easydist.torch.experimental.pp.split_utils import set_updated_params, get_updated_params
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 
 
