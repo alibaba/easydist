@@ -20,7 +20,6 @@ import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
-import ctypes
 
 import numpy
 import rich
@@ -39,7 +38,7 @@ import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage
+from easydist.torch.experimental.pp.PipelineStage import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params, set_backward_flag, set_step_flag, set_updated_params
@@ -204,12 +203,12 @@ def _compile_auto(func,
                   input_signature,
                   args,
                   kwargs,
-                  schedule_cls=None,
+                  schedule_cls=ScheduleGPipe,
                   args_chunk_spec=None,
                   kwargs_chunk_spec=None,
                   outputs_chunk_spec=None,
                   num_chunks=1,
-                  strict=True):
+                  strict=False):
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -273,7 +272,7 @@ def _compile_auto(func,
     args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
                                                              args_chunk_spec, kwargs_chunk_spec)
 
-    with _enable_compile(), SplitPatcher(module, opt):
+    with _enable_compile(), SplitPatcher(module, opt) if schedule_cls else nullcontext():
         clear_pp_compile_states()
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
@@ -523,12 +522,14 @@ def _compile_auto(func,
             for node in traced_graph.graph.nodes
         }
         stateless_func_args = (params, buffers, named_states, args, kwargs)
-
+        # save_graphviz_dot(sharded_graph, 'sharded_graph')
+        # sharded_graph = bfs_topsort(sharded_graph)
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(sharded_graph,
                                                                     world_size,
                                                                     stateless_func_args,
                                                                     init_helper=init_helper,
                                                                     strict=strict)
+        save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(schedule_cls=schedule_cls,
                             local_gm=pp_local_gm,
                             compiled_meta=pp_compiled_meta,
@@ -629,7 +630,5 @@ def _compile_auto(func,
     # the param maintain in the local of compiled function.
     if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
-
-    save_graphviz_dot(sharded_graph, f'sharded_graph_{rank}')
 
     return EDCompiledFunc(sharded_graph)

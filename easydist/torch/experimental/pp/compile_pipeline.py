@@ -16,7 +16,7 @@ from torch.fx._symbolic_trace import _Patcher
 
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, set_backward_flag, split
-from easydist.torch.experimental.pp.utils import save_graphviz_dot, _to_tuple
+from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz_dot, _to_tuple
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.utils import _rematerialize_optimizer
@@ -580,10 +580,10 @@ class SplitPatcher(_Patcher):
                 states = step_split_func(states)
                 states = list_after_split(ctx, states)
                 params, split_grads, named_states = pytree.tree_unflatten(states, spec)
-                for n, p in params.items():
+
+                for n, p in params.items():  # need to split on grads
                     p.grad = split_grads[n]
-                
-                # don't swap back
+
                 with stateless._reparametrize_module(
                     cast(torch.nn.Module, self.mod), {
                         **params,
@@ -722,7 +722,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
 
                 output_mask = list_args_kwargs_mask[0]
                 getitem_idx = 0
-                for getitem_user, kept in zip(node.users, output_mask):
+                for getitem_user, kept in zip(ordered_gi_users(node), output_mask):
                     assert getitem_user.op == 'call_function' and getitem_user.target == operator.getitem
                     if kept:
                         env[getitem_user.name] = new_graph.create_node(op='call_function',
@@ -824,7 +824,8 @@ def compile_pipeline(
     # node name of input and output in stateless_func
     params, buffers, optimstates, args, kwargs = stateless_func_args
     params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten, args_nodes_unflatten, kwargs_nodes_unflatten = inputs_nodes_unflatten
-    output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, nones_or_grads_nodes_unflatten, returns_nodes_unflatten = output_nodes_unflatten
+    output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, __nones_or_grads_nodes_unflatten, returns_nodes_unflatten = output_nodes_unflatten
+    _, __nones_or_grads_nodes_unflatten_spec = pytree.tree_flatten(__nones_or_grads_nodes_unflatten)  # don't use
     returns_nodes_flatten, _ = pytree.tree_flatten(returns_nodes_unflatten)
     output_optimstates_nodes_flatten, _ = pytree.tree_flatten(output_optimstates_nodes_unflatten)
 
@@ -908,7 +909,12 @@ def compile_pipeline(
     # split fw_bw and step
     splited_global, part_cnt = split_by(traced_stateless_func, torch.ops.easydist.step_split.default)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
-
+    nones_or_grads_nodes_unflatten = {}
+    if hasattr(splited_global, 'submod_1'):
+        phs = [node for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
+        num_params = len(params_nodes_unflatten)
+        nones_or_grads_nodes_unflatten = pytree.tree_unflatten([ph.name for ph in phs[num_params: num_params * 2]], __nones_or_grads_nodes_unflatten_spec)
+    save_graphviz_dot(splited_global, "splited_global")
     states_used_by = defaultdict(list)
 
     # functions to convert a stateless submodule to a stateful one TODO @botbw: simpify this if possible
@@ -1051,6 +1057,7 @@ def compile_pipeline(
             if is_fwbw:  # this is a fw or fw_bw gm
                 fw_or_fwbw_gm, part_cnt = split_by(
                     submod, torch.ops.easydist.fw_bw_split.default)  # split the module
+                save_graphviz_dot(fw_or_fwbw_gm, f"fw_or_fwbw_gm")
                 assert part_cnt == nstages * 2 if is_backward_called else nstages, "part_cnt should be nstages * 2 if backward is called"
                 stateful_fw_bw = []
                 submod_idx = 0
@@ -1067,6 +1074,7 @@ def compile_pipeline(
             else:  # this is a optimizer gm
                 assert is_backward_called and current_stateful_fw_bw is not None, "There should be a stateful_bw_fw before optimizer step"
                 step_gm_global = _extract_step_submod(node, submod)
+                save_graphviz_dot(step_gm_global.gm, f"step_gm_global")
                 for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                         reversed(current_stateful_fw_bw[nstages:])):
                     compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, step_gm_global, strict=strict)
