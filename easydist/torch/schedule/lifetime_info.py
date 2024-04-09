@@ -12,13 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 
-from collections import defaultdict
-
 import sys
 import logging
 import torch
+import queue
 from enum import Enum
 from typing import Tuple, Set
+from collections import defaultdict
+
+from easydist.torch.schedule.schedule_result import ScheduleResult
+
 
 logger = logging.getLogger(__name__)
 
@@ -142,53 +145,33 @@ class MemSharedTensorGroup:
 class LifetimeInfo:
     def __init__(self,
                  graph,                 # torch.fx.Graph
-                 nodes_to_schedule,     # list of nodes to be scheduled
-                 graph_mem_info,        # GraphMemInfo
-                 pre_scheded_nodes,
-                 one_step_one_op):
+                 nodes_on_all_streams,  # list of nodes we care lifetimes
+                 graph_mem_info):       # GraphMemInfo
         self.graph = graph
-        self.nodes_to_schedule = nodes_to_schedule
+        self.nodes_on_all_streams = nodes_on_all_streams
         self.graph_mem_info = graph_mem_info
-        self.node_set = set(nodes_to_schedule)
-        self.cache_prev_nodes = {}
-        self.cache_post_nodes = {}
-        self.pre_scheded_nodes = pre_scheded_nodes
-        self.one_step_one_op = one_step_one_op
+        self.node_set = set(nodes_on_all_streams)
 
-        # map: node -> (asap, alap)
-        self.node_makespans = {}
+        # map(key: node, value: map(key: other stream id, value: smallest anchor across stream))
+        self.anchors_between_streams = defaultdict(lambda: {})
 
-        # map: edge(node out) -> (asap, alap)
-        self.edge_makespans = {}
+        # list of map:
+        # per stream maps extended with across-stream consumer nodes
+        self.extended_schedule_maps = []
 
-        self.buffer_makespans = {}
+        # list of map:
+        # per stream edge makespan maps
+        self.edge_makespan_maps = None
 
-        self.depths = {}
-        self.max_depth = 0
-        for node in self.nodes_to_schedule:
-            if node in self.depths:
-                continue
-            max_arg_depth = 0
-            for arg in node.args:
-                if isinstance(arg, torch.fx.Node):
-                    if arg not in self.node_set:
-                        continue
-                    assert arg in self.depths
-                    max_arg_depth = max(max_arg_depth, self.depths[arg])
-            depth = max_arg_depth+1
-            self.depths[node] = depth
-            self.max_depth = max(self.max_depth, depth)
-
-        if one_step_one_op:
-            self.num_steps = len(self.nodes_to_schedule)
-        else:
-            self.num_steps = self.max_depth + 1
+        # list of map:
+        # per stream edge makespan maps
+        self.buffer_makespan_maps = None
 
         # build memory share groups
         # map: (node, tensor_idx) -> the set of nodes which share the same memory
         self.mem_share_info = defaultdict(lambda: MemSharedTensorGroup())
         # NOTE: It is more efficient to traverse all nodes by topological order
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             out_vars = graph_mem_info.get_out_vars(node)
             for out_var in out_vars:
                 #print(f"node: {node}, var: {out_var}")
@@ -228,13 +211,56 @@ class LifetimeInfo:
             visited_group_set.add(id(tensor_group))
 
             # debug: dump memory-shared tensor group
-            #print(str(tensor_group))
+            print(str(tensor_group))
 
             assert tensor_group.src_tensor_size > 0, f"no core tensor in tensor group: {str(tensor_group)}"
 
     def get_group(self, node: torch.fx.Node, out_idx: int):
         assert (node, out_idx) in self.mem_share_info
         return self.mem_share_info[(node, out_idx)]
+
+
+class UnscheduledLifetimeInfo(LifetimeInfo):
+    def __init__(self,
+                 graph,                 # torch.fx.Graph
+                 nodes_on_all_streams,  # list of nodes we care lifetimes
+                 graph_mem_info,        # GraphMemInfo
+                 pre_scheded_nodes,
+                 one_step_one_op):
+        super().__init__(graph, nodes_on_all_streams, graph_mem_info)
+
+        self.cache_prev_nodes = {}
+        self.cache_post_nodes = {}
+
+        # map: node -> (asap, alap)
+        self.node_makespans = {}
+
+        # map: edge(node out) -> (asap, alap)
+        self.edge_makespans = {}
+
+        self.buffer_makespans = {}
+
+        self.one_step_one_op = one_step_one_op
+        if one_step_one_op:
+            self.num_steps = len(self.nodes_on_all_streams)
+        else:
+            depths = {}
+            self.max_depth = 0
+            for node in self.nodes_on_all_streams:
+                if node in depths:
+                    continue
+                max_arg_depth = 0
+                for arg in node.args:
+                    if isinstance(arg, torch.fx.Node):
+                        if arg not in self.node_set:
+                            continue
+                        assert arg in depths
+                        max_arg_depth = max(max_arg_depth, depths[arg])
+                depth = max_arg_depth+1
+                depths[node] = depth
+                self.max_depth = max(self.max_depth, depth)
+
+            self.num_steps = self.max_depth + 1
 
     def get_overlap_type(self, node1: torch.fx.Node, out_idx1: int,
                          node2: torch.fx.Node, out_idx2: int) -> OverlapType:
@@ -454,7 +480,7 @@ class LifetimeInfo:
 
     def compute_asap_by_depth(self):
         asaps = {}
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             self._compute_asap_by_depth(node, asaps)
         return asaps
 
@@ -481,7 +507,7 @@ class LifetimeInfo:
 
     def compute_alap_by_depth(self):
         alaps = {}
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             self._compute_alap_by_depth(node, alaps)
         return alaps
 
@@ -509,7 +535,7 @@ class LifetimeInfo:
     def compute_node_makespans_by_depth(self):
         asaps = self.compute_asap_by_depth()
         alaps = self.compute_alap_by_depth()
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             asap = asaps[node]
             alap = alaps[node]
             self.node_makespans[node] = (asap, alap)
@@ -517,10 +543,10 @@ class LifetimeInfo:
 
     def compute_node_makespans_by_cone(self):
         # refresh post cache for post nodes to avoid calling deep incursive call
-        for node in reversed(self.nodes_to_schedule):
+        for node in reversed(self.nodes_on_all_streams):
             self.find_all_post_nodes(node)
 
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             prev_node_num = len(self.find_all_prev_nodes(node))
             post_node_num = len(self.find_all_post_nodes(node))
 
@@ -530,7 +556,7 @@ class LifetimeInfo:
 
     def compute_node_makespans(self):
         assert not self.node_makespans
-        node_num = len(self.nodes_to_schedule)
+        node_num = len(self.nodes_on_all_streams)
         if self.pre_scheded_nodes:
             for node,step in self.pre_scheded_nodes.items():
                 self.node_makespans[node] = (step, step)
@@ -549,7 +575,7 @@ class LifetimeInfo:
         # must compute node makespans(asap/alap) before computing edge makespans
         self.compute_node_makespans()
 
-        for node in self.nodes_to_schedule:
+        for node in self.nodes_on_all_streams:
             lb, ub = self.node_makespans[node]
             user_ub_max = ub
             for user in node.users:
@@ -568,7 +594,7 @@ class LifetimeInfo:
         if not self.edge_makespans:
             self.compute_edge_makespans()
 
-        for nd in self.nodes_to_schedule:
+        for nd in self.nodes_on_all_streams:
             assert nd in self.edge_makespans
             lb, ub = self.edge_makespans[nd]
             out_vars = self.graph_mem_info.get_out_vars(nd)
@@ -589,4 +615,216 @@ class LifetimeInfo:
                     self.buffer_makespans[out_shared_group] = [lb, ub]
 
         return self.buffer_makespans
+
+class ScheduledLifetimeInfo(LifetimeInfo):
+    def __init__(self,
+                 graph,                 # torch.fx.Graph
+                 nodes_on_all_streams,  # list of nodes we care lifetimes
+                 graph_mem_info,        # GraphMemInfo
+                 schedule_result):      # ScheduleResult
+        super().__init__(graph, nodes_on_all_streams, graph_mem_info)
+
+        self.schedule_result = schedule_result
+
+        self.nodes_out_of_ctx = []
+
+    def build_extended_schedule_maps(self):
+        # copy original per stream schedule
+        for node_idx_map in self.schedule_result.node_idx_maps:
+            ext_sched_map = node_idx_map.copy()
+            self.extended_schedule_maps.append(ext_sched_map)
+            self.nodes_out_of_ctx.append(set())
+
+        # update schedule map with across-stream consumers
+        for sid in range(self.schedule_result.num_streams):
+            seq = self.schedule_result.get_sequence(sid)
+            last_pos = len(seq) - 1
+            for node in seq:
+                for user in node.users:
+                    if user not in self.node_set:
+                        continue
+                    user_schedule = self.schedule_result.get_schedule(user)
+                    user_sid = user_schedule.log_stream_id
+                    if user_sid == sid:
+                        continue
+
+                    self.nodes_out_of_ctx[sid].add(user)
+                    if (
+                        (user not in self.anchors_between_streams) or
+                        (sid not in self.anchors_between_streams[user])
+                    ):
+                        assert user not in self.extended_schedule_maps[sid]
+                        self.extended_schedule_maps[sid][user] = last_pos
+                    else:
+                        anchor_pos = self.anchors_between_streams[user][sid]
+                        assert anchor_pos > 0
+                        if user not in self.extended_schedule_maps:
+                            self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
+                            #self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
+                        elif self.extended_schedule_maps[sid][user] < (anchor_pos - 1):
+                            #print(f"update anchor position for {node} due to user {user}")
+                            self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
+                            #self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
+
+        # debug
+        #for sid in range(self.schedule_result.num_streams):
+        #    print(f"stream {sid}:\n  extended_schedule_map:\n  {self.extended_schedule_maps[sid]}")
+        #    print(f"  nodes out of context:\n  {self.nodes_out_of_ctx[sid]}")
+
+    def build_anchors_between_streams(self):
+        stream_pointers = [0]*self.schedule_result.num_streams
+        for sid in range(self.schedule_result.num_streams):
+            seq = self.schedule_result.get_sequence(sid)
+            stream_pointers[sid] = len(seq)-1
+
+        rdy_queue = queue.Queue()
+
+        # initialize ready queue
+        for sid in range(self.schedule_result.num_streams):
+            last_node = self.schedule_result.get_node(sid, stream_pointers[sid])
+            ready = True
+            for user in last_node.users:
+                if (
+                    user in self.node_set and
+                    user not in self.anchors_between_streams
+                ):
+                    ready = False
+                    break
+            if ready:
+                rdy_queue.put(last_node)
+                stream_pointers[sid] -= 1
+
+        while not rdy_queue.empty():
+            cur_node = rdy_queue.get()
+            cur_schedule = self.schedule_result.get_schedule(cur_node)
+            cur_sid = cur_schedule.log_stream_id
+            cur_seq = self.schedule_result.get_sequence(cur_sid)
+            cur_seq_ub = len(cur_seq)-1
+            cur_pos = cur_schedule.local_idx
+            assert stream_pointers[sid] < cur_schedule.local_idx
+
+            ready = True
+            cur_anchors_between_streams = {}   # other stream id(int) -> smallest anchor(int)
+            for user in cur_node.users:
+                if user not in self.node_set:
+                    continue
+                user_schedule = self.schedule_result.get_schedule(user)
+                user_sid = user_schedule.log_stream_id
+                if user_sid == cur_sid:
+                    continue
+                user_idx = user_schedule.local_idx
+                #print(f"cur node {cur_node}, user {user}, user schedule: ({user_sid}, {user_idx})")
+                if user_sid in cur_anchors_between_streams:
+                    if user_idx < cur_anchors_between_streams[user_sid]:
+                        cur_anchors_between_streams[user_sid] = user_idx
+                else:
+                    cur_anchors_between_streams[user_sid] = user_idx
+
+            successor_anchors_between_streams = {}
+            if cur_pos < cur_seq_ub:
+                successor = cur_seq[cur_pos+1]
+                successor_anchors_between_streams = self.anchors_between_streams[successor]
+                #print(f"cur_sid {cur_sid}, cur_seq_ub {cur_seq_ub}, cur_pos {cur_pos}, successor {successor},\nsuccessor_anchors_between_streams {successor_anchors_between_streams}")
+
+            assert cur_node not in self.anchors_between_streams, f"{cur_node} records anchors twice"
+
+            #print(f"current node {cur_node}, cur_anchors_between_streams: {cur_anchors_between_streams}")
+
+            # merge successor_anchors_between_streams and cur_anchors_between_streams
+            if not cur_anchors_between_streams:
+                self.anchors_between_streams[cur_node] = successor_anchors_between_streams
+                #print(f"final current node {cur_node}, successor_anchors_between_streams: {successor_anchors_between_streams}")
+            elif not successor_anchors_between_streams:
+                self.anchors_between_streams[cur_node] = cur_anchors_between_streams
+                #print(f"final current node {cur_node}, cur_anchors_between_streams: {cur_anchors_between_streams}")
+            else:
+                for sid,anchor in successor_anchors_between_streams.items():
+                    assert sid != cur_sid
+                    if sid not in cur_anchors_between_streams:
+                        cur_anchors_between_streams[sid] = anchor
+                    else:
+                        if anchor < cur_anchors_between_streams[sid]:
+                            cur_anchors_between_streams[sid] = anchor
+
+                self.anchors_between_streams[cur_node] = cur_anchors_between_streams
+                #print(f"final current node {cur_node}, updated cur_anchors_between_streams: {cur_anchors_between_streams}")
+
+            # update ready queue
+            for sid in range(self.schedule_result.num_streams):
+                pos = stream_pointers[sid]
+                if pos < 0:
+                    continue
+                seq = self.schedule_result.get_sequence(sid)
+                pre_node = seq[pos]
+                pre_rdy = True
+                for user in pre_node.users:
+                    if (
+                        user in self.node_set and
+                        user not in self.anchors_between_streams
+                    ):
+                        pre_rdy = False
+                        break
+                if pre_rdy:
+                    rdy_queue.put(pre_node)
+                    stream_pointers[sid] = pos-1
+
+    def compute_edge_makespans(self):
+        self.edge_makespan_maps = [{} for _ in range(self.schedule_result.num_streams)]
+        for sid in range(self.schedule_result.num_streams):
+            max_step = len(self.schedule_result.node_sequences[sid])-1
+            for node,step in self.extended_schedule_maps[sid].items():
+                if node in self.nodes_out_of_ctx[sid]:
+                    continue
+
+                user_max_step = step
+                for user in node.users:
+                    if user not in self.extended_schedule_maps[sid]:
+                        user_max_step = max_step
+                        break
+                    user_step = self.extended_schedule_maps[sid][user]
+                    user_max_step = max(user_max_step, user_step)
+
+                self.edge_makespan_maps[sid][node] = (step, user_max_step)
+
+        # debug
+        #for sid in range(self.schedule_result.num_streams):
+        #    print(f"edge makespan on stream {sid}:\n{self.edge_makespan_maps[sid]}")
+
+    def compute_buffer_makespans(self):
+        self.buffer_makespan_maps = [{} for _ in range(self.schedule_result.num_streams)]
+        if not self.edge_makespan_maps:
+            self.compute_edge_makespans()
+        for sid in range(self.schedule_result.num_streams):
+            cur_seq = self.schedule_result.get_sequence(sid)
+            cur_edge_makespan_map = self.edge_makespan_maps[sid]
+            cur_buffer_makespan_map = self.buffer_makespan_maps[sid]
+            cur_max_step = len(cur_seq)-1
+
+            for nd in cur_seq:
+                assert nd in cur_edge_makespan_map
+                lb, ub = cur_edge_makespan_map[nd]
+                out_vars = self.graph_mem_info.get_out_vars(nd)
+                for var in out_vars:
+                    out_tensor = (nd, var.out_index)
+                    out_shared_group = self.mem_share_info[out_tensor]
+                    if out_shared_group.src_from_ctx:
+                        #if out_shared_group not in cur_buffer_makespan_map:
+                        #    cur_buffer_makespan_map[out_shared_group] = [0, cur_max_step]
+                        continue
+
+                    src_node = out_shared_group.src_tensor[0]
+                    src_node_sched = self.schedule_result.get_schedule(src_node)
+                    src_node_stream_id = src_node_sched.log_stream_id
+                    if src_node_stream_id != sid:
+                        continue
+
+                    if out_shared_group in cur_buffer_makespan_map:
+                        buffer_span = cur_buffer_makespan_map[out_shared_group]
+                        if lb < buffer_span[0]:
+                            buffer_span[0] = lb
+                        if ub > buffer_span[1]:
+                            buffer_span[1] = ub
+                    else:
+                        cur_buffer_makespan_map[out_shared_group] = [lb, ub]
+
 

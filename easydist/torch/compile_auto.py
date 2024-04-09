@@ -450,32 +450,40 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
             logging.info("finish profiling fx module's memory")
             graph_mem_info = alloc_profiler.create_graph_mem_info()
 
+            op_streams = {}
+            for op_name, streams in trace_data.op_streams.items():
+                op_streams[op_name] = streams[0]
+
+            for op_name, streams in trace_data.op_extra_streams.items():
+                if op_name not in op_streams:
+                    op_streams[op_name] = streams[0]
+
             if mdconfig.mem_opt_by_solver:
-                mem_sched = ILPMemoryScheduler(
-                                    sharded_graph, graph_mem_info, 1024*128)
+                mem_sched = ILPMemoryScheduler(sharded_graph, graph_mem_info,
+                                               1024*128, op_streams)
             else:
                 mem_sched = EfficientMemoryScheduler(
-                                    sharded_graph, graph_mem_info)
+                                    sharded_graph, graph_mem_info, op_streams)
 
-            required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations = \
+            required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems = \
                                                 mem_sched.gen_mem_addresses()
             #print(f"master proposes required_memory: {required_memory}")
-            #print(f"master creates mem locations:\n{mem_locations}")
+            #print(f"master creates mem locations:\n{inter_op_mems}")
 
             with mem_addr_rdy_cond:
                 global mem_sol
                 mem_sol = [
-                    required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations
+                    required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems
                 ]
                 mem_addr_rdy_cond.notify_all()
 
             assert len(ordered_schedules) == len(mem_sched.nodes_to_schedule), \
                 f"schedule {len(ordered_schedules)} nodes, but totally {len(mem_sched.nodes_to_schedule)} nodes"
         else:
-            required_memory, temp_memory, ordered_schedules, mem_alloc_info, mem_locations = rpc.rpc_sync(
+            required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems = rpc.rpc_sync(
                                 "ed_worker0", fetch_mem_sol, args=(), timeout=0)
             #print(f"worker {rank} receives required_memory: {required_memory}")
-            #print(f"worker {rank} receives mem locations:\n{mem_locations}")
+            #print(f"worker {rank} receives mem locations:\n{inter_op_mems}")
 
         rpc.shutdown()
 

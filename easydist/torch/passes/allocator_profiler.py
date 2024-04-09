@@ -150,7 +150,7 @@ class ModuleProfilingInfo:
 
                 if not alloc_for_out:
                     alloc_size = addr_size[1]
-                    #print(f"add temp var: alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
+                    #print(f"[temp var] {node_name}, alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
                     node_mem_info.add_temp_var(alloc_size, alloc_idx)
                     if alloc_size==0:
                         logger.info(f"The allocated temp buffer size of tensor {node_name} is zero")
@@ -177,7 +177,7 @@ class ModuleProfilingInfo:
 
                     assert is_ref, f"rank {self.rank}, {node_name}:{out_idx} is neither allocated nor a reference"
 
-            #print(f"node_mem_info:\n{str(node_mem_info)}")
+            #print(f"[{node_name}] node_mem_info:\n{str(node_mem_info)}")
         #print(str_info)
         return graph_mem_info
 

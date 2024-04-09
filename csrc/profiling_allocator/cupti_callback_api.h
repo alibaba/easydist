@@ -20,7 +20,7 @@
 
 #pragma once
 
-#define TRACER_VERBOSE
+//#define TRACER_VERBOSE
 
 extern std::string g_cur_op_name;
 extern bool g_stream_tracing_active;
@@ -77,8 +77,10 @@ typedef struct StreamTraceData_st {
   void clear() {
     op_streams_.clear();
     op_extra_streams_.clear();
+#ifdef TRACER_VERBOSE
     op_kernels_.clear();
     op_extra_kernels_.clear();
+#endif
   }
 
   std::map<std::string, std::vector<uint32_t>> op_streams_;
