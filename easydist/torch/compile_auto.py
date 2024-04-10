@@ -41,7 +41,7 @@ from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.PipelineStage import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params, set_backward_flag, set_step_flag, set_updated_params
+from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states, set_backward_flag, set_step_flag, set_updated_params_states
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
@@ -50,6 +50,7 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
+from easydist.torch.passes.fix_sharding_node_order import fix_sharding_node_order
 from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
@@ -265,7 +266,7 @@ def _compile_auto(func,
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-        params = get_updated_params() or params
+        params, named_states = get_updated_params_states()
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
@@ -343,9 +344,9 @@ def _compile_auto(func,
     sharded_graph = fix_embedding(sharded_graph, recover=True)
 
     if not mdconfig.use_dtensor:
-        if mdconfig.comm_optimization is True:
-            sharded_graph = runtime_prof(sharded_graph)
-            sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
+        # if mdconfig.comm_optimization is True:
+            # sharded_graph = runtime_prof(sharded_graph)
+            # sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
 
         # override pytorch dtensor propagate rules to optimize dispater behavior
         if mdconfig.override_dtensor_rule is True:
@@ -522,13 +523,14 @@ def _compile_auto(func,
             for node in traced_graph.graph.nodes
         }
         stateless_func_args = (params, buffers, named_states, args, kwargs)
-        # save_graphviz_dot(sharded_graph, 'sharded_graph')
-        # sharded_graph = bfs_topsort(sharded_graph)
+        sharded_graph = fix_sharding_node_order(sharded_graph)
+        save_graphviz_dot(sharded_graph, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(sharded_graph,
                                                                     world_size,
                                                                     stateless_func_args,
                                                                     init_helper=init_helper,
                                                                     strict=strict)
+        # sharded_graph = pp_local_gm
         save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(schedule_cls=schedule_cls,
                             local_gm=pp_local_gm,

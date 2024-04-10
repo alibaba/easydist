@@ -135,19 +135,19 @@ ANNOTATION_OPS = [
     torch.ops.easydist.step_split.default
 ]
 
-__updated_params = None
+__updated_params_states = None, None
 __backward_flag = False
 __step_flag = False
 
 
-def get_updated_params():
-    global __updated_params
-    return __updated_params
+def get_updated_params_states():
+    global __updated_params_states
+    return __updated_params_states
 
 
-def set_updated_params(updated_params):
-    global __updated_params
-    __updated_params = updated_params
+def set_updated_params_states(updated_params, updated_states):
+    global __updated_params_states
+    __updated_params_states = updated_params, updated_states
 
 
 def get_backward_flag():
@@ -171,7 +171,7 @@ def set_step_flag(flag):
 
 def clear_pp_compile_states():
     set_backward_flag(False)
-    set_updated_params(None)
+    set_updated_params_states(None, None)
     set_step_flag(False)
 
 

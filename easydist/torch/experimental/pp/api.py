@@ -10,10 +10,11 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline, get_updated_params,
-                                                             set_backward_flag, set_step_flag, set_updated_params)
+                                                             set_backward_flag, set_step_flag, set_updated_params_states)
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.PipelineStage import PipelineStage
+from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
@@ -86,7 +87,7 @@ def _compile_pp(func,
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
-        set_updated_params(params)
+        clear_pp_compile_states()
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -94,7 +95,7 @@ def _compile_pp(func,
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-        params = get_updated_params()
+        params, named_states = get_updated_params()
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 

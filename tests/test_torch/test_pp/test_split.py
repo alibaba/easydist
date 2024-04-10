@@ -24,7 +24,7 @@ from easydist.utils import rgetattr, rsetattr
 from torch.fx.experimental.proxy_tensor import make_fx
 # from easydist.torch.experimental.pp.ed_make_fx import ed_make_fx
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.experimental.pp.split_utils import set_updated_params, get_updated_params
+from easydist.torch.experimental.pp.split_utils import set_updated_params_states, get_updated_params_states
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 
 
@@ -175,7 +175,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
         flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
-        set_updated_params(params)
+        set_updated_params_states(params, named_states)
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -183,7 +183,7 @@ def test_main(module, split_ann_or_policy, rand_input_gen_method, train_step_fun
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-        params = get_updated_params()
+        params, named_states = get_updated_params_states()
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 

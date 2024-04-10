@@ -20,7 +20,7 @@ from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.utils import _rematerialize_optimizer
-from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
+from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params_states, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
 
 from torch.nn.utils import stateless
 
@@ -591,7 +591,7 @@ class SplitPatcher(_Patcher):
                         opt, named_states, params) if opt else nullcontext():
                     orig_step(opt, *args, **kwargs)
 
-                set_updated_params(params)
+                set_updated_params_states(params, named_states)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
@@ -735,7 +735,11 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                 args = []
                 for arg in node.args:
                     if isinstance(arg, (list, tuple)):  # list of Tensors
-                        args.append([env[x.name] for x in arg if x.name in env])
+                        if any(isinstance(x, fx.Node) for x in arg):
+                            assert all(isinstance(x, fx.Node) for x in arg)
+                            args.append([env[x.name] for x in arg if x.name in env])
+                        else:
+                            args.append(arg)
                     elif isinstance(arg, torch.fx.Node):  # Tensor
                         if arg.name in env:
                             args.append(env[arg.name])
@@ -745,7 +749,11 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                 kwargs = {}
                 for kwarg_name, kwarg in node.kwargs.items():
                     if isinstance(kwarg, (list, tuple)):
-                        kwargs[kwarg_name] = [env[x.name] for x in kwarg if x.name in env]
+                        if any(isinstance(x, fx.Node) for x in kwarg):
+                            assert all(isinstance(x, fx.Node) for x in kwarg)
+                            kwargs[kwarg_name] = [env[x.name] for x in kwarg if x.name in env]
+                        else:
+                            kwargs[kwarg_name] = kwarg
                     elif isinstance(kwarg, torch.fx.Node):
                         if kwarg.name in env:
                             kwargs[kwarg_name] = env[kwarg.name]
@@ -942,6 +950,7 @@ def compile_pipeline(
         return outputs_spec, call_module_users
 
     def _extract_fw_submod(node, submod):
+        save_graphviz_dot(submod, node.name)
         # process input
         inputs_spec = []
         inputs_users = []
@@ -974,6 +983,7 @@ def compile_pipeline(
                              call_module_users, node.target)
 
     def _extract_bw_submod(node, submod):
+        save_graphviz_dot(submod, node.name)
         # process input
         inputs_spec = []
         inputs_users = []
@@ -1147,7 +1157,7 @@ def compile_pipeline(
                         kwargs={arg_name: env[arg_name]
                                 for arg_name in stage.bw_func_args})
                     name_to_stage_idx[node_name] = stage_idx
-                    for output in stage.bw_gm.outputs_spec:
+                    for output in stage.bw_gm.call_module_users:
                         if not output in output_nodes_flatten:
                             env[output] = g.create_node(name=output,
                                                         op='call_function',
