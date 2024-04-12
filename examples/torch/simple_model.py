@@ -9,9 +9,11 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
 from torch.utils.checkpoint import checkpoint
+from torch.distributed._tensor import DeviceMesh
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
+from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
 
 
@@ -107,7 +109,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
         annotate_split_points(model, {
-            "norm"
+            "linear"
         })
 
         randn_input = torch.randn(1024, 1024)
@@ -176,6 +178,14 @@ def main():
     torch.distributed.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+
+    
+    set_device_mesh(DeviceMesh("cuda", [
+        [
+            [0, 2],
+            [1, 3]
+        ]
+    ], mesh_dim_names=["spmd0", "spmd1", "pp"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,

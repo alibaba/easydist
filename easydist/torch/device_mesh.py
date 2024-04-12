@@ -15,6 +15,7 @@
 import logging
 import functools
 import operator
+from contextlib import contextmanager
 
 import numpy
 import torch
@@ -72,21 +73,47 @@ def device_mesh_rank(device_mesh, dim):
 
     return rank
 
+# [spmd0, spmd1, pp]
+__with_spmd_device_mesh = False  # TODO @botbw: remove this function tag
 
-WITH_PP_PARALLELISM = True
-
-def set_with_pp_parallelism(with_pp_parallelism):
-    global WITH_PP_PARALLELISM
-    WITH_PP_PARALLELISM = with_pp_parallelism
+@contextmanager
+def spmd_device_mesh():
+    global __with_spmd_device_mesh
+    ori_with_spmd_device_mesh = __with_spmd_device_mesh
+    __with_spmd_device_mesh = True
+    try:
+        yield
+    finally:
+        __with_spmd_device_mesh = ori_with_spmd_device_mesh
 
 def get_device_mesh():
     global TORCH_DEVICE_MESH
-    if WITH_PP_PARALLELISM:
-        return get_spmd_device_mesh(TORCH_DEVICE_MESH)
+    if __with_spmd_device_mesh:
+        return __get_spmd_device_mesh(TORCH_DEVICE_MESH)
     return TORCH_DEVICE_MESH
 
-def get_spmd_device_mesh(device_mesh):
-    assert WITH_PP_PARALLELISM 
+def get_spmd_size():
+    global TORCH_DEVICE_MESH
+    return TORCH_DEVICE_MESH.size(0), TORCH_DEVICE_MESH.size(1)
+
+def get_spmd_rank():
+    global TORCH_DEVICE_MESH
+    return TORCH_DEVICE_MESH.get_coordinate_on_dim(0), TORCH_DEVICE_MESH.get_coordinate_on_dim(1)
+
+def get_pp_size():
+    global TORCH_DEVICE_MESH
+    return TORCH_DEVICE_MESH.size(2)
+
+def get_pp_rank():
+    global TORCH_DEVICE_MESH
+    return TORCH_DEVICE_MESH.get_coordinate_on_dim(2)
+
+def get_pp_group():
+    global TORCH_DEVICE_MESH
+    return TORCH_DEVICE_MESH.get_dim_groups(2)
+
+def __get_spmd_device_mesh(device_mesh):
+    assert __with_spmd_device_mesh 
 
     if device_mesh is None:
         return None
