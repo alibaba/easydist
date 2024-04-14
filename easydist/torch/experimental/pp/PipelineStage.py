@@ -13,7 +13,9 @@ import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import map_arg
 import torch.utils._pytree as pytree
+from torch.distributed._tensor import DeviceMesh, mesh_resources
 
+from easydist.torch.device_mesh import get_device_mesh, get_pp_group, get_pp_rank, spmd_device_mesh
 from easydist.torch.experimental.pp.compile_pipeline import (
     CompiledMeta, CompiledStage, StateType,
     graph_outputs_to_func_outputs)
@@ -163,8 +165,8 @@ class PipelineStage:
         self,
         schedule_cls: Type[Schedule],
         local_gm: fx.GraphModule,
-        compiled_meta: CompiledMeta,
         stage_idx: int,
+        compiled_meta: CompiledMeta,
         compiled_stage: CompiledStage,
         node_metas: Dict[str, Dict[str, FakeTensor]],
         num_chunks: int,
@@ -172,16 +174,17 @@ class PipelineStage:
         kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
         returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
         device: torch.device,
-        group: Optional[dist.ProcessGroup] = None,
+        group: dist.ProcessGroup,
+        sharded_graph: fx.GraphModule,
         gather_output=True
     ):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
-        assert issubclass(schedule_cls, Schedule), "schedule_cls must be the Schedule class itself"
+        assert issubclass(schedule_cls, Schedule), "schedule_cls must be the Schedule class"
         self.schedule = schedule_cls(self)
-        self.compiled_meta = compiled_meta
         self.stage_idx = stage_idx
+        self.compiled_meta = compiled_meta
         self.compiled_stage = compiled_stage
         self.num_chunks = num_chunks
         self.inputs_nodes_chunk_spec = self._get_inputs_nodes_spec(compiled_meta, args_chunk_spec,
@@ -194,6 +197,7 @@ class PipelineStage:
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
         self.return_to_all_stages = gather_output
+        self.graph = sharded_graph
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
@@ -210,7 +214,7 @@ class PipelineStage:
         # Prepare send/recv infrastructure
         self._init_communication(node_metas)
         # Cast submodule to device
-        self._move_or_init_inject_states()
+        # self._move_or_init_inject_states()
         # Move ops argument to device
         self._move_ops_to_device()
 
@@ -265,39 +269,39 @@ class PipelineStage:
             returns_nodes_chunk_spec[name] = spec
         return returns_nodes_chunk_spec
 
-    def _move_or_init_inject_states(self):
-        # Move submodule to indicated device if possible
-        # Note: we cannot move meta module to real devices because meta tensors
-        # do not support to() method. One needs to do an in-place tensor swap in
-        # that case.
-        for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
-            if isinstance(tensor, FakeTensor) or tensor.is_meta:
-                materialize_fn = self.compiled_meta.params_init_helpers[name]
-                self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = materialize_fn(
-                    tensor=tensor, materialization_device=self.device)
-            else:
-                self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
-                    self.device)
-        for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
-            if isinstance(tensor, FakeTensor) or tensor.is_meta:
-                materialize_fn = self.compiled_meta.buffers_init_helpers[name]
-                self.compiled_stage.fw_gm.injected_states[
-                    StateType.BUFFERS][name] = materialize_fn(tensor=tensor,
-                                                              materialization_device=self.device)
-            else:
-                self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
-                    self.device)
-        if self.step_node is not None:
-            for name, tensor in self.compiled_stage.step_gm.injected_states[
-                    StateType.OPTIMSTATES].items():
-                if isinstance(tensor, FakeTensor) or tensor.is_meta:
-                    materialize_fn = self.compiled_meta.optimstates_init_helpers[name]
-                    self.compiled_stage.step_gm.injected_states[
-                        StateType.OPTIMSTATES][name] = materialize_fn(
-                            tensor=tensor, materialization_device=self.device)
-                else:
-                    self.compiled_stage.step_gm.injected_states[
-                        StateType.OPTIMSTATES][name] = tensor.to(self.device)
+    # def _move_or_init_inject_states(self):
+    #     # Move submodule to indicated device if possible
+    #     # Note: we cannot move meta module to real devices because meta tensors
+    #     # do not support to() method. One needs to do an in-place tensor swap in
+    #     # that case.
+    #     for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
+    #         if isinstance(tensor, FakeTensor) or tensor.is_meta:
+    #             materialize_fn = self.compiled_meta.params_init_helpers[name]
+    #             self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = materialize_fn(
+    #                 tensor=tensor, materialization_device=self.device)
+    #         else:
+    #             self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
+    #                 self.device)
+    #     for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
+    #         if isinstance(tensor, FakeTensor) or tensor.is_meta:
+    #             materialize_fn = self.compiled_meta.buffers_init_helpers[name]
+    #             self.compiled_stage.fw_gm.injected_states[
+    #                 StateType.BUFFERS][name] = materialize_fn(tensor=tensor,
+    #                                                           materialization_device=self.device)
+    #         else:
+    #             self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
+    #                 self.device)
+    #     if self.step_node is not None:
+    #         for name, tensor in self.compiled_stage.step_gm.injected_states[
+    #                 StateType.OPTIMSTATES].items():
+    #             if isinstance(tensor, FakeTensor) or tensor.is_meta:
+    #                 materialize_fn = self.compiled_meta.optimstates_init_helpers[name]
+    #                 self.compiled_stage.step_gm.injected_states[
+    #                     StateType.OPTIMSTATES][name] = materialize_fn(
+    #                         tensor=tensor, materialization_device=self.device)
+    #             else:
+    #                 self.compiled_stage.step_gm.injected_states[
+    #                     StateType.OPTIMSTATES][name] = tensor.to(self.device)
 
     def _move_ops_to_device(self):
         # Today PT2 tracer does not treat `x.device` as a symbolic device;
@@ -479,7 +483,7 @@ class PipelineStage:
                              f"Sending tensor to Rank {dst}: {val.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
-                    val,
+                    val.contiguous(),
                     peer_rank if self.group is None else dist.get_global_rank(
                         self.group, peer_rank),  # TODO
                     group=self.group,
@@ -603,23 +607,24 @@ class PipelineStage:
     #             all_graph_outputs.update(outputs)
     #     return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
 
-    def gather_state_dict(self, rank):
+    def gather_state_dict(self, group_rank):
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()
-        dist.gather_object(state_dict, state_dicts if self.group_rank == rank else None, dst=rank)
+        dist.gather_object(state_dict, state_dicts if self.group_rank == group_rank else None, dst=group_rank, group=self.group)
         return state_dicts
 
-    def gather_optimizer_state_dict(self, rank):
+    def gather_optimizer_state_dict(self, group_rank):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
         dist.gather_object(optimizer_state_dict,
-                           optimizer_state_dicts if self.group_rank == rank else None,
-                           dst=rank)
+                           optimizer_state_dicts if self.group_rank == group_rank else None,
+                           dst=group_rank,
+                           group=self.group)
         return optimizer_state_dicts
 
     def all_gather_outputs(self):
         outputs_all_gather = [None for _ in range(self.num_stages)]
-        dist.all_gather_object(outputs_all_gather, self.outputs_batch)
+        dist.all_gather_object(outputs_all_gather, self.outputs_batch, group=self.group)
         all_graph_outputs = {}
         for output_stage in outputs_all_gather:
             all_graph_outputs.update(output_stage)
@@ -631,7 +636,7 @@ class PipelineStage:
         returns_all_gather = [None for _ in range(self.num_stages)]
         returns_nodes_flatten = {node_name: None for node_name in self.compiled_meta.returns_nodes_flatten}
         returns_batch = {node_name: val for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten}
-        dist.all_gather_object(returns_all_gather, returns_batch)
+        dist.all_gather_object(returns_all_gather, returns_batch, group=self.group)
         all_returns = {}
         for returns_stage in returns_all_gather:
             for k, v, in returns_stage.items():
@@ -668,6 +673,8 @@ class PipelineStage:
             ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
         return ret
 
+    def run_with_graph(self, graph, *args, **kwargs):
+        return self(*args, **kwargs)
 
 def print_tensor_dict(chunk, di):
     print(f'Chunk {chunk}')

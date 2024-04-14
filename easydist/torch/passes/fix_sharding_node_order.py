@@ -13,13 +13,14 @@
 # ==============================================================================
 
 from typing import Dict, List
+from collections import Counter
 import operator
 from matplotlib.pyplot import step
 import torch
 import torch.fx as fx
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS, get_backward_flag, get_step_flag
 from easydist.torch.passes.comm_optimize import _link_nodes
-from easydist.torch.passes.sharding import CUSTOM_FUNCS
+from easydist.torch.passes.sharding import COMM_FUNCS, CUSTOM_FUNCS
 
 def fix_sharding_node_order(fx_module: fx.GraphModule):
     nodes = list(fx_module.graph.nodes)
@@ -42,11 +43,11 @@ def bfs2bottom(root: fx.Node, vis: Dict[fx.Node, bool]):
     res = []
     while q:
         cur = q.pop(0)
-        res.append(cur)
         for user in cur.users:
             if vis[user]:
                 continue
             vis[user] = True
+            res.append(user)
             q.append(user)
     return set(res)
 
@@ -55,20 +56,20 @@ def bfs2top(root: fx.Node, vis: Dict[fx.Node, bool]):
     res = []
     while q:
         cur = q.pop(0)
-        res.append(cur)
         for input_node in cur.all_input_nodes:
             if vis[input_node]:
                 continue
             vis[input_node] = True
+            res.append(input_node)
             q.append(input_node)
     return set(res)
 
 def fix_order(fx_module: fx.GraphModule):
     '''
-                                            ┏ grad ┓
-    Assume that the graph looks like fw -> bw -> step -> output
-                                      ┣ act ┛               ┃
-                                      ┗━━━━ fw output ━━━━━━┛
+                                    ┏ grad ┓
+    Assume that the graph is fw -> bw -> step -> output
+                              ┣ act ┛               ┃
+                              ┗━━━━ fw output ━━━━━━┛
     '''
     # phs and output
     phs = []
@@ -92,11 +93,9 @@ def fix_order(fx_module: fx.GraphModule):
         assert len(fw_bw_split_nodes) % 2 == 1
         n = len(fw_bw_split_nodes)
         backward_split_node = fw_bw_split_nodes[n // 2]
-    
+
     # partition graph nodes
     vis = {node: False for node in fx_module.graph.nodes}
-    # ind = {node: len(node.all_input_nodes) for node in fx_module.graph.nodes}
-    # outd = {node: len(node.users) for node in fx_module.graph.nodes}
 
     for ph in phs:
         vis[ph] = True
@@ -106,52 +105,77 @@ def fix_order(fx_module: fx.GraphModule):
     if step_split_node:
         vis[step_split_node] = True
         step_partition = bfs2bottom(step_split_node, vis)
+        step_partition.add(step_split_node)
 
     # backward nodes, any toplogical order will do
-    forward_partition = set()
+    forward_partition = bfs2top(backward_split_node, vis)
     backward_partition = set()
     if backward_split_node:
         vis[backward_split_node] = True
         backward_partition = bfs2bottom(backward_split_node, vis)
-        forward_partition = bfs2top(backward_split_node, vis)
+        backward_partition.add(backward_split_node)
 
-    forward_nodes = []
-    backward_nodes = []
-    step_nodes = []
-    # get topological order
-    for node in fx_module.graph.nodes:
-        if node.op == 'placeholder' or node.op == 'output':
-            continue
-        if node in forward_partition:
-            forward_nodes.append(node)
-        elif node in backward_partition:
-            backward_nodes.append(node)
-        elif node in step_partition:
-            step_nodes.append(node)
+    # other comm nodes
+    #   1. output move to earlist point
+    #   2. activations, move to the latest point (i.e. cooresponding backward submod)
+    comm1_partition = bfs2top(output, vis)
+    comm2_partition = set(fx_module.graph.nodes) - set(phs) - set([output]) - comm1_partition - backward_partition - step_partition - forward_partition
 
-    nodes = phs + forward_nodes + backward_nodes + step_nodes + [output]
+    nodes = list(fx_module.graph.nodes)
+    # get topological order for each partition
+    for i, node in enumerate(nodes):
+        if node in backward_partition:
+            ancessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
+            nodes.pop(i)
+            nodes.insert(ancessor_id + 1, node)
+
+    for i in range(len(nodes) - 1, -1, -1):
+        node = nodes[i]
+        if node in comm2_partition:
+            successor_id = min(map(lambda n: nodes.index(n), node.users))
+            nodes.pop(i)
+            nodes.insert(successor_id - 1, node)
+
+
+    # forward nodes move to the latest point
+    # forward_nodes = forward_nodes[::-1]
+    # for i, node in enumerate(forward_nodes):
+    #     successor_id = max(map(lambda n: forward_nodes.index(n) if n in forward_partition else -1, node.users))
+    #     if successor_id == -1: continue
+    #     forward_nodes.pop(i)
+    #     forward_nodes.insert(successor_id + 1, node)
+    # forward_nodes = forward_nodes[::-1]
     
-    # jump nodes
-    #   for grad and output (user is step_split_node) move to earlist point
-    #   for activations, move to the latest point
-    for node in fx_module.graph.nodes:
-        if not vis[node] and (step_split_node in node.users or output in node.users):
-                vis[node] = True
-                accessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
-                nodes.insert(accessor_id + 1, node)
+    # backward nodes move to earlist point
+    # for i, node in enumerate(backward_nodes):
+    #     ancessor_id = max(map(lambda n: backward_nodes.index(n) if n in backward_partition and n.op != 'placeholder' else -1, node.all_input_nodes))
+    #     if ancessor_id == -1: continue
+    #     backward_nodes.pop(i)
+    #     backward_nodes.insert(ancessor_id + 1, node)
 
-    for node in reversed(list(fx_module.graph.nodes)):
-        if not vis[node]:
-            vis[node] = True
-            succeesor_id = min(map(lambda n: nodes.index(n), node.users))
-            nodes.insert(succeesor_id, node)
+    # nodes = phs + forward_nodes + backward_nodes + step_nodes + [output]
 
-    assert set(nodes) == set(fx_module.graph.nodes)
+    # # output nodes
+    # for node in comm1_nodes:
+    #     # accessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
+    #     # if accessor_id == -1:
+    #     #     succeesor_id = min(map(lambda n: nodes.index(n), node.users))
+    #     #     nodes.insert(succeesor_id, node)
+    #     #     continue
+    #     accessor_id = len(nodes) - 1
+    #     nodes.insert(accessor_id, node)
+
+    # for node in reversed(comm2_nodes):
+    #     succeesor_id = min(map(lambda n: nodes.index(n), node.users))
+    #     nodes.insert(succeesor_id, node)
+
+    assert Counter(nodes) == Counter(fx_module.graph.nodes)
+
     _link_nodes(fx_module, nodes)
     fx_module.recompile()
     return fx_module
-            
-    
+
+
 
 # def fix_sharding_node_order(fx_module: fx.GraphModule):
 #     outd = {node: len(node.users) for node in fx_module.graph.nodes}

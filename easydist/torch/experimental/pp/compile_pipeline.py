@@ -131,6 +131,7 @@ class CompiledStage:  # TODO @botbw: make this picklable
             stage_optimstates_inputs = set(stage_optimstates_inputs)
             self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
             self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
+            save_graphviz_dot(self.step_gm.gm, self.fw_gm.name + self.step_gm.name)
 
     @torch.no_grad
     def forward(self, activations_chunk=None, outputs_chunk=None, **kwargs):
@@ -543,11 +544,20 @@ class SplitPatcher(_Patcher):
     def __enter__(self):
         patcher = super().__enter__()
 
+        orig_backward = torch.Tensor.backward
+
+        def backward_wrapper(loss, *args, **kwargs):
+            loss = before_bw_split_func(loss)
+            orig_backward(loss, *args, **kwargs)
+            set_backward_flag(True)
+
+        patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
+
+
         if self.mod:
             mod_cls = type(self.mod)
             orig_forward = mod_cls.forward
 
-            # TODO @botbw: try register_module_full_forward_pre_hook
             def forward_wrapper(mod, *args, **kwargs):
                 ret = orig_forward(mod, *args, **kwargs)
                 return ret
@@ -592,15 +602,6 @@ class SplitPatcher(_Patcher):
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
 
-        orig_backward = torch.Tensor.backward
-
-        # TODO @botbw: register_module_full_backward_pre_hook
-        def backward_wrapper(tensor, *args, **kwargs):
-            tensor = before_bw_split_func(tensor)
-            orig_backward(tensor, *args, **kwargs)
-            set_backward_flag(True)
-
-        patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
 
         return patcher
 
@@ -794,7 +795,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
     output_spec = [node.name for node in outputs]
 
     return EDGraphModule(new_gm, ed_gm.submod_type, inputs_spec, injected_states, output_spec,
-                         ed_gm.call_module_users, ed_gm.name)
+                         ed_gm.call_module_users, 'partial_' + ed_gm.name)
 
 
 def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str, torch.Tensor], strict: bool=True):
@@ -978,7 +979,7 @@ def compile_pipeline(
             outputs_spec, call_module_users = _extract_output(node)
 
         return EDGraphModule(submod, SubmodType.STEP, inputs_spec, injected_states, outputs_spec,
-                             call_module_users, node.target)
+                             call_module_users, 'step')
 
     # meta data
     compiled_meta = CompiledMeta(
