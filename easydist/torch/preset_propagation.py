@@ -144,7 +144,7 @@ def meta_foreach_two_tensor_list(args, kwargs):
     return sharding_ann, {}
 
 @register_meta_spmd(torch.ops.easydist.step_split.default)
-def meta_foreach_two_tensor_list(args, kwargs):
+def meta_step_split(args, kwargs):
     tensor_1_list = args[0]
     sharding_ann = ShardAnnotation([[[ShardDim.get_noshard_dim()] * len(tensor.shape)
                                      for tensor in tensor_1_list]])
