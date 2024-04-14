@@ -18,10 +18,9 @@ import pickle
 import time
 import threading
 from functools import partial
-from typing import Any, cast
+from typing import Any, Union, cast
 from contextlib import nullcontext
 
-import numpy
 import rich
 import torch
 import torch.utils._pytree as pytree
@@ -209,7 +208,7 @@ def _compile_auto(func,
                   kwargs_chunk_spec=None,
                   outputs_chunk_spec=None,
                   num_chunks=1,
-                  strict=False):
+                  strict=True) -> Union[PipelineStage, Any]:
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -259,6 +258,7 @@ def _compile_auto(func,
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        clear_pp_compile_states()
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -275,7 +275,6 @@ def _compile_auto(func,
                                                              args_chunk_spec, kwargs_chunk_spec)
 
     with _enable_compile(), SplitPatcher(module, opt) if schedule_cls else nullcontext():
-        clear_pp_compile_states()
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -380,8 +379,71 @@ def _compile_auto(func,
     fake_named_states = pytree.tree_map(wrap_fake, named_states)
 
     with spmd_device_mesh():
-        params, buffers, named_states = pre_shard(args_strategy, params, buffers, named_states,
-                                                  init_helper, mdconfig.easydist_device)
+        device_mesh = get_device_mesh()
+        device = mdconfig.easydist_device
+
+        # pre-shard params, buffers, named_states
+        params_strategy = args_strategy[:len(params)]
+        buffers_strategy = args_strategy[len(params):len(params) + len(buffers)]
+
+        if mdconfig.use_contiguous_buffer:
+            contiguous_buf = init_contiguous_buf(params, params_strategy,
+                                                device_mesh)
+
+        index = 0
+        for idx, param_name in enumerate(params):
+            materialize_fn = init_helper.get_materialize_fn()
+            materialize_fn = partial(materialize_fn,
+                                    param_buf_key=param_name,
+                                    materialization_device=device)
+            params[param_name] = sharded_tensor(params[param_name],
+                                                params_strategy[idx],
+                                                get_device_mesh(),
+                                                materialize_fn=materialize_fn)
+
+            size = params[param_name]._local_tensor.numel()
+
+            if mdconfig.use_contiguous_buffer:
+                contiguous_buf[index:index +
+                            size] = params[param_name]._local_tensor.view(-1)
+                params[param_name]._local_tensor = contiguous_buf[
+                    index:index + size].view(
+                        params[param_name]._local_tensor.shape)
+
+            if not mdconfig.use_dtensor:
+                params[param_name] = params[param_name]._local_tensor
+
+            index += size
+
+        for idx, buffer_name in enumerate(buffers):
+            materialize_fn = init_helper.get_materialize_fn()
+            materialize_fn = partial(materialize_fn,
+                                    param_buf_key=buffer_name,
+                                    materialization_device=device)
+            buffers[buffer_name] = sharded_tensor(buffers[buffer_name],
+                                                buffers_strategy[idx],
+                                                get_device_mesh(),
+                                                materialize_fn=materialize_fn)
+            if not mdconfig.use_dtensor:
+                buffers[buffer_name] = buffers[buffer_name]._local_tensor
+
+        # use zero init for optimizer states
+        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+        state_tensor_num = len(params) + len(buffers)
+        materialize_fn = partial(materialize_zero, materialization_device=device)
+        for i in range(len(flat_named_states)):
+            if isinstance(flat_named_states[i], torch.Tensor):
+                flat_named_states[i] = sharded_tensor(
+                    flat_named_states[i],
+                    args_strategy[state_tensor_num],
+                    get_device_mesh(),
+                    materialize_fn=materialize_fn)
+                if not mdconfig.use_dtensor:
+                    flat_named_states[i] = flat_named_states[i]._local_tensor
+
+                state_tensor_num += 1
+
+        named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
     if schedule_cls is not None:
         pp_rank, pp_size = get_pp_rank(), get_pp_size()
@@ -394,7 +456,6 @@ def _compile_auto(func,
         save_graphviz_dot(sharded_graph, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
             sharded_graph, pp_size, stateless_func_args, strict=strict)
-        # sharded_graph = pp_local_gm
         save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(
             schedule_cls=schedule_cls,
@@ -574,74 +635,3 @@ def _compile_auto(func,
         module.to("meta")
 
     return EDCompiledFunc(sharded_graph)
-
-
-def pre_shard(args_strategy, params, buffers, named_states, init_helper,
-              device):
-    device_mesh = get_device_mesh()
-    device = mdconfig.easydist_device
-
-    # pre-shard params, buffers, named_states
-    params_strategy = args_strategy[:len(params)]
-    buffers_strategy = args_strategy[len(params):len(params) + len(buffers)]
-
-    if mdconfig.use_contiguous_buffer:
-        contiguous_buf = init_contiguous_buf(params, params_strategy,
-                                             device_mesh)
-
-    index = 0
-    for idx, param_name in enumerate(params):
-        materialize_fn = init_helper.get_materialize_fn()
-        materialize_fn = partial(materialize_fn,
-                                 param_buf_key=param_name,
-                                 materialization_device=device)
-        params[param_name] = sharded_tensor(params[param_name],
-                                            params_strategy[idx],
-                                            get_device_mesh(),
-                                            materialize_fn=materialize_fn)
-
-        size = params[param_name]._local_tensor.numel()
-
-        if mdconfig.use_contiguous_buffer:
-            contiguous_buf[index:index +
-                           size] = params[param_name]._local_tensor.view(-1)
-            params[param_name]._local_tensor = contiguous_buf[
-                index:index + size].view(
-                    params[param_name]._local_tensor.shape)
-
-        if not mdconfig.use_dtensor:
-            params[param_name] = params[param_name]._local_tensor
-
-        index += size
-
-    for idx, buffer_name in enumerate(buffers):
-        materialize_fn = init_helper.get_materialize_fn()
-        materialize_fn = partial(materialize_fn,
-                                 param_buf_key=buffer_name,
-                                 materialization_device=device)
-        buffers[buffer_name] = sharded_tensor(buffers[buffer_name],
-                                              buffers_strategy[idx],
-                                              get_device_mesh(),
-                                              materialize_fn=materialize_fn)
-        if not mdconfig.use_dtensor:
-            buffers[buffer_name] = buffers[buffer_name]._local_tensor
-
-    # use zero init for optimizer states
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-    state_tensor_num = len(params) + len(buffers)
-    materialize_fn = partial(materialize_zero, materialization_device=device)
-    for i in range(len(flat_named_states)):
-        if isinstance(flat_named_states[i], torch.Tensor):
-            flat_named_states[i] = sharded_tensor(
-                flat_named_states[i],
-                args_strategy[state_tensor_num],
-                get_device_mesh(),
-                materialize_fn=materialize_fn)
-            if not mdconfig.use_dtensor:
-                flat_named_states[i] = flat_named_states[i]._local_tensor
-
-            state_tensor_num += 1
-
-    named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
-
-    return params, buffers, named_states

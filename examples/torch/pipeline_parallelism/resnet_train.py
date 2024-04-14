@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torchvision import datasets, transforms
 from torchvision.models import resnet18
 from torch.distributed._tensor import DeviceMesh, mesh_resources
+from tqdm import tqdm
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
@@ -106,7 +107,7 @@ def test_main():
     epochs = 5
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
-        for i, (x_batch, y_batch) in enumerate(train_dataloader):
+        for x_batch, y_batch in tqdm(train_dataloader, dynamic_ncols=True):
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
             if x_batch.size(0) != batch_size:  # TODO need to solve this
@@ -119,8 +120,8 @@ def test_main():
 
         print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
 
-        params, buffers, _, _, _ = train_step.all_gather_outputs()
-        validation(module, valid_dataloader, epoch, params, buffers)
+        # params, buffers, _, _, _ = train_step.compiled_func.all_gather_outputs()
+        # validation(module, valid_dataloader, epoch, params, buffers)
 
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(cur_dir, 'ckpt')

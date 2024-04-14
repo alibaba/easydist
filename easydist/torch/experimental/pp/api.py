@@ -9,18 +9,15 @@ from torch.nn.utils import stateless
 from torch.fx.experimental.proxy_tensor import make_fx
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline, get_updated_params,
-                                                             set_backward_flag, set_step_flag, set_updated_params_states)
-from easydist.torch.experimental.pp.microbatch import \
-    split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline)
+from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.PipelineStage import PipelineStage
-from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states
+from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
 
 
-# TODO @botbw: how to deal with dict?
 def _compile_pp(func,
                 tracing_mode,
                 init_helper,
@@ -95,7 +92,8 @@ def _compile_pp(func,
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-        params, named_states = get_updated_params()
+        if (tup := get_updated_params_states()) != (None, None):
+            params, named_states = tup
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
@@ -103,8 +101,6 @@ def _compile_pp(func,
                                                              args_chunk_spec, kwargs_chunk_spec)
 
     with _enable_compile(), SplitPatcher(module, opt):
-        set_backward_flag(False)
-        set_step_flag(False)
         traced_stateless_func = make_fx(partial(stateless_func, func),
                                            tracing_mode=tracing_mode,
                                            decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -112,10 +108,6 @@ def _compile_pp(func,
                                                                          named_states,
                                                                          args_split[0],
                                                                          kwargs_split[0])
-
-    traced_stateless_func.graph.eliminate_dead_code()
-    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
-    traced_stateless_func.recompile()
 
     assert len(list(traced_stateless_func.named_buffers())) == 0, "Make sure there is no tensor created in the forward function"
     traced_stateless_func_node_metas = {
@@ -140,6 +132,6 @@ def _compile_pp(func,
                              args_chunk_spec=args_chunk_spec,
                              kwargs_chunk_spec=kwargs_chunk_spec,
                              returns_chunk_spec=outputs_chunk_spec,
-                             device=torch.device(f"cuda:{rank % torch.cuda.device_count()}"))
+                             mesh=torch.device(f"cuda:{rank % torch.cuda.device_count()}"))
 
     return pipe
