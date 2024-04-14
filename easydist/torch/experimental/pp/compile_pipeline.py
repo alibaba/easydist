@@ -273,6 +273,8 @@ class CompiledStage:  # TODO @botbw: make this picklable
                 input_node_name = self.compiled_meta.output2input_optimstates[output]
                 self.step_gm.injected_states[StateType.OPTIMSTATES][
                     input_node_name] = ret  # update optimstates in case it's not updated in place.
+            elif output in self.compiled_meta.nones_or_grads_nodes_unflatten.values():
+                outputs_batch[output] = ret
             else:
                 if self.strict:
                     raise RuntimeError(f"output {output} not sure where to go")

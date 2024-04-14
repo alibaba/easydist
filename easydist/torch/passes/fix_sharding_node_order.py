@@ -116,22 +116,22 @@ def fix_order(fx_module: fx.GraphModule):
         backward_partition.add(backward_split_node)
 
     # other comm nodes
-    #   1. output move to earlist point
+    #   1. outputs move to earlist point
     #   2. activations, move to the latest point (i.e. cooresponding backward submod)
-    comm1_partition = bfs2top(output, vis)
-    comm2_partition = set(fx_module.graph.nodes) - set(phs) - set([output]) - comm1_partition - backward_partition - step_partition - forward_partition
+    returns = bfs2top(output, vis)
+    activations = set(n for n in vis if not vis[n])
 
     nodes = list(fx_module.graph.nodes)
     # get topological order for each partition
     for i, node in enumerate(nodes):
-        if node in backward_partition:
+        if node in (backward_partition | returns) and node.target in CUSTOM_FUNCS :
             ancessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
             nodes.pop(i)
             nodes.insert(ancessor_id + 1, node)
 
     for i in range(len(nodes) - 1, -1, -1):
         node = nodes[i]
-        if node in comm2_partition:
+        if node in activations:
             successor_id = min(map(lambda n: nodes.index(n), node.users))
             nodes.pop(i)
             nodes.insert(successor_id - 1, node)

@@ -109,7 +109,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
         annotate_split_points(model, {
-            "linear"
+            "norm"
         })
 
         randn_input = torch.randn(1024, 1024)
