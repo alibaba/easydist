@@ -455,7 +455,11 @@ def _compile_auto(func,
         stateless_func_args = (params, buffers, named_states, args, kwargs)
         save_graphviz_dot(sharded_graph, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
-            sharded_graph, pp_size, stateless_func_args, strict=strict)
+            sharded_graph,
+            pp_size,
+            stateless_func_args,
+            phs_stragegies=args_strategy,
+            strict=strict)
         save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(
             schedule_cls=schedule_cls,

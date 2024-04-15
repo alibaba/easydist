@@ -1,4 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates
 from collections import defaultdict
 import logging
 import operator
@@ -15,7 +14,8 @@ from torch.fx.node import map_arg
 import torch.utils._pytree as pytree
 from torch.distributed._tensor import DeviceMesh, mesh_resources
 
-from easydist.torch.device_mesh import get_device_mesh, get_pp_group, get_pp_rank, spmd_device_mesh
+from easydist.metashard.metair import VarSPMDStrategy
+from easydist.torch.device_mesh import get_device_mesh, get_pp_group, get_pp_rank, get_spmd_rank, spmd_device_mesh
 from easydist.torch.experimental.pp.compile_pipeline import (
     CompiledMeta, CompiledStage, StateType,
     graph_outputs_to_func_outputs)
@@ -32,10 +32,20 @@ def _make_tensor_from_meta(
     return torch.empty(example_value.size(), dtype=example_value.dtype, device=device)
 
 class RecvBase:
-    def __init__(self, input_name):
+    def __init__(
+            self, 
+            input_name: str,
+            source: int,
+            example_tensor: FakeTensor
+        ):
         self.input_name = input_name
+        self.source = source
+        self.example_tensor = example_tensor
+    
+    def get_buffer(self, device: torch.device) -> torch.Tensor:
+        raise NotImplementedError
 
-class RecvInfo(RecvBase):
+class RecvDynamicBuffer(RecvBase):
 
     def __init__(
         self,
@@ -43,16 +53,30 @@ class RecvInfo(RecvBase):
         source: int,
         example_tensor: FakeTensor,
     ):
-        super().__init__(input_name)
-        self.source = source
-        self.example_tensor = example_tensor
+        super().__init__(input_name, source, example_tensor)
+    
+    def get_buffer(self, device: torch.device) -> torch.Tensor:
+        return _make_tensor_from_meta(self.example_tensor, device)
 
-    def __repr__(self):
-        return f"RecvInfo(input={self.input_name}, source={self.source}, shape={self.example_tensor.size()})"
+class RecvStaticBuffer(RecvBase):
+    
+        def __init__(
+            self,
+            input_name: str,
+            source: int,
+            example_tensor: FakeTensor
+        ):
+            super().__init__(input_name, source, example_tensor)
+            self.buffer = None
+    
+        def get_buffer(self, device: torch.device) -> torch.Tensor:
+            if self.buffer is None:
+                self.buffer = _make_tensor_from_meta(self.example_tensor, device)
+            return self.buffer
 
-class StageKwargPlaceholder(RecvBase):
+class StageKwargPlaceholder:
     def __init__(self, input_name: str):
-        super().__init__(input_name)
+        self.input_name = input_name
 
 
 class Schedule(ABC):
@@ -176,6 +200,7 @@ class PipelineStage:
         device: torch.device,
         group: dist.ProcessGroup,
         sharded_graph: fx.GraphModule,
+        dynamic_buffer=False,
         gather_output=True
     ):
         # meta info
@@ -198,11 +223,15 @@ class PipelineStage:
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
         self.return_to_all_stages = gather_output
         self.graph = sharded_graph
+
         if dist.get_world_size(self.group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
-        # runtimes
+        # communication infra
+        self._init_communication(node_metas, dynamic_buffer)
+
+        # runtime states
         self.cur_fw_chunk_id = 0
         self.cur_bw_chunk_id = 0
         self.cur_step_chunk_id = 0
@@ -210,37 +239,6 @@ class PipelineStage:
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_batch = {}  # Activation send requests of all chunk
-
-        # Prepare send/recv infrastructure
-        self._init_communication(node_metas)
-        # Cast submodule to device
-        # self._move_or_init_inject_states()
-        # Move ops argument to device
-        self._move_ops_to_device()
-
-    def _init_fw_bw_step_nodes(self, local_gm):
-        # Find stage forward node in graph
-        self.fw_node = None
-        for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_fw':  # TODO is it good to use str as a tag?
-                assert self.fw_node is None, "Multiple forward nodes found"
-                self.fw_node = node
-        if not self.fw_node:
-            raise AssertionError(f"Cannot find {self.name} in graph")
-
-        # Find stage backward node in graph
-        self.bw_node = None
-        for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_bw':  # TODO is it good to use str as a tag?
-                assert self.bw_node is None, "Multiple backward nodes found"
-                self.bw_node = node
-
-        # Find stage step node in graph
-        self.step_node = None
-        for node in local_gm.graph.nodes:
-            if node.name == f'{self.name}_step':  # TODO is it good to use str as a tag?
-                assert self.step_node is None, "Multiple step nodes found"
-                self.step_node = node
 
     def _get_inputs_nodes_spec(self, compiled_meta: CompiledMeta, args_chunk_spec,
                                 kwargs_chunk_spec):
@@ -269,59 +267,7 @@ class PipelineStage:
             returns_nodes_chunk_spec[name] = spec
         return returns_nodes_chunk_spec
 
-    # def _move_or_init_inject_states(self):
-    #     # Move submodule to indicated device if possible
-    #     # Note: we cannot move meta module to real devices because meta tensors
-    #     # do not support to() method. One needs to do an in-place tensor swap in
-    #     # that case.
-    #     for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].items():
-    #         if isinstance(tensor, FakeTensor) or tensor.is_meta:
-    #             materialize_fn = self.compiled_meta.params_init_helpers[name]
-    #             self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = materialize_fn(
-    #                 tensor=tensor, materialization_device=self.device)
-    #         else:
-    #             self.compiled_stage.fw_gm.injected_states[StateType.PARAMS][name] = tensor.to(
-    #                 self.device)
-    #     for name, tensor in self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS].items():
-    #         if isinstance(tensor, FakeTensor) or tensor.is_meta:
-    #             materialize_fn = self.compiled_meta.buffers_init_helpers[name]
-    #             self.compiled_stage.fw_gm.injected_states[
-    #                 StateType.BUFFERS][name] = materialize_fn(tensor=tensor,
-    #                                                           materialization_device=self.device)
-    #         else:
-    #             self.compiled_stage.fw_gm.injected_states[StateType.BUFFERS][name] = tensor.to(
-    #                 self.device)
-    #     if self.step_node is not None:
-    #         for name, tensor in self.compiled_stage.step_gm.injected_states[
-    #                 StateType.OPTIMSTATES].items():
-    #             if isinstance(tensor, FakeTensor) or tensor.is_meta:
-    #                 materialize_fn = self.compiled_meta.optimstates_init_helpers[name]
-    #                 self.compiled_stage.step_gm.injected_states[
-    #                     StateType.OPTIMSTATES][name] = materialize_fn(
-    #                         tensor=tensor, materialization_device=self.device)
-    #             else:
-    #                 self.compiled_stage.step_gm.injected_states[
-    #                     StateType.OPTIMSTATES][name] = tensor.to(self.device)
-
-    def _move_ops_to_device(self):
-        # Today PT2 tracer does not treat `x.device` as a symbolic device;
-        # instead, the device of tracing time got burned into the generated
-        # code.  Here we provide a workaround for users to manually modify the
-        # "device" kwarg of operations. Such operation may include:
-        # `torch.ones`, `torch.zeros`, `torch.rand`, etc.
-        modify_graph_op_device(self.compiled_stage.fw_gm.gm, self.device)
-        if self.compiled_stage.has_bw():
-            modify_graph_op_device(self.compiled_stage.bw_gm.gm, self.device)
-        if self.compiled_stage.has_step():
-            modify_graph_op_device(self.compiled_stage.step_gm.gm, self.device)
-
-    def is_first(self):
-        return self.stage_idx == 0
-
-    def is_last(self):
-        return self.stage_idx == self.num_stages - 1
-
-    def _init_communication(self, node_metas):
+    def _init_communication(self, node_metas, dynamic_buffer):
         """
         Create send/recv infrastructures for activations (during forward) and
         gradients (during backward)
@@ -337,12 +283,36 @@ class PipelineStage:
         self.stage_index_to_group_rank = stage_index_to_group_rank
 
         # chunk : Dict of kwarg buffers
-        self.fw_kwargs_recv_info = self._create_recv_info(node_metas, self.fw_node)
+        self.fw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.fw_node)
         self.fw_act_send_info = self._create_send_info(self.fw_node)
 
         if self.bw_node is not None:
-            self.bw_kwargs_recv_info = self._create_recv_info(node_metas, self.bw_node)
+            self.bw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.bw_node)
             self.bw_grad_send_info = self._create_send_info(self.bw_node)
+
+    def _init_fw_bw_step_nodes(self, local_gm):
+        # Find stage forward node in graph
+        self.fw_node = None
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_fw':
+                assert self.fw_node is None, "Multiple forward nodes found"
+                self.fw_node = node
+        if not self.fw_node:
+            raise AssertionError(f"Cannot find {self.name} in graph")
+
+        # Find stage backward node in graph
+        self.bw_node = None
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_bw':
+                assert self.bw_node is None, "Multiple backward nodes found"
+                self.bw_node = node
+
+        # Find stage step node in graph
+        self.step_node = None
+        for node in local_gm.graph.nodes:
+            if node.name == f'{self.name}_step':
+                assert self.step_node is None, "Multiple step nodes found"
+                self.step_node = node
 
     def get_stage_index_of_node_name(
         self,
@@ -370,11 +340,11 @@ class PipelineStage:
 
     def _create_recv_info(
         self,
+        dynamic_buffer,
         node_metas,
         kwarg,
     ):
-        # `kwargs` is a Dict, hence we will have:
-        # Dict[keyword, RecvInfo]
+        info_cls = RecvDynamicBuffer if dynamic_buffer else RecvStaticBuffer
         to_sort = []
         for _, kwarg in kwarg.kwargs.items():
             if kwarg.op == "placeholder":
@@ -392,7 +362,7 @@ class PipelineStage:
                 kwargs_recv_info[0].append(StageKwargPlaceholder(x[1])) # args recev with rank 0 (lowest rank)
             else:
                 src_rank, name, example_value = x
-                kwargs_recv_info[src_rank].append(RecvInfo(name, src_rank, example_value))
+                kwargs_recv_info[src_rank].append(info_cls(name, src_rank, example_value))
 
         return kwargs_recv_info
 
@@ -406,14 +376,14 @@ class PipelineStage:
         """
         return self.get_stage_index_of_node_name(user.name)
 
-    def _recv_tensor(self, info: RecvInfo, recv_reqs: List[dist.Work]):
+    def _recv_tensor(self, info: RecvBase, recv_reqs: List[dist.Work]):
         logger.debug(f"[{self.group_rank}] "
                      f"Receiving tensor '{info.input_name}' from Rank {info.source}: "
                      f"{info.example_tensor.size()}")
         # Use async to parallelize recv of tensors
         peer_rank = self.stage_index_to_group_rank[info.source]
         # Create a buffer for receiving the tensor
-        buffer = _make_tensor_from_meta(info.example_tensor, self.device)
+        buffer = info.get_buffer(self.device)
         work = dist.irecv(
             buffer,
             peer_rank if self.group is None else dist.get_global_rank(self.group, peer_rank),
@@ -429,14 +399,13 @@ class PipelineStage:
         return lambda info: self._recv_tensor(info, reqs)
 
     def split_input_kwargs(self, kwargs):
-        if kwargs:
-            _, self.kwargs_chunks = split_args_kwargs_into_chunks(
-                (),
-                kwargs,
-                self.num_chunks,
-                None,
-                self.inputs_nodes_chunk_spec,
-            )
+        return split_args_kwargs_into_chunks(
+            (),
+            kwargs,
+            self.num_chunks,
+            None,
+            self.inputs_nodes_chunk_spec,
+        )[1]
 
     def _recv_and_fill_inputs(
         self,
@@ -453,7 +422,7 @@ class PipelineStage:
         composite_kwargs = {}
         for rank, info_list in kwargs_recv_info.items():
             for info in info_list:
-                if isinstance(info, RecvInfo):
+                if isinstance(info, RecvBase):
                     composite_kwargs[info.input_name] = act_recv(info)
                 else:
                     composite_kwargs[info.input_name] = chunk_kwargs[info.input_name]
@@ -584,55 +553,55 @@ class PipelineStage:
 
         return self.outputs_batch
 
-    def state_dict(self):
-        return self.compiled_stage.state_dict()
-
     def load_state_dict(self, state_dict):
         self.compiled_stage.load_state_dict(state_dict)
 
-    def optimizer_state_dict(self):
-        return self.compiled_stage.optimizer_state_dict()
+    def optimizer_state_dict(self, rank=None):
+        if rank is None:
+            return self.compiled_stage.optimizer_state_dict()
+        else:
+            return self._gather_optimizer_state_dict(rank)
+
+    def state_dict(self, group_rank=None):
+        if group_rank is None:
+            return self.compiled_stage.state_dict()
+        else:
+            return self._gather_state_dict(group_rank)
 
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
 
-    # def gather_outputs(self, rank):
-    #     outputs_all_stages = [None for _ in range(self.num_stages)]
-    #     dist.gather_object(self.outputs_batch,
-    #                        outputs_all_stages if self.group_rank == rank else None,
-    #                        dst=rank)
-    #     all_graph_outputs = {}
-    #     if self.group_rank == rank:  # other rank receive None s
-    #         for outputs in outputs_all_stages:
-    #             all_graph_outputs.update(outputs)
-    #     return graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
+    # def _gather_named_params(self, group_rank):
+    #     params = [None for _ in range(self.num_stages)]
+    #     named_params = self.compiled_stage.named_params()
+    #     dist.gather_object(named_params, params if self.group_rank == group_rank else None, dst=group_rank, group=self.group)
+    #     return params
+    
 
-    def gather_state_dict(self, group_rank):
+    def _gather_state_dict(self, group_rank):
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()
-        dist.gather_object(state_dict, state_dicts if self.group_rank == group_rank else None, dst=group_rank, group=self.group)
+        spmd0, spmd1 = get_spmd_rank()
+        with spmd_device_mesh(group_rank):
+            spmd_mesh = get_device_mesh()
+            dst_rank = spmd_mesh.mesh[spmd0, spmd1].item()  # TODO @botbw
+        dist.gather_object(state_dict, state_dicts if self.group_rank == group_rank else None, dst=dst_rank, group=self.group)
         return state_dicts
 
-    def gather_optimizer_state_dict(self, group_rank):
+    def _gather_optimizer_state_dict(self, group_rank):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
+        spmd0, spmd1 = get_spmd_rank()
+        with spmd_device_mesh(group_rank):
+            spmd_mesh = get_device_mesh()
+            dst_rank = spmd_mesh.mesh[spmd0, spmd1].item()  # TODO @botbw
         dist.gather_object(optimizer_state_dict,
                            optimizer_state_dicts if self.group_rank == group_rank else None,
-                           dst=group_rank,
+                           dst=dst_rank,
                            group=self.group)
         return optimizer_state_dicts
 
-    def all_gather_outputs(self):
-        outputs_all_gather = [None for _ in range(self.num_stages)]
-        dist.all_gather_object(outputs_all_gather, self.outputs_batch, group=self.group)
-        all_graph_outputs = {}
-        for output_stage in outputs_all_gather:
-            all_graph_outputs.update(output_stage)
-        outputs = graph_outputs_to_func_outputs(self.compiled_meta, all_graph_outputs, strict=False)
-        outputs = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), outputs)
-        return outputs  # TODO @botbw: should be strict, but some states are erased
-
-    def all_gather_returns(self):
+    def _all_gather_returns(self):
         returns_all_gather = [None for _ in range(self.num_stages)]
         returns_nodes_flatten = {node_name: None for node_name in self.compiled_meta.returns_nodes_flatten}
         returns_batch = {node_name: val for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten}
@@ -647,6 +616,9 @@ class PipelineStage:
         return ret
 
     def __call__(self, *args, **kwargs) -> None:
+            # Clean per iteration
+        self.clear_runtime_states()
+
         args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
         args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten((self.compiled_meta.args_nodes_unflatten, self.compiled_meta.kwargs_nodes_unflatten))
         assert spec_val == spec_node, "Mismatched args/kwargs"
@@ -657,18 +629,15 @@ class PipelineStage:
                 val = val.to(self.device)
             input_node_vals[node] = val
 
-        # Clean per iteration
-        self.clear_runtime_states()
-
         # Split inputs into chunks
-        self.split_input_kwargs(input_node_vals)
+        self.kwargs_chunks = self.split_input_kwargs(input_node_vals)
 
         self.schedule()
 
         logger.debug(f"[{self.group_rank}] All sends finished")
 
         if self.return_to_all_stages:
-            ret = self.all_gather_returns()
+            ret = self._all_gather_returns()
         else:
             ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
         return ret

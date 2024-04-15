@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
-from easydist.torch.device_mesh import set_device_mesh
+from easydist.torch.device_mesh import get_pp_rank, set_device_mesh
 # from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.experimental.pp.compile_pipeline import (split_into_equal_size)
 from easydist.torch.init_helper import SetParaInitHelper
@@ -75,8 +75,8 @@ def test_main():
     module.fc = torch.nn.Linear(512, 10).to(device)
     _, module = split_into_equal_size(world_size // 2)(module)
 
-    # opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
+    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
     num_chunks = world_size * 4 # high comm overhead
@@ -89,13 +89,13 @@ def test_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
 
-    def validation(module, valid_dataloader, epoch, params, buffers):
-        module.load_state_dict({**params, **buffers})
+    def validation(module, valid_dataloader, epoch, state_dict):
+        module.load_state_dict(state_dict)
         module.to(rank)
         module.eval()
         correct_cnt = 0
         all_cnt = 0
-        for x_batch, y_batch in valid_dataloader:
+        for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
             x_batch = x_batch.to(f'cuda:{rank}')
             y_batch = y_batch.to(f'cuda:{rank}')
             out = module(x_batch)
@@ -119,9 +119,12 @@ def test_main():
             loss_sum += loss.item()
 
         print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
-
-        # params, buffers, _, _, _ = train_step.compiled_func.all_gather_outputs()
-        # validation(module, valid_dataloader, epoch, params, buffers)
+        state_dict_list = train_step.compiled_func.state_dict(0)
+        if rank == 0:
+            state_dict = {}
+            for st in state_dict_list:
+                state_dict.update(st)
+            validation(module, valid_dataloader, epoch, state_dict)
 
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
@@ -131,8 +134,8 @@ def test_main():
     # state_dict = compiled_fn.state_dict()
     # opt_state_dict = compiled_fn.optimizer_state_dict()
 
-    # torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{rank}.pt'))
-    # torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{rank}.pt'))
+    # torch.save(state_dict, os.path.join(ckpt_dir, f'state_dict_{get_pp_rank()}.pt'))
+    # torch.save(opt_state_dict, os.path.join(ckpt_dir, f'opt_state_dict_{get_pp_rank()}.pt'))
 
 if __name__ == '__main__':
     test_main()

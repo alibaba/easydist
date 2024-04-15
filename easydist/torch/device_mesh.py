@@ -74,13 +74,16 @@ def device_mesh_rank(device_mesh, dim):
     return rank
 
 # [spmd0, spmd1, pp]
-__with_spmd_device_mesh = False  # TODO @botbw: remove this function tag
+__with_spmd_device_mesh = None  # TODO @botbw: remove this function tag
 
 @contextmanager
-def spmd_device_mesh():
+def spmd_device_mesh(pp_rank=None):
     global __with_spmd_device_mesh
     ori_with_spmd_device_mesh = __with_spmd_device_mesh
-    __with_spmd_device_mesh = True
+    if pp_rank is None:
+        __with_spmd_device_mesh = TORCH_DEVICE_MESH.get_coordinate_on_dim(2)
+    else:
+        __with_spmd_device_mesh = pp_rank
     try:
         yield
     finally:
@@ -88,7 +91,7 @@ def spmd_device_mesh():
 
 def get_device_mesh():
     global TORCH_DEVICE_MESH
-    if __with_spmd_device_mesh:
+    if __with_spmd_device_mesh is not None:
         return __get_spmd_device_mesh(TORCH_DEVICE_MESH)
     return TORCH_DEVICE_MESH
 
@@ -113,12 +116,12 @@ def get_pp_group():
     return TORCH_DEVICE_MESH.get_dim_groups(2)
 
 def __get_spmd_device_mesh(device_mesh):
-    assert __with_spmd_device_mesh 
+    assert __with_spmd_device_mesh is not None 
 
     if device_mesh is None:
         return None
     
-    ranks = device_mesh.mesh[:, :, device_mesh.get_coordinate_on_dim(2)]
+    ranks = device_mesh.mesh[:, :, __with_spmd_device_mesh]
     spmd_mesh = DeviceMesh(
         device_mesh.device_type, ranks, _init_process_groups=False
     )

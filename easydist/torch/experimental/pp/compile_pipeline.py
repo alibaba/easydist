@@ -13,13 +13,18 @@ import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx._symbolic_trace import _Patcher
+from torch.distributed._tensor import DeviceMesh, mesh_resources
 
+from easydist.metashard.annotation import ShardDim
+from easydist.metashard.metair import SPMD, VarSPMDStrategy
+from easydist.torch.device_mesh import get_device_mesh, spmd_device_mesh
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, set_backward_flag, split
 from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz_dot, _to_tuple
 from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
+from easydist.torch.passes.sharding import all_gather_end, all_gather_start, all_reduce_end, all_reduce_start, all_to_all_end, all_to_all_start, reduce_scatter_end, reduce_scatter_start, scatter_wrapper, reduce_map
 from easydist.utils import rgetattr, rsetattr
-from easydist.torch.utils import _rematerialize_optimizer
+from easydist.torch.utils import _rematerialize_optimizer, to_torch_spmd
 from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params_states, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
 
 from torch.nn.utils import stateless
@@ -76,6 +81,10 @@ class CompiledMeta:
     # node name to stage idx mapping
     node_to_stage_idx: Dict[str, int]
 
+    # output spmd stragegies
+    params_strategies: Dict[str, VarSPMDStrategy]
+    buffers_strategies: Dict[str, VarSPMDStrategy]
+    optimstates_strategies: Dict[str, Dict[str, VarSPMDStrategy]]
 
 
 @dataclass
@@ -294,40 +303,98 @@ class CompiledStage:  # TODO @botbw: make this picklable
         state_dict.update(self.named_buffers())
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def _load_params(self, state_dict):
+        to_pop = []
         for torch_name, tensor in state_dict.items():
-            if torch_name in self.compiled_meta.inv_params:
-                self.fw_gm.injected_states[StateType.PARAMS][torch_name] = tensor
-            elif torch_name in self.compiled_meta.inv_buffers:
-                self.fw_gm.injected_states[StateType.BUFFERS][torch_name] = tensor
-            else:
-                raise RuntimeError(f"state_dict key {torch_name} not found")
+            node_name = self.compiled_meta.params_nodes_unflatten[torch_name]       
+            if node_name in self.compiled_meta.params_strategies:
+                src_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                tgt_specs = self.compiled_meta.params_strategies[node_name]
+                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)         
+            self.fw_gm.injected_states[StateType.PARAMS][node_name] = tensor
+            to_pop.append(torch_name)
+        for torch_name in to_pop:
+            state_dict.pop(torch_name)
+
+    def _load_buffers(self, state_dict):
+        to_pop = []
+        for torch_name, tensor in state_dict.items():
+            node_name = self.compiled_meta.buffers_nodes_unflatten[torch_name]
+            if node_name in self.compiled_meta.buffers_strategies:
+                src_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                tgt_specs = self.compiled_meta.buffers_strategies[node_name]
+                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
+            self.fw_gm.injected_states[StateType.BUFFERS][node_name] = tensor
+            to_pop.append(torch_name)
+        for torch_name in to_pop:
+            state_dict.pop(torch_name)
+
+    def load_state_dict(self, state_dict, strict=True):
+        self._load_params(state_dict)
+        self._load_buffers(state_dict)
+        if strict:
+            if len(state_dict) != 0:
+                raise RuntimeError(f"state_dict has unexpected keys {state_dict.keys()}")
 
     def load_optimizer_state_dict(self, state_dict):
-        for torch_name, state in state_dict.items():
-            if torch_name in self.compiled_meta.inv_optimstates:
-                self.step_gm.injected_states[StateType.OPTIMSTATES][torch_name] = state
-            else:
-                raise RuntimeError(f"state_dict key {torch_name} not found")
+        for torch_name, typ_dict in state_dict.items():
+            for typ, tensor in typ_dict.items():
+                node_name = self.compiled_meta.optimstates_nodes_unflatten[torch_name][typ]
+                if node_name in self.compiled_meta.optimstates_strategies:
+                    src_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                    tgt_specs = self.compiled_meta.optimstates_strategies[node_name]
+                    tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
+                self.step_gm.injected_states[StateType.OPTIMSTATES][node_name] = tensor
+        # TODO: pop states after loading
+
 
     def named_parameters(self):
-        return {
-            self.compiled_meta.inv_params[name]: tensor
-            for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()
-        }
+        if self.compiled_meta.params_strategies:
+            params = {}
+            for node_name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items():
+                src_specs = self.compiled_meta.params_strategies[node_name]
+                tgt_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
+                torch_name = self.compiled_meta.inv_params[node_name]
+                params[torch_name] = tensor
+            return params
+        else:
+            return {
+                self.compiled_meta.inv_params[name]: tensor
+                for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()
+            }
 
     def named_buffers(self):
-        return {
-            self.compiled_meta.inv_buffers[name]: tensor
-            for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()
-        }
+        if self.compiled_meta.buffers_strategies:
+            buffers = {}
+            for node_name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items():
+                src_specs = self.compiled_meta.buffers_strategies[node_name]
+                tgt_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
+                torch_name = self.compiled_meta.inv_buffers[node_name]
+                buffers[torch_name] = tensor
+            return buffers
+        else:
+            return {
+                self.compiled_meta.inv_buffers[name]: tensor
+                for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()
+            }
 
     def optimizer_state_dict(self):
         optim_state = defaultdict(dict)
-        for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
-            optim_state[self.compiled_meta.inv_optimstates[name]][
-                self.compiled_meta.inv_optimstates_type[name]] = tensor
-        return dict(optim_state)
+        if self.compiled_meta.optimstates_strategies:
+            for name, state in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
+                src_specs = self.compiled_meta.optimstates_strategies[name]
+                tgt_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
+                state = do_spmd_comm(state, src_specs, tgt_specs)
+                optim_state[self.compiled_meta.inv_optimstates[name]][
+                    self.compiled_meta.inv_optimstates_type[name]] = state
+            return optim_state
+        else:
+            for name, tensor in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
+                optim_state[self.compiled_meta.inv_optimstates[name]][
+                    self.compiled_meta.inv_optimstates_type[name]] = tensor
+            return dict(optim_state)
 
 
 # ================================= section start ========================================
@@ -569,7 +636,7 @@ class SplitPatcher(_Patcher):
         if self.opt:
             opt_cls = type(self.opt)
             orig_step = opt_cls.step
-            
+
 
             def step_wrapper(opt, *args, **kwargs):
                 params = dict(self.mod.named_parameters()) if self.mod else {}
@@ -580,9 +647,9 @@ class SplitPatcher(_Patcher):
                 for n, p in params.items():
                     if p in self.opt.state:
                         named_states[n] = self.opt.state[p]
-            
+
                 states, spec = pytree.tree_flatten((params, grads, named_states))
-                
+
                 ctx = {}
                 states = list_before_split(ctx, states)
                 states = step_split_func(states)
@@ -810,6 +877,7 @@ def compile_pipeline(
     traced_stateless_func: fx.GraphModule,  # traced stateless function with split op
     nstages: int,  # number of stages, should be num_of_split_op * 2
     stateless_func_args,  # args for stateless function
+    phs_stragegies: Optional[List[VarSPMDStrategy]]=None,
     strict=True  # report error if not all params and buffers are used
 ) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
     is_backward_called = get_backward_flag()
@@ -869,6 +937,19 @@ def compile_pipeline(
         for output_name, input_name in zip(output_optimstates_nodes_flatten,
                                            pytree.tree_flatten(optimstates_nodes_unflatten)[0])
     }
+
+    # find spmd strategy if proviced
+    params_strategies = {}
+    buffers_strategies = {}
+    optimstates_strategies = defaultdict(dict)
+    if phs_stragegies:
+        for ph_name, ph_strategy in zip(input_nodes_flatten, phs_stragegies):
+            if ph_name in inv_params:
+                params_strategies[ph_name] = ph_strategy
+            elif ph_name in inv_buffers:
+                buffers_strategies[ph_name] = ph_strategy
+            elif ph_name in inv_optimstates:
+                optimstates_strategies[ph_name] = ph_strategy
 
     # split fw_bw and step
     splited_global, part_cnt = split_by(traced_stateless_func, torch.ops.easydist.step_split.default)
@@ -1008,7 +1089,11 @@ def compile_pipeline(
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
-        node_to_stage_idx=None)  # this need to be filled later
+        node_to_stage_idx=None,# this need to be filled later
+        params_strategies=params_strategies,
+        buffers_strategies=buffers_strategies,
+        optimstates_strategies=optimstates_strategies,
+    )
 
     current_stateful_fw_bw = None
     compiled_stages: List[CompiledStage] = []
@@ -1157,3 +1242,60 @@ def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
                                                     target=operator.getitem,
                                                     args=(out_maybe_tuple, output))
         name_to_stage_idx[output] = stage_idx
+
+def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy],
+                 tgt_specs: List[VarSPMDStrategy]):
+    if src_specs == tgt_specs:
+        return tensor
+
+    with spmd_device_mesh():
+        sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+        device_mesh = get_device_mesh()
+        result = tensor
+        for i, (current, target) in sorted_placements:
+            my_coordinate = device_mesh.get_coordinate()
+            num_chunks = device_mesh.size(dim=i)
+
+            if current == target:
+                continue
+
+            if target.is_shard():
+                if current.is_replicate():
+                    result = scatter_wrapper(result, num_chunks,
+                                            target.dim, my_coordinate[i])
+                elif current.is_shard():
+                    # all_to_all
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+
+                    result = all_to_all_start(result, current.dim,
+                                            target.dim, num_chunks,
+                                            my_coordinate[i], ranks)
+                    result = all_to_all_end(result, current.dim,
+                                            target.dim, num_chunks,
+                                            my_coordinate[i], ranks)
+                elif current.is_partial():
+                    # reduce_scatter
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    reduceOp = reduce_map[current.args["ops"]]
+                    # make sure contiguous
+                    result = reduce_scatter_start(result, reduceOp,
+                                                target.dim, ranks)
+                    result = reduce_scatter_end(result, reduceOp,
+                                                target.dim, ranks)
+            elif target.is_replicate():
+                if current.is_shard():
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    # make sure contiguous
+                    result = all_gather_start(result, current.dim, ranks)
+                    result = all_gather_end(result, current.dim, ranks)
+                elif current.is_partial():
+                    # insert all_reduce here
+                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                    ranks = submesh.mesh.flatten().tolist()
+                    reduceOp = reduce_map[current.args["ops"]]
+                    result = all_reduce_start(result, reduceOp, ranks)
+                    result = all_reduce_end(result, reduceOp, ranks)
+    return result
