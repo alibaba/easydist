@@ -1,4 +1,4 @@
-# torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
 import os
 import sys
 import random

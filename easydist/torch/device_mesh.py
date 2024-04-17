@@ -74,13 +74,13 @@ def device_mesh_rank(device_mesh, dim):
     return rank
 
 # [spmd0, spmd1, pp]
-__with_spmd_device_mesh = None  # TODO @botbw: remove this function tag
+__with_spmd_device_mesh = None
 
 @contextmanager
 def spmd_device_mesh(pp_rank=None):
     global __with_spmd_device_mesh
     ori_with_spmd_device_mesh = __with_spmd_device_mesh
-    if pp_rank is None:
+    if pp_rank is None and len(TORCH_DEVICE_MESH.mesh.shape) >= 3:
         __with_spmd_device_mesh = TORCH_DEVICE_MESH.get_coordinate_on_dim(2)
     else:
         __with_spmd_device_mesh = pp_rank
@@ -128,3 +128,17 @@ def __get_spmd_device_mesh(device_mesh):
     spmd_mesh._dim_group_infos = device_mesh._dim_group_infos[:2]
     mesh_resources.child_to_parent_mapping[device_mesh] = spmd_mesh
     return spmd_mesh
+
+if __name__ == "__main__":
+    set_device_mesh(DeviceMesh("cuda", [
+        [ # ---> pp dim
+           [0, 2], 
+           [1, 3]
+        ]  
+    ], mesh_dim_names=["spmd0", "spmd1", "pp"]))
+
+    print(get_device_mesh())  # [[[0, 2], [1, 3]]]
+    with spmd_device_mesh(pp_rank=0):
+        print(get_device_mesh()) # [[0, 1]]
+    with spmd_device_mesh(pp_rank=1):
+        print(get_device_mesh()) # [[2, 3]]

@@ -90,7 +90,7 @@ def all_gather_end(self: torch.Tensor, gather_dim: int, group: List[int], tag: s
 
 
 def scatter_wrapper(tensor, num_chunks, dim, indice):
-    return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice]
+    return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice].contiguous()
 
 
 def copy_wrapper(self, other):

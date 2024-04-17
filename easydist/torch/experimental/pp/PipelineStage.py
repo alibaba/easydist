@@ -198,7 +198,7 @@ class PipelineStage:
         kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
         returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
         device: torch.device,
-        group: dist.ProcessGroup,
+        pp_group: dist.ProcessGroup,
         sharded_graph: fx.GraphModule,
         dynamic_buffer=False,
         gather_output=True
@@ -216,15 +216,15 @@ class PipelineStage:
                                                                 kwargs_chunk_spec)
         self.returns_nodes_chunk_spec = self._get_returns_nodes_spec(compiled_meta, returns_chunk_spec)
         self.device = device
-        self.group = group
+        self.pp_group = pp_group
 
-        self.group_rank = dist.get_rank(group)
+        self.pp_rank = dist.get_rank(pp_group)
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
         self.return_to_all_stages = gather_output
         self.graph = sharded_graph
 
-        if dist.get_world_size(self.group) > self.num_stages:
+        if dist.get_world_size(self.pp_group) > self.num_stages:
             raise RuntimeError(
                 "Number of ranks is larger than number of stages, some ranks are unused")
 
@@ -274,13 +274,14 @@ class PipelineStage:
         """
         # Create stage id to group rank mapping
         # In interleaved case, `group_rank` is stage index % group size.
-        stage_index_to_group_rank: Dict[int, int] = {}
-        pg_world_size = dist.get_world_size(self.group)
+        stage_index_to_pp_rank: Dict[int, int] = {}
+        pg_world_size = dist.get_world_size(self.pp_group)
+        assert pg_world_size == self.num_stages, "Currently only support 1 rank per stage"  # TODO @botbw
         for i in range(self.num_stages):
             # We only support wrapped-around interleaving
             peer_rank = i % pg_world_size
-            stage_index_to_group_rank.setdefault(i, peer_rank)
-        self.stage_index_to_group_rank = stage_index_to_group_rank
+            stage_index_to_pp_rank.setdefault(i, peer_rank)
+        self.stage_index_to_group_rank = stage_index_to_pp_rank
 
         # chunk : Dict of kwarg buffers
         self.fw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.fw_node)
@@ -377,7 +378,7 @@ class PipelineStage:
         return self.get_stage_index_of_node_name(user.name)
 
     def _recv_tensor(self, info: RecvBase, recv_reqs: List[dist.Work]):
-        logger.debug(f"[{self.group_rank}] "
+        logger.debug(f"[{self.pp_rank}] "
                      f"Receiving tensor '{info.input_name}' from Rank {info.source}: "
                      f"{info.example_tensor.size()}")
         # Use async to parallelize recv of tensors
@@ -386,8 +387,8 @@ class PipelineStage:
         buffer = info.get_buffer(self.device)
         work = dist.irecv(
             buffer,
-            peer_rank if self.group is None else dist.get_global_rank(self.group, peer_rank),
-            group=self.group,
+            peer_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, peer_rank),
+            group=self.pp_group,
         )
         recv_reqs.append(work)
         return buffer
@@ -448,14 +449,14 @@ class PipelineStage:
         for dst, nodes in send_info.items():
             for node in nodes:
                 val = output_dict[node]
-                logger.debug(f"[{self.group_rank}] "
+                logger.debug(f"[{self.pp_rank}] "
                              f"Sending tensor to Rank {dst}: {val.size()}")
                 peer_rank = self.stage_index_to_group_rank[dst]
                 work = dist.isend(
                     val.contiguous(),
-                    peer_rank if self.group is None else dist.get_global_rank(
-                        self.group, peer_rank),  # TODO
-                    group=self.group,
+                    peer_rank if self.pp_group is None else dist.get_global_rank(
+                        self.pp_group, peer_rank),  # TODO
+                    group=self.pp_group,
                 )
                 send_reqs.append(work)
 
@@ -556,17 +557,17 @@ class PipelineStage:
     def load_state_dict(self, state_dict):
         self.compiled_stage.load_state_dict(state_dict)
 
-    def optimizer_state_dict(self, rank=None):
-        if rank is None:
+    def optimizer_state_dict(self, world_rank=None):
+        if world_rank is None:
             return self.compiled_stage.optimizer_state_dict()
         else:
-            return self._gather_optimizer_state_dict(rank)
+            return self._gather_optimizer_state_dict(world_rank)
 
-    def state_dict(self, group_rank=None):
-        if group_rank is None:
+    def state_dict(self, world_rank=None):
+        if world_rank is None:
             return self.compiled_stage.state_dict()
         else:
-            return self._gather_state_dict(group_rank)
+            return self._gather_state_dict(world_rank)
 
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
@@ -577,35 +578,29 @@ class PipelineStage:
     #     dist.gather_object(named_params, params if self.group_rank == group_rank else None, dst=group_rank, group=self.group)
     #     return params
     
-
-    def _gather_state_dict(self, group_rank):
+    def _gather_state_dict(self, world_rank):
         state_dicts = [None for _ in range(self.num_stages)]
-        state_dict = self.compiled_stage.state_dict()
+        state_dict = self.compiled_stage.state_dict()  # gather spmd0, spmd1
+        device_mesh = get_device_mesh()
         spmd0, spmd1 = get_spmd_rank()
-        with spmd_device_mesh(group_rank):
-            spmd_mesh = get_device_mesh()
-            dst_rank = spmd_mesh.mesh[spmd0, spmd1].item()  # TODO @botbw
-        dist.gather_object(state_dict, state_dicts if self.group_rank == group_rank else None, dst=dst_rank, group=self.group)
+        if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
+            dist.gather_object(state_dict, state_dicts if device_mesh.get_rank() == world_rank else None, dst=world_rank, group=self.pp_group)
         return state_dicts
 
-    def _gather_optimizer_state_dict(self, group_rank):
+    def _gather_optimizer_state_dict(self, world_rank):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
+        device_mesh = get_device_mesh()
         spmd0, spmd1 = get_spmd_rank()
-        with spmd_device_mesh(group_rank):
-            spmd_mesh = get_device_mesh()
-            dst_rank = spmd_mesh.mesh[spmd0, spmd1].item()  # TODO @botbw
-        dist.gather_object(optimizer_state_dict,
-                           optimizer_state_dicts if self.group_rank == group_rank else None,
-                           dst=dst_rank,
-                           group=self.group)
+        if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
+            dist.gather_object(optimizer_state_dict, optimizer_state_dicts if device_mesh.get_rank() == world_rank else None, dst=world_rank, group=self.pp_group)
         return optimizer_state_dicts
 
     def _all_gather_returns(self):
         returns_all_gather = [None for _ in range(self.num_stages)]
         returns_nodes_flatten = {node_name: None for node_name in self.compiled_meta.returns_nodes_flatten}
         returns_batch = {node_name: val for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten}
-        dist.all_gather_object(returns_all_gather, returns_batch, group=self.group)
+        dist.all_gather_object(returns_all_gather, returns_batch, group=self.pp_group)
         all_returns = {}
         for returns_stage in returns_all_gather:
             for k, v, in returns_stage.items():
@@ -634,7 +629,7 @@ class PipelineStage:
 
         self.schedule()
 
-        logger.debug(f"[{self.group_rank}] All sends finished")
+        logger.debug(f"[{self.pp_rank}] All sends finished")
 
         if self.return_to_all_stages:
             ret = self._all_gather_returns()
@@ -642,7 +637,7 @@ class PipelineStage:
             ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
         return ret
 
-    def run_with_graph(self, graph, *args, **kwargs):
+    def run_with_graph(self, graph, *args, **kwargs):  # could construct a partial graph
         return self(*args, **kwargs)
 
 def print_tensor_dict(chunk, di):

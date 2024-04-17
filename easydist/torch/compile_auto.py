@@ -342,43 +342,42 @@ def _compile_auto(func,
                 sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
                 sharded_graph = tile_comm(sharded_graph)
 
-    save_graphviz_dot(sharded_graph, f'sharded_graph_raw_{rank}')
-    sharded_graph = fix_embedding(sharded_graph, recover=True)
+        save_graphviz_dot(sharded_graph, f'sharded_graph_raw_{rank}')
+        sharded_graph = fix_embedding(sharded_graph, recover=True)
 
-    if not mdconfig.use_dtensor:
-        if schedule_cls is None and mdconfig.comm_optimization is True:
-            sharded_graph = runtime_prof(sharded_graph)
-            sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
+        if not mdconfig.use_dtensor:
+            if False and schedule_cls is None and mdconfig.comm_optimization is True:
+                sharded_graph = runtime_prof(sharded_graph)
+                sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
 
-        # override pytorch dtensor propagate rules to optimize dispater behavior
-        if mdconfig.override_dtensor_rule is True:
-            sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
+            # override pytorch dtensor propagate rules to optimize dispater behavior
+            if mdconfig.override_dtensor_rule is True:
+                sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
 
 
-    if mdconfig.log_level <= logging.DEBUG:
-        sharded_graph.print_readable()
+        if mdconfig.log_level <= logging.DEBUG:
+            sharded_graph.print_readable()
 
-    if mdconfig.dump_fx_graph:
-        print(f"node num in sharded graph: {len(sharded_graph.graph.nodes)}")
-        drawer = FxGraphDrawer(sharded_graph, "shard_fx", ignore_getattr=True)
-        dot_graphs = drawer.get_all_dot_graphs()
-        for name, dot_graph in dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
-            dot_graph.write_raw(f"./tmp/{name}.txt")
+        if mdconfig.dump_fx_graph:
+            print(f"node num in sharded graph: {len(sharded_graph.graph.nodes)}")
+            drawer = FxGraphDrawer(sharded_graph, "shard_fx", ignore_getattr=True)
+            dot_graphs = drawer.get_all_dot_graphs()
+            for name, dot_graph in dot_graphs.items():
+                dot_graph.write_jpg(f"./tmp/{name}.jpg")
+                dot_graph.write_raw(f"./tmp/{name}.txt")
 
-    # keep fake params, buffers, named_states
-    fake_tensor_mode = FakeTensorMode()
+        # keep fake params, buffers, named_states
+        fake_tensor_mode = FakeTensorMode()
 
-    def wrap_fake(x):
-        if isinstance(x, torch.Tensor):
-            return fake_tensor_mode.from_tensor(x)
-        return x
+        def wrap_fake(x):
+            if isinstance(x, torch.Tensor):
+                return fake_tensor_mode.from_tensor(x)
+            return x
 
-    fake_params = pytree.tree_map(wrap_fake, params)
-    fake_buffers = pytree.tree_map(wrap_fake, buffers)
-    fake_named_states = pytree.tree_map(wrap_fake, named_states)
+        fake_params = pytree.tree_map(wrap_fake, params)
+        fake_buffers = pytree.tree_map(wrap_fake, buffers)
+        fake_named_states = pytree.tree_map(wrap_fake, named_states)
 
-    with spmd_device_mesh():
         device_mesh = get_device_mesh()
         device = mdconfig.easydist_device
 
@@ -472,7 +471,7 @@ def _compile_auto(func,
             args_chunk_spec=args_chunk_spec,
             kwargs_chunk_spec=kwargs_chunk_spec,
             returns_chunk_spec=outputs_chunk_spec,
-            group=get_pp_group(),
+            pp_group=get_pp_group(),
             device=torch.device(f"cuda:{rank}"),
             sharded_graph=sharded_graph,
         )
