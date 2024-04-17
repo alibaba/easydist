@@ -20,7 +20,6 @@ import threading
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
-import ctypes
 
 import numpy
 import rich
@@ -54,7 +53,7 @@ from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sh
 from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
-
+from profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode
 # for pickle dump opt_strategy
 import sys
 
@@ -67,7 +66,6 @@ sol_rdy_cond = threading.Condition()
 
 mem_sol = None
 mem_addr_rdy_cond = threading.Condition()
-
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     fx_module = fix_meta_device(fx_module)
@@ -433,9 +431,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         if rank == 0:
             logging.info("profiling fx module's memory...")
 
-        import __main__
         # setting allocator to profiling mode
-        __main__.allocator_mode = 'profile'
+        _set_allocator_mode(AllocatorMode.PROFILE)
 
         # save all profiling information in this dict
         profiling_info = ModuleProfilingInfo(rank)
@@ -541,11 +538,11 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             # run the sharded_graph
             if mdconfig.enable_memory_opt:
-                __main__.allocator_mode = 'runtime'
-                __main__.is_customized = True
+                _set_allocator_mode(AllocatorMode.RUNTIME)
+                _set_customized_flag(True)
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)
-                __main__.is_customized = False
+                _set_customized_flag(False)
             else:
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)

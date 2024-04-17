@@ -16,6 +16,7 @@
 #include <pybind11/stl.h>
 
 #include "stream_tracer.h"
+#include "profiling_allocator.h"
 
 namespace py = pybind11;
 
@@ -30,6 +31,18 @@ PYBIND11_MODULE(profiling_allocator, m) {
     m.def("_enter_op_core", enterOpCore);
     m.def("_leave_op_core", leaveOpCore);
     m.def("_get_stream_trace_data", getStreamTraceData);
+    
+    m.def("_set_start_recording", set_start_recording);
+    m.def("_set_allocator_mode", set_allocator_mode);
+    m.def("_set_customized_flag", set_customized_flag);
+    m.def("_set_mem_size", set_mem_size);
+    m.def("_set_temp_mem_size", set_temp_mem_size);
+    m.def("_set_raw_mem_allocs", set_raw_mem_allocs);
+    m.def("_get_allocator_profiling_info", get_allocator_profiling_info);
+
+    py::enum_<AllocatorMode>(m, "AllocatorMode")
+        .value("PROFILE", AllocatorMode::PROFILE)
+        .value("RUNTIME", AllocatorMode::RUNTIME);
 
     py::class_<StreamTraceData>(m, "StreamTraceData")
         .def(py::init<>())

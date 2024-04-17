@@ -22,27 +22,13 @@ import easydist
 def init_meta_allocator():
     if not easydist.config.enable_memory_opt:
         return
-    register_global_variables()
     swap_to_profiling_allocator()
-
-def register_global_variables():
-    # setting global variables
-    __main__.start_recording = False
-    __main__.op_name = 'N/A'
-    __main__.allocator_profiling_info = []
-    __main__.allocator_mode = 'profile'
-    __main__.memory_plan = []
 
 def swap_to_profiling_allocator():
     # swap from caching allocator to profiling allocator
     path_to_profiling_allocator = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
-                        "build",
-                        "lib.linux-x86_64-cpython-38",
                         "profiling_allocator.cpython-38-x86_64-linux-gnu.so")
-    raw_allocator = ctypes.CDLL(path_to_profiling_allocator)
-    init_fn = ctypes.cast(getattr(raw_allocator, 'init_allocator'), ctypes.c_void_p).value
     new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
         path_to_profiling_allocator, 'meta_malloc', 'meta_free')
     torch.cuda.memory.change_current_allocator(new_alloc)
-    new_alloc.allocator().set_init_fn(init_fn)

@@ -17,7 +17,7 @@
 #include <vector>
 #include <cassert>
 #include <cupti.h>
-
+#include <string>
 #pragma once
 
 //#define TRACER_VERBOSE

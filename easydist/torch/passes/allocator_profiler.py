@@ -14,8 +14,6 @@
 
 from typing import Any, List, Dict, Tuple
 import logging
-
-import __main__
 import torch.utils._pytree as pytree
 import torch
 from torch.fx.graph_module import GraphModule
@@ -30,7 +28,9 @@ from easydist.torch.mem_allocation_info import GraphMemInfo
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from profiling_allocator import _set_cur_op_name, _activate_stream_tracer, \
                                 _inactivate_stream_tracer, _enter_op_core, \
-                                _leave_op_core
+                                _leave_op_core, _set_start_recording, \
+                                _set_mem_size, _set_temp_mem_size, _set_raw_mem_allocs, \
+                                _get_allocator_profiling_info
 
 __all__ = ['AllocatorProfiler']
 logger = logging.getLogger(__name__)
@@ -246,10 +246,9 @@ class AllocatorProfiler(Interpreter):
         # create dict to store addresses for this node
         node_profiling_info = NodeProfilingInfo(n.name)
         node_profiling_info.set_qualified_name(qualified_name)
-
         with self._set_current_node(n):
             # tell profiling_allocator stop recording
-            __main__.start_recording = False
+            _set_start_recording(False)
 
             _activate_stream_tracer()
             inputs_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'] if 'val' in nd.meta else nd, n.args)
@@ -272,10 +271,10 @@ class AllocatorProfiler(Interpreter):
                         assert False, f'Unexpected input: {type(flat_input)}, {flat_input}'
 
             # set op_name for profiling_allocator.so
-            __main__.op_name = n.name
+            _set_cur_op_name(n.name)
 
             # tell profiling_allocator to start profiling
-            __main__.start_recording = True
+            _set_start_recording(True)
 
             if n.op == "placeholder":
                 out_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'], n)
@@ -306,7 +305,7 @@ class AllocatorProfiler(Interpreter):
     def create_graph_mem_info(self) -> GraphMemInfo:
         # process info from our profiling allocator
         # data format from allocator: (node_name, ptr_address)
-        for allocator_info in __main__.allocator_profiling_info:
+        for allocator_info in _get_allocator_profiling_info():
             node_name, *info = allocator_info
             node_info = self.profiling_info.get_node_profiling_info(node_name)
             node_info.record_alloc_info(info)
@@ -316,9 +315,9 @@ class AllocatorProfiler(Interpreter):
         return graph_mem_info
 
     def load_memory_plan(self, graph_mem_plan: GraphMemPlan):
-        __main__.raw_mem_allocs = graph_mem_plan.raw_mem_allocs
-        __main__.mem_size = graph_mem_plan.mem_size
-        __main__.temp_mem_size = graph_mem_plan.temp_mem_size
-        logger.info(f"load_memory_plan: mem_size: {__main__.mem_size}, temp_mem_size: {__main__.temp_mem_size}")
+        _set_raw_mem_allocs(graph_mem_plan.raw_mem_allocs)
+        _set_mem_size(graph_mem_plan.mem_size)
+        _set_temp_mem_size(graph_mem_plan.temp_mem_size)
+        logger.info(f"load_memory_plan: mem_size: {graph_mem_plan.mem_size}, temp_mem_size: {graph_mem_plan.temp_mem_size}")
 
 
