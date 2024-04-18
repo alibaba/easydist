@@ -57,7 +57,8 @@ class CompiledFuncWrapper:
                  tracing_mode="fake",
                  cuda_graph=True,
                  enable_mono_graph=False,
-                 compile_only=False) -> None:
+                 compile_only=False,
+                 compile_kwargs={}) -> None:
         update_wrapper(self, func)
         self.original_func = func
 
@@ -67,6 +68,7 @@ class CompiledFuncWrapper:
         self.enable_cuda_graph = cuda_graph
         self.enable_mono_graph = enable_mono_graph
         self.compile_only = compile_only
+        self.compile_kwargs = compile_kwargs
 
         self.init_helper = SetParaInitHelper()
 
@@ -123,7 +125,7 @@ class CompiledFuncWrapper:
 
             if self.parallel_mode == "auto":
                 self.compiled_func = _compile_auto(self.original_func, self.tracing_mode,
-                                                   self.init_helper, input_signature, args, kwargs)
+                                                   self.init_helper, input_signature, args, kwargs, **self.compile_kwargs)
             elif self.parallel_mode in ["ddp", "zero2", "zero3"]:
                 self.compiled_func = _compile_dp(self.original_func, self.parallel_mode,
                                                  self.tracing_mode, args, kwargs)
@@ -223,7 +225,8 @@ def easydist_compile(func=None,
                      use_hint=False,
                      liveness_only_input=False,
                      max_solver_time=float("inf"),
-                     compile_only=False):
+                     compile_only=False,
+                     **compile_kwargs):
 
     mdconfig.use_hint = use_hint
     mdconfig.liveness_only_input = liveness_only_input
@@ -236,11 +239,11 @@ def easydist_compile(func=None,
         )
     if func:
         return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph,
-                                   enable_mono_graph, compile_only)
+                                   enable_mono_graph, compile_only, compile_kwargs)
     else:
 
         def wrapper(func):
             return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph,
-                                       enable_mono_graph, compile_only)
+                                       enable_mono_graph, compile_only, compile_kwargs)
 
         return wrapper

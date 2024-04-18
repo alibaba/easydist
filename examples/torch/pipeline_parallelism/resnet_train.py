@@ -15,6 +15,7 @@ from tqdm import tqdm
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
+from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
     split_into_equal_size)
 
@@ -38,7 +39,10 @@ def seed(seed=42):
 criterion = torch.nn.CrossEntropyLoss()
 
 
-@easydist_compile(tracing_mode="fake", cuda_graph=False)
+@easydist_compile(tracing_mode="fake",
+                  cuda_graph=False,
+                  schedule_cls=ScheduleDAPPLE,
+                  num_chunks=4)
 def train_step(input, label, model, opt):
     opt.zero_grad()
     out = model(input)
@@ -72,7 +76,6 @@ def test_main():
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     batch_size = 64
-    num_chunks = world_size * 4  # high comm overhead
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
@@ -115,8 +118,7 @@ def test_main():
             all_cnt += len(out)
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
-            loss_sum += loss.item()
-
+            loss_sum += loss.mean().item()
         print(
             f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
         )

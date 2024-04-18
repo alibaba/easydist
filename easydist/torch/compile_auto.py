@@ -21,6 +21,7 @@ from functools import partial
 from typing import Any, Union, cast
 from contextlib import nullcontext
 
+import numpy
 import rich
 import torch
 import torch.utils._pytree as pytree
@@ -56,6 +57,7 @@ from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
+from easydist.utils.testing import TorchMockDeviceMesh
 
 # for pickle dump opt_strategy
 import sys
@@ -202,12 +204,15 @@ def _compile_auto(func,
                   input_signature,
                   args,
                   kwargs,
-                  schedule_cls=ScheduleGPipe,
+                  schedule_cls=None,
                   args_chunk_spec=None,
                   kwargs_chunk_spec=None,
                   outputs_chunk_spec=None,
                   num_chunks=1,
                   strict=True) -> Union[PipelineStage, Any]:
+    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                             args_chunk_spec, kwargs_chunk_spec)
+    args, kwargs = args_split[0], kwargs_split[0]
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -270,15 +275,12 @@ def _compile_auto(func,
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
-    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
-                                                             args_chunk_spec, kwargs_chunk_spec)
-
     with _enable_compile(), SplitPatcher(module, opt) if schedule_cls else nullcontext():
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
-                               _allow_non_fake_inputs=False)(params, buffers, named_states, args_split[0],
-                                                             kwargs_split[0])
+                               _allow_non_fake_inputs=False)(params, buffers, named_states, args,
+                                                             kwargs)
 
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
@@ -345,7 +347,7 @@ def _compile_auto(func,
         sharded_graph = fix_embedding(sharded_graph, recover=True)
 
         if not mdconfig.use_dtensor:
-            if False and schedule_cls is None and mdconfig.comm_optimization is True:
+            if schedule_cls is None and mdconfig.comm_optimization is True:
                 sharded_graph = runtime_prof(sharded_graph)
                 sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
 
@@ -365,6 +367,18 @@ def _compile_auto(func,
                 dot_graph.write_jpg(f"./tmp/{name}.jpg")
                 dot_graph.write_raw(f"./tmp/{name}.txt")
 
+        # do not use mock device after get sharded_graph
+        device_mesh = get_device_mesh()
+        if isinstance(device_mesh, TorchMockDeviceMesh):
+            if device_mesh.debug_only:
+                mesh_shape = numpy.array(range(world_size)).reshape(1, -1).tolist()
+            else:
+                mesh_shape = device_mesh.shape
+            mesh = DeviceMesh("cuda", mesh_shape)
+            set_device_mesh(mesh)
+
+        device = mdconfig.easydist_device
+
         # keep fake params, buffers, named_states
         fake_tensor_mode = FakeTensorMode()
 
@@ -377,16 +391,12 @@ def _compile_auto(func,
         fake_buffers = pytree.tree_map(wrap_fake, buffers)
         fake_named_states = pytree.tree_map(wrap_fake, named_states)
 
-        device_mesh = get_device_mesh()
-        device = mdconfig.easydist_device
-
         # pre-shard params, buffers, named_states
         params_strategy = args_strategy[:len(params)]
         buffers_strategy = args_strategy[len(params):len(params) + len(buffers)]
 
         if mdconfig.use_contiguous_buffer:
-            contiguous_buf = init_contiguous_buf(params, params_strategy,
-                                                device_mesh)
+            contiguous_buf = init_contiguous_buf(params, params_strategy, device_mesh)
 
         index = 0
         for idx, param_name in enumerate(params):
@@ -402,11 +412,9 @@ def _compile_auto(func,
             size = params[param_name]._local_tensor.numel()
 
             if mdconfig.use_contiguous_buffer:
-                contiguous_buf[index:index +
-                            size] = params[param_name]._local_tensor.view(-1)
-                params[param_name]._local_tensor = contiguous_buf[
-                    index:index + size].view(
-                        params[param_name]._local_tensor.shape)
+                contiguous_buf[index:index + size] = params[param_name]._local_tensor.view(-1)
+                params[param_name]._local_tensor = contiguous_buf[index:index + size].view(
+                    params[param_name]._local_tensor.shape)
 
             if not mdconfig.use_dtensor:
                 params[param_name] = params[param_name]._local_tensor
@@ -431,11 +439,10 @@ def _compile_auto(func,
         materialize_fn = partial(materialize_zero, materialization_device=device)
         for i in range(len(flat_named_states)):
             if isinstance(flat_named_states[i], torch.Tensor):
-                flat_named_states[i] = sharded_tensor(
-                    flat_named_states[i],
-                    args_strategy[state_tensor_num],
-                    get_device_mesh(),
-                    materialize_fn=materialize_fn)
+                flat_named_states[i] = sharded_tensor(flat_named_states[i],
+                                                    args_strategy[state_tensor_num],
+                                                    get_device_mesh(),
+                                                    materialize_fn=materialize_fn)
                 if not mdconfig.use_dtensor:
                     flat_named_states[i] = flat_named_states[i]._local_tensor
 
