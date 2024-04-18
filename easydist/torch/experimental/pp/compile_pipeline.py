@@ -334,7 +334,7 @@ class CompiledStage:
         params_and_buffers = (set(fw_gm.injected_states[StateType.PARAMS].keys())
                               | set(fw_gm.injected_states[StateType.BUFFERS].keys()))
         self.fw_func_args = set(fw_gm.inputs_spec) - params_and_buffers  # args for self.forward
-        self.fw_func_returns = set(  # TODO @botbw: better way of doing this
+        self.fw_func_returns = set(
             output for output, users in self.fw_gm.call_module_users.items()
             if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name))
         )  # not just used by bw, need to pass to next stage
@@ -347,7 +347,7 @@ class CompiledStage:
             self.bw_func_args = set(bw_gm.inputs_spec) - set(
                 self.activation_nodes) - params_and_buffers  # args for self.backward
 
-        if full_step_gm is not None:  # TODO @botbw: simplify this
+        if full_step_gm is not None:
             stage_params_inputs = set(self.fw_gm.injected_states[StateType.PARAMS]) & set(
                 full_step_gm.inputs_spec)
             inv_stage_params_inputs = set(self.compiled_meta.inv_params[name]
@@ -570,7 +570,7 @@ class CompiledStage:
                 self.step_gm.injected_states[StateType.OPTIMSTATES][node_name] = tensor
         # TODO: pop states after loading
 
-    def named_parameters(self):
+    def named_parameters(self):  # TODO @botbw: is it okay to gather one by one?
         if self.compiled_meta.params_strategies:
             params = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items():
@@ -586,7 +586,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()
             }
 
-    def named_buffers(self):
+    def named_buffers(self):  # TODO @botbw: is it okay to gather one by one?
         if self.compiled_meta.buffers_strategies:
             buffers = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items():
@@ -602,7 +602,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()
             }
 
-    def optimizer_state_dict(self):
+    def optimizer_state_dict(self):  # TODO @botbw: is it okay to gather one by one?
         optim_state = defaultdict(dict)
         if self.compiled_meta.optimstates_strategies:
             for name, state in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
@@ -978,7 +978,7 @@ def compile_pipeline(
     save_graphviz_dot(splited_global, "splited_global")
     states_used_by = defaultdict(list)
 
-    # functions to convert a stateless submodule to a stateful one TODO @botbw: simpify this if possible
+    # functions to convert a stateless submodule to a stateful one
     def _extract_output(node):
         # process output
         outputs_spec = []

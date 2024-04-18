@@ -590,7 +590,7 @@ class PipelineStage:
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
 
-    def _gather_state_dict(self, world_rank):
+    def _gather_state_dict(self, world_rank):  # TODO @botbw: should use gather_object here?
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()  # gather spmd0, spmd1
         device_mesh = get_device_mesh()
@@ -602,7 +602,7 @@ class PipelineStage:
                                group=self.pp_group)
         return state_dicts
 
-    def _gather_optimizer_state_dict(self, world_rank):
+    def _gather_optimizer_state_dict(self, world_rank):  # TODO @botbw: should use gather_object here?
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
         device_mesh = get_device_mesh()
@@ -615,7 +615,7 @@ class PipelineStage:
                 group=self.pp_group)
         return optimizer_state_dicts
 
-    def _all_gather_returns(self):
+    def _all_gather_returns(self):  # TODO @botbw: should use gather_object here?
         returns_all_gather = [None for _ in range(self.num_stages)]
         returns_nodes_flatten = {
             node_name: None
@@ -662,7 +662,7 @@ class PipelineStage:
         else:
             ret = graph_outputs_to_func_outputs(self.compiled_meta,
                                                 self.outputs_batch,
-                                                strict=False)[-1]
+                                            strict=False)[-1]  # TODO @botbw: remove?
         return ret
 
     def run_with_graph(self, graph, *args, **kwargs):  # could construct a partial graph
