@@ -46,7 +46,7 @@ def bfs2top(root: fx.Node, vis: Dict[fx.Node, bool]):
             q.append(input_node)
     return set(res)
 
-def fix_node_order(fx_module: fx.GraphModule):
+def fix_node_order(fx_module: fx.GraphModule):  # TODO @botbw: reorder the whole graph if possible
     '''
                                     ┏ grad ┓
     Assume that the graph is fw -> bw -> step -> output

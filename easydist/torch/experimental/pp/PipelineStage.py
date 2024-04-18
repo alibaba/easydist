@@ -452,7 +452,7 @@ class PipelineStage:
 
         return composite_kwargs
 
-    def _send_output_dict(
+    def _send_output_dict(  # TODO @botbw: is it good send and receive one by one?
         self,
         send_info,
         output_dict,
