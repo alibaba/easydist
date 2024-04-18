@@ -1,3 +1,17 @@
+# Copyright (c) 2023, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from contextlib import nullcontext
 import logging
 import operator
@@ -5,29 +19,234 @@ import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx._symbolic_trace import _Patcher
-from torch.distributed._tensor import DeviceMesh, mesh_resources
+from torch.distributed._tensor import mesh_resources
 
-from easydist.metashard.annotation import ShardDim
 from easydist.metashard.metair import SPMD, VarSPMDStrategy
 from easydist.torch.device_mesh import get_device_mesh, spmd_device_mesh
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, set_backward_flag, split
 from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz_dot, _to_tuple
-from easydist.torch.init_helper import (InitHelper, SetParaInitHelper, materialize_zero)
 from easydist.torch.passes.sharding import all_gather_end, all_gather_start, all_reduce_end, all_reduce_start, all_to_all_end, all_to_all_start, reduce_scatter_end, reduce_scatter_start, scatter_wrapper, reduce_map
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.utils import _rematerialize_optimizer, to_torch_spmd
 from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params_states, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
 
 from torch.nn.utils import stateless
+
+# ================================= section start ========================================
+# Functions in this section are modified from
+# https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L1206
+
+
+# Copyright (c) Meta Platforms, Inc. and affiliates
+class PipeSplitWrapper(torch.nn.Module):
+
+    def __init__(self, mod: torch.nn.Module):
+        super().__init__()
+        self.mod = mod
+
+    def forward(self, *args, **kwargs):
+        ret: Any = self.mod(*args, **kwargs)
+        ret_on_new_stage: Any = split(ret)
+        assert type(ret) == type(
+            ret_on_new_stage), f"Please make sure you register the unflatten func correctly"
+        return ret_on_new_stage
+
+    def __getattr__(self, name: str):
+        if '_parameters' in self.__dict__:
+            _parameters = self.__dict__['_parameters']
+            if name in _parameters:
+                return _parameters[name]
+        if '_buffers' in self.__dict__:
+            _buffers = self.__dict__['_buffers']
+            if name in _buffers:
+                return _buffers[name]
+        if '_modules' in self.__dict__:
+            modules = self.__dict__['_modules']
+            if name in modules:
+                return modules[name]
+        if hasattr(self.mod, name):
+            return getattr(self.mod, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+
+def annotate_split_points(mod: torch.nn.Module, spec: set[str]):
+    # TODO: make this implementation out-of-place?
+    for qualname in iter(spec):
+        atoms = qualname.split(".")
+        predecessor_module = mod
+        for i, atom in enumerate(atoms[:-1]):
+            try:
+                predecessor_module = getattr(predecessor_module, atom)
+            except AttributeError as e:
+                raise AttributeError(
+                    f'Specified target {qualname} referenced nonexistent module {".".join(atoms[:i+1])}'
+                )
+
+        mod_to_wrap = getattr(predecessor_module, atoms[-1])
+        wrapped_mod = PipeSplitWrapper(mod_to_wrap)
+        setattr(predecessor_module, atoms[-1], wrapped_mod)
+
+
+def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], torch.fx.GraphModule]:
+
+    def _split_into_nstages_equal_size(mod: torch.nn.Module) -> torch.fx.GraphModule:
+        tracer = torch.fx.Tracer()
+        g = tracer.trace(mod)
+        gm = torch.fx.GraphModule(mod, g)
+        param_size = 0
+        for param in gm.parameters():
+            param_size += param.numel()
+        buffer_size = 0
+        for buffer in gm.buffers():
+            buffer_size += buffer.numel()
+
+        total_size = param_size + buffer_size
+        per_stage_size = total_size // nstages
+        logging.debug(f"Total model size: {total_size}, "
+                      f"per stage size: {per_stage_size}")
+
+        gm, rv_nstages = _split_on_size_threshold_with_max_stages(gm, per_stage_size, nstages)
+        assert rv_nstages == nstages
+        return nstages, gm
+
+    return _split_into_nstages_equal_size
+
+
+def _analyze_node_size(gm: torch.fx.GraphModule, ) -> Dict[torch.fx.Node, Dict[str, int]]:
+    # state_dict helps us to get parameter sizes
+    state_dict = gm.state_dict()
+
+    # Function Parameter Usage
+    node_param_sizes: Dict[torch.fx.Node, Dict[str, int]] = {}
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":  # a parameter node
+            param_name = node.target
+            assert param_name in state_dict
+            param = state_dict[param_name]
+            # Find use site of this parameter
+            for user in node.users:
+                func_param_sizes = node_param_sizes.setdefault(user, {})
+                func_param_sizes.setdefault(param_name, param.numel())
+
+    # Module Parameter Usage
+    for node in gm.graph.nodes:
+        # We calcuate size of a user-defined submodule as a whole
+        if node.op == "call_module":
+            mod_param_sizes: Dict[str, int] = {}
+            submod: torch.nn.Module = gm.get_submodule(node.target)
+            for param_name, param in submod.named_parameters():
+                mod_param_sizes.setdefault(param_name, param.numel())
+            if mod_param_sizes:
+                node_param_sizes.setdefault(node, mod_param_sizes)
+
+    for node, param_sizes in node_param_sizes.items():
+        logging.debug(f"{node} has params: {param_sizes}")
+
+    return node_param_sizes
+
+
+def _split_on_size_threshold_with_max_stages(
+    gm: torch.fx.GraphModule,
+    threshold: int,
+    max_stages: int = -1,
+) -> Tuple[torch.fx.GraphModule, int]:
+    # Analyze size of parameters/buffers used by each node in the graph
+    node_param_sizes = _analyze_node_size(gm)
+
+    # Record split positions
+    insert_after_nodes: List[torch.fx.Node] = []
+
+    def new_stage_after(node):
+        insert_after_nodes.append(node)
+
+    # Track the parameters we have seen in the current bucket and their total size
+    accumulate_size = 0
+    accumulate_params: Dict = {}
+    checked_nodes = []
+    for node in gm.graph.nodes:
+        if node not in node_param_sizes:
+            # The callsite of this node does not involve parameters or buffers
+            continue
+
+        # Track the new parameters we see at this node as well as parameters that we have seen in current bucket
+        new_size = 0
+        new_params: Dict = {}
+        repeated_size = 0
+        repeated_params: Dict = {}
+        param_sizes = node_param_sizes[node]
+        if node.op == "call_function":
+            checked_nodes.append(node)
+            # For function, the parameter it uses can be shared with other functions seen previously
+            for param_name, size in param_sizes.items():
+                if param_name not in accumulate_params:  # new parameter
+                    new_params.setdefault(param_name)
+                    new_size += size
+                else:  # repeated parameter; mark down; use later
+                    repeated_params.setdefault(param_name)
+                    repeated_size += size
+        elif node.op == "call_module":
+            checked_nodes.append(node)
+            # For module, we count its paramters as a single whole
+            for param_name, size in param_sizes.items():
+                new_size += size
+
+        if (accumulate_size + new_size
+                <= threshold):  # can accommodate this node in current bucket
+            accumulate_size += new_size
+            accumulate_params.update(new_params)
+        elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage
+            new_stage_after(node)
+        else:  # cannot accommodate this node
+            try:
+                new_stage_after(checked_nodes[-2])
+            except IndexError:
+                raise RuntimeError(
+                    f"Cannot split graph into stages with size threshold {threshold} and max stages {max_stages}"
+                )
+            accumulate_size = repeated_size + new_size
+            accumulate_params.clear()
+            accumulate_params.update(repeated_params)
+            accumulate_params.update(new_params)
+
+    def gen_func_wrapper(target_func):
+
+        def wrapped_func(*args, **kwargs):
+            ret = target_func(*args, **kwargs)
+            ret = _to_tuple(ret)
+            ret = fw_bw_split_func(*ret)
+            return ret[0] if len(ret) == 1 else ret
+
+        return wrapped_func
+
+    def gen_module_wrapper(target_module):
+        return PipeSplitWrapper(target_module)
+
+    nstages = 1
+    for node in insert_after_nodes:
+        if nstages == max_stages:
+            break
+        if node.op == "call_function":
+            node.target = gen_func_wrapper(node.target)
+        else:
+            assert node.op == "call_module"
+            rsetattr(gm, node.target, gen_module_wrapper(rgetattr(gm, node.target)))
+
+        nstages += 1
+
+    # Since we transformed the graph, we need to recompile the module
+    gm.recompile()
+
+    return gm, nstages
+
+
+# ================================= section end ========================================
 
 
 class StateType(Enum):
@@ -41,7 +260,7 @@ class SubmodType(Enum):
     BW = "bw"
     STEP = "step"
 
-# TODO @botbw simplify this
+
 @dataclass
 class CompiledMeta:
     nstages: int
@@ -101,10 +320,14 @@ class EDGraphModule:
         return self.gm(*args, **kwargs)
 
 
-class CompiledStage:  # TODO @botbw: make this picklable
+class CompiledStage:
 
-    def __init__(self, compiled_meta: CompiledMeta, fw_gm: EDGraphModule,
-                 bw_gm: Optional[EDGraphModule], full_step_gm: Optional[EDGraphModule], strict: bool = True):
+    def __init__(self,
+                 compiled_meta: CompiledMeta,
+                 fw_gm: EDGraphModule,
+                 bw_gm: Optional[EDGraphModule],
+                 full_step_gm: Optional[EDGraphModule],
+                 strict: bool = True):
         self.strict = strict
         self.compiled_meta = compiled_meta
         self.fw_gm = fw_gm
@@ -306,11 +529,11 @@ class CompiledStage:  # TODO @botbw: make this picklable
     def _load_params(self, state_dict):
         to_pop = []
         for torch_name, tensor in state_dict.items():
-            node_name = self.compiled_meta.params_nodes_unflatten[torch_name]       
+            node_name = self.compiled_meta.params_nodes_unflatten[torch_name]
             if node_name in self.compiled_meta.params_strategies:
                 src_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
                 tgt_specs = self.compiled_meta.params_strategies[node_name]
-                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)         
+                tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
             self.fw_gm.injected_states[StateType.PARAMS][node_name] = tensor
             to_pop.append(torch_name)
         for torch_name in to_pop:
@@ -346,7 +569,6 @@ class CompiledStage:  # TODO @botbw: make this picklable
                     tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
                 self.step_gm.injected_states[StateType.OPTIMSTATES][node_name] = tensor
         # TODO: pop states after loading
-
 
     def named_parameters(self):
         if self.compiled_meta.params_strategies:
@@ -397,212 +619,6 @@ class CompiledStage:  # TODO @botbw: make this picklable
             return dict(optim_state)
 
 
-# ================================= section start ========================================
-# The idea of functions in this section are modified from
-# https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L1206
-class PipeSplitWrapper(torch.nn.Module):
-
-    def __init__(self, mod: torch.nn.Module):
-        super().__init__()
-        self.mod = mod
-
-    def forward(self, *args, **kwargs):
-        ret: Any = self.mod(*args, **kwargs)
-        ret_on_new_stage: Any = split(ret)
-        assert type(ret) == type(ret_on_new_stage), f"Please make sure you register the unflatten func correctly"
-        return ret_on_new_stage
-
-    def __getattr__(self, name: str):
-        if '_parameters' in self.__dict__:
-            _parameters = self.__dict__['_parameters']
-            if name in _parameters:
-                return _parameters[name]
-        if '_buffers' in self.__dict__:
-            _buffers = self.__dict__['_buffers']
-            if name in _buffers:
-                return _buffers[name]
-        if '_modules' in self.__dict__:
-            modules = self.__dict__['_modules']
-            if name in modules:
-                return modules[name]
-        if hasattr(self.mod, name):
-            return getattr(self.mod, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-
-def annotate_split_points(mod: torch.nn.Module, spec: set[str]):
-    # TODO: make this implementation out-of-place?
-    for qualname in iter(spec):
-        atoms = qualname.split(".")
-        predecessor_module = mod
-        for i, atom in enumerate(atoms[:-1]):
-            try:
-                predecessor_module = getattr(predecessor_module, atom)
-            except AttributeError as e:
-                raise AttributeError(
-                    f'Specified target {qualname} referenced nonexistent module {".".join(atoms[:i+1])}'
-                )
-
-        mod_to_wrap = getattr(predecessor_module, atoms[-1])
-        wrapped_mod = PipeSplitWrapper(mod_to_wrap)
-        setattr(predecessor_module, atoms[-1], wrapped_mod)
-
-
-def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], torch.fx.GraphModule]:
-
-    def _split_into_nstages_equal_size(mod: torch.nn.Module) -> torch.fx.GraphModule:
-        tracer = torch.fx.Tracer()
-        g = tracer.trace(mod)
-        gm = torch.fx.GraphModule(mod, g)
-        param_size = 0
-        for param in gm.parameters():
-            param_size += param.numel()
-        buffer_size = 0
-        for buffer in gm.buffers():
-            buffer_size += buffer.numel()
-
-        total_size = param_size + buffer_size
-        per_stage_size = total_size // nstages
-        logging.debug(f"Total model size: {total_size}, "
-                      f"per stage size: {per_stage_size}")
-
-        gm, rv_nstages = _split_on_size_threshold_with_max_stages(gm, per_stage_size, nstages)
-        assert rv_nstages == nstages
-        return nstages, gm
-
-    return _split_into_nstages_equal_size
-
-
-def _analyze_node_size(gm: torch.fx.GraphModule, ) -> Dict[torch.fx.Node, Dict[str, int]]:
-    # state_dict helps us to get parameter sizes
-    state_dict = gm.state_dict()
-
-    # Function Parameter Usage
-    node_param_sizes: Dict[torch.fx.Node, Dict[str, int]] = {}
-    for node in gm.graph.nodes:
-        if node.op == "get_attr":  # a parameter node
-            param_name = node.target
-            assert param_name in state_dict
-            param = state_dict[param_name]
-            # Find use site of this parameter
-            for user in node.users:
-                func_param_sizes = node_param_sizes.setdefault(user, {})
-                func_param_sizes.setdefault(param_name, param.numel())
-
-    # Module Parameter Usage
-    for node in gm.graph.nodes:
-        # We calcuate size of a user-defined submodule as a whole
-        if node.op == "call_module":
-            mod_param_sizes: Dict[str, int] = {}
-            submod: torch.nn.Module = gm.get_submodule(node.target)
-            for param_name, param in submod.named_parameters():
-                mod_param_sizes.setdefault(param_name, param.numel())
-            if mod_param_sizes:
-                node_param_sizes.setdefault(node, mod_param_sizes)
-
-    for node, param_sizes in node_param_sizes.items():
-        logging.debug(f"{node} has params: {param_sizes}")
-
-    return node_param_sizes
-
-
-def _split_on_size_threshold_with_max_stages(
-    gm: torch.fx.GraphModule,
-    threshold: int,
-    max_stages: int = -1,
-) -> Tuple[torch.fx.GraphModule, int]:
-    # Analyze size of parameters/buffers used by each node in the graph
-    node_param_sizes = _analyze_node_size(gm)
-
-    # Record split positions
-    insert_after_nodes: List[torch.fx.Node] = []
-
-    def new_stage_after(node):
-        insert_after_nodes.append(node)
-
-    # Track the parameters we have seen in the current bucket and their total size
-    accumulate_size = 0
-    accumulate_params: Dict = {}
-    checked_nodes = []
-    for node in gm.graph.nodes:
-        if node not in node_param_sizes:
-            # The callsite of this node does not involve parameters or buffers
-            continue
-
-        # Track the new parameters we see at this node as well as parameters that we have seen in current bucket
-        new_size = 0
-        new_params: Dict = {}
-        repeated_size = 0
-        repeated_params: Dict = {}
-        param_sizes = node_param_sizes[node]
-        if node.op == "call_function":
-            checked_nodes.append(node)
-            # For function, the parameter it uses can be shared with other functions seen previously
-            for param_name, size in param_sizes.items():
-                if param_name not in accumulate_params:  # new parameter
-                    new_params.setdefault(param_name)
-                    new_size += size
-                else:  # repeated parameter; mark down; use later
-                    repeated_params.setdefault(param_name)
-                    repeated_size += size
-        elif node.op == "call_module":
-            checked_nodes.append(node)
-            # For module, we count its paramters as a single whole
-            for param_name, size in param_sizes.items():
-                new_size += size
-
-        if (accumulate_size + new_size
-                <= threshold):  # can accommodate this node in current bucket
-            accumulate_size += new_size
-            accumulate_params.update(new_params)
-        elif (accumulate_size == 0 and new_size > threshold):  # this node becomes a stage
-            new_stage_after(node)
-        else:  # cannot accommodate this node
-            try:
-                new_stage_after(checked_nodes[-2])
-            except IndexError:
-                raise RuntimeError(
-                    f"Cannot split graph into stages with size threshold {threshold} and max stages {max_stages}"
-                )
-            accumulate_size = repeated_size + new_size
-            accumulate_params.clear()
-            accumulate_params.update(repeated_params)
-            accumulate_params.update(new_params)
-
-    def gen_func_wrapper(target_func):
-
-        def wrapped_func(*args, **kwargs):
-            ret = target_func(*args, **kwargs)
-            ret = _to_tuple(ret)
-            ret = fw_bw_split_func(*ret)
-            return ret[0] if len(ret) == 1 else ret
-
-        return wrapped_func
-
-    def gen_module_wrapper(target_module):
-        return PipeSplitWrapper(target_module)
-
-    nstages = 1
-    for node in insert_after_nodes:
-        if nstages == max_stages:
-            break
-        if node.op == "call_function":
-            node.target = gen_func_wrapper(node.target)
-        else:
-            assert node.op == "call_module"
-            rsetattr(gm, node.target, gen_module_wrapper(rgetattr(gm, node.target)))
-
-        nstages += 1
-
-    # Since we transformed the graph, we need to recompile the module
-    gm.recompile()
-
-    return gm, nstages
-
-
-# ================================= section end ========================================
-
-
 class SplitPatcher(_Patcher):
 
     def __init__(self, mod: torch.nn.Module, opt: torch.optim.Optimizer):
@@ -622,7 +638,6 @@ class SplitPatcher(_Patcher):
 
         patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
 
-
         if self.mod:
             mod_cls = type(self.mod)
             orig_forward = mod_cls.forward
@@ -637,12 +652,9 @@ class SplitPatcher(_Patcher):
             opt_cls = type(self.opt)
             orig_step = opt_cls.step
 
-
             def step_wrapper(opt, *args, **kwargs):
                 params = dict(self.mod.named_parameters()) if self.mod else {}
-                grads = {
-                    n: p.grad for n, p in params.items() if p.grad is not None
-                }
+                grads = {n: p.grad for n, p in params.items() if p.grad is not None}
                 named_states = {}
                 for n, p in params.items():
                     if p in self.opt.state:
@@ -660,17 +672,17 @@ class SplitPatcher(_Patcher):
                     p.grad = split_grads[n]
 
                 with stateless._reparametrize_module(
-                    cast(torch.nn.Module, self.mod), {
-                        **params,
-                    }, tie_weights=True) if self.mod else nullcontext(), _rematerialize_optimizer(
-                        opt, named_states, params) if opt else nullcontext():
+                        cast(torch.nn.Module, self.mod), {
+                            **params,
+                        },
+                        tie_weights=True) if self.mod else nullcontext(), _rematerialize_optimizer(
+                            opt, named_states, params) if opt else nullcontext():
                     orig_step(opt, *args, **kwargs)
 
                 set_updated_params_states(params, named_states)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
-
 
         return patcher
 
@@ -717,9 +729,8 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
                             node
                         )  # nodes that can be removed directly (i.e. not connected in graph)
                     except Exception as e:  # nodes which are in graph
-                        assert len(
-                            node.args
-                        ) == 1 and len(node.args[0]) == len(node.users), "split_point should have only one argument (list) or None"
+                        assert len(node.args) == 1 and len(node.args[0]) == len(
+                            node.users), "split_point should have only one argument (list) or None"
                         args_prev = node.args[0]
                         to_erase = []
                         for gi in node.users:
@@ -867,31 +878,32 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                          ed_gm.call_module_users, 'partial_' + ed_gm.name)
 
 
-def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta, node_outputs: Dict[str, torch.Tensor], strict: bool=True):
-    return pytree.tree_unflatten(
-        [node_outputs[node_name] if (strict or node_name in node_outputs) else None for node_name in compiled_meta.output_nodes_flatten],
-        compiled_meta.out_spec)
+def graph_outputs_to_func_outputs(compiled_meta: CompiledMeta,
+                                  node_outputs: Dict[str, torch.Tensor],
+                                  strict: bool = True):
+    return pytree.tree_unflatten([
+        node_outputs[node_name] if (strict or node_name in node_outputs) else None
+        for node_name in compiled_meta.output_nodes_flatten
+    ], compiled_meta.out_spec)
 
 
 def compile_pipeline(
     traced_stateless_func: fx.GraphModule,  # traced stateless function with split op
     nstages: int,  # number of stages, should be num_of_split_op * 2
     stateless_func_args,  # args for stateless function
-    phs_stragegies: Optional[List[VarSPMDStrategy]]=None,
+    phs_stragegies: Optional[List[VarSPMDStrategy]] = None,
     strict=True  # report error if not all params and buffers are used
 ) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
     is_backward_called = get_backward_flag()
     is_step_called = get_step_flag()
 
-    input_nodes_flatten = tuple(
-        ph.name for ph in traced_stateless_func.graph.nodes if ph.op == 'placeholder'
-    )
+    input_nodes_flatten = tuple(ph.name for ph in traced_stateless_func.graph.nodes
+                                if ph.op == 'placeholder')
     inputs_nodes_unflatten = pytree.tree_unflatten(input_nodes_flatten,
                                                    traced_stateless_func._in_spec)
 
-    output_nodes_flatten = tuple(
-        node.name if node else None for node in list(traced_stateless_func.graph.nodes)[-1].args[0]
-    )
+    output_nodes_flatten = tuple(node.name if node else None
+                                 for node in list(traced_stateless_func.graph.nodes)[-1].args[0])
     output_nodes_unflatten = pytree.tree_unflatten(output_nodes_flatten,
                                                    traced_stateless_func._out_spec)
 
@@ -899,7 +911,8 @@ def compile_pipeline(
     params, buffers, optimstates, args, kwargs = stateless_func_args
     params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten, args_nodes_unflatten, kwargs_nodes_unflatten = inputs_nodes_unflatten
     output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, __nones_or_grads_nodes_unflatten, returns_nodes_unflatten = output_nodes_unflatten
-    _, __nones_or_grads_nodes_unflatten_spec = pytree.tree_flatten(__nones_or_grads_nodes_unflatten)  # don't use
+    _, __nones_or_grads_nodes_unflatten_spec = pytree.tree_flatten(
+        __nones_or_grads_nodes_unflatten)  # don't use
     returns_nodes_flatten, _ = pytree.tree_flatten(returns_nodes_unflatten)
     output_optimstates_nodes_flatten, _ = pytree.tree_flatten(output_optimstates_nodes_unflatten)
 
@@ -952,13 +965,16 @@ def compile_pipeline(
                 optimstates_strategies[ph_name] = ph_strategy
 
     # split fw_bw and step
-    splited_global, part_cnt = split_by(traced_stateless_func, torch.ops.easydist.step_split.default)
+    splited_global, part_cnt = split_by(traced_stateless_func,
+                                        torch.ops.easydist.step_split.default)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
     nones_or_grads_nodes_unflatten = {}
     if hasattr(splited_global, 'submod_1'):
         phs = [node for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         num_params = len(params_nodes_unflatten)
-        nones_or_grads_nodes_unflatten = pytree.tree_unflatten([ph.name for ph in phs[num_params: num_params * 2]], __nones_or_grads_nodes_unflatten_spec)
+        nones_or_grads_nodes_unflatten = pytree.tree_unflatten(
+            [ph.name for ph in phs[num_params:num_params * 2]],
+            __nones_or_grads_nodes_unflatten_spec)
     save_graphviz_dot(splited_global, "splited_global")
     states_used_by = defaultdict(list)
 
@@ -1089,7 +1105,7 @@ def compile_pipeline(
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
-        node_to_stage_idx=None,# this need to be filled later
+        node_to_stage_idx=None,  # this need to be filled later
         params_strategies=params_strategies,
         buffers_strategies=buffers_strategies,
         optimstates_strategies=optimstates_strategies,
@@ -1125,7 +1141,11 @@ def compile_pipeline(
                 save_graphviz_dot(step_gm_global.gm, f"step_gm_global")
                 for fw_gm, bw_gm in zip(current_stateful_fw_bw[:nstages],
                                         reversed(current_stateful_fw_bw[nstages:])):
-                    compiled_stage = CompiledStage(compiled_meta, fw_gm, bw_gm, step_gm_global, strict=strict)
+                    compiled_stage = CompiledStage(compiled_meta,
+                                                   fw_gm,
+                                                   bw_gm,
+                                                   step_gm_global,
+                                                   strict=strict)
                     compiled_stages.append(compiled_stage)
                 assert len(
                     step_gm_global.injected_states[StateType.OPTIMSTATES]
@@ -1134,7 +1154,8 @@ def compile_pipeline(
             is_fwbw = not is_fwbw
 
     # some post check
-    erased_tensor_keys = set(params.keys()) | set(buffers.keys()) | set(k for k, v in optimstates.items() if v)
+    erased_tensor_keys = set(params.keys()) | set(buffers.keys()) | set(
+        k for k, v in optimstates.items() if v)
     if erased_tensor_keys:
         debugging_info = textwrap.dedent(f"""
             Some states were erased, please make sure this is as intended
@@ -1177,7 +1198,7 @@ def compile_pipeline(
             if node.name not in all_states_names_flatten:  # args that are not states
                 env[node.name] = g.placeholder(node.name)
         elif node.op == 'call_module':
-            for dump_ph in splited_global.graph.nodes: # args that are not used in fwbw
+            for dump_ph in splited_global.graph.nodes:  # args that are not used in fwbw
                 if dump_ph.op == 'placeholder' and dump_ph.name not in all_states_names_flatten and dump_ph.name not in env:
                     env[dump_ph.name] = g.placeholder(dump_ph.name)
 
@@ -1211,7 +1232,6 @@ def compile_pipeline(
                 construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
             submod_idx += 1
 
-
     compiled_meta.node_to_stage_idx = name_to_stage_idx  # TODO @botbw move this to constructor?
 
     def eliminate_dead_node():
@@ -1222,29 +1242,30 @@ def compile_pipeline(
 
     return compiled_meta, compiled_stages, local_gm, erased_tensor_keys
 
+
 def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
     stage_idx = submod_idx
     stage = compiled_stages[submod_idx]
     node_name = f'stage_{submod_idx}_fw'
     out_maybe_tuple = g.create_node(
-                        name=node_name,
-                        op='call_function',
-                        target=stage.forward,
-                        kwargs={arg_name: env[arg_name]
-                                for arg_name in stage.fw_func_args})
+        name=node_name,
+        op='call_function',
+        target=stage.forward,
+        kwargs={arg_name: env[arg_name]
+                for arg_name in stage.fw_func_args})
     name_to_stage_idx[node_name] = stage_idx
     for arg_name in stage.fw_func_args:
         if env[arg_name].op == 'placeholder':
             name_to_stage_idx[arg_name] = stage_idx
     for output in stage.fw_func_returns:
         env[output] = g.create_node(name=output,
-                                                    op='call_function',
-                                                    target=operator.getitem,
-                                                    args=(out_maybe_tuple, output))
+                                    op='call_function',
+                                    target=operator.getitem,
+                                    args=(out_maybe_tuple, output))
         name_to_stage_idx[output] = stage_idx
 
-def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy],
-                 tgt_specs: List[VarSPMDStrategy]):
+
+def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSPMDStrategy]):
     if src_specs == tgt_specs:
         return tensor
 
@@ -1261,18 +1282,15 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy],
 
             if target.is_shard():
                 if current.is_replicate():
-                    result = scatter_wrapper(result, num_chunks,
-                                            target.dim, my_coordinate[i])
+                    result = scatter_wrapper(result, num_chunks, target.dim, my_coordinate[i])
                 elif current.is_shard():
                     # all_to_all
                     submesh = mesh_resources.create_child_mesh(device_mesh, i)
                     ranks = submesh.mesh.flatten().tolist()
 
-                    result = all_to_all_start(result, current.dim,
-                                            target.dim, num_chunks,
-                                            my_coordinate[i], ranks)
-                    result = all_to_all_end(result, current.dim,
-                                            target.dim, num_chunks,
+                    result = all_to_all_start(result, current.dim, target.dim, num_chunks,
+                                              my_coordinate[i], ranks)
+                    result = all_to_all_end(result, current.dim, target.dim, num_chunks,
                                             my_coordinate[i], ranks)
                 elif current.is_partial():
                     # reduce_scatter
@@ -1280,10 +1298,8 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy],
                     ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
-                    result = reduce_scatter_start(result, reduceOp,
-                                                target.dim, ranks)
-                    result = reduce_scatter_end(result, reduceOp,
-                                                target.dim, ranks)
+                    result = reduce_scatter_start(result, reduceOp, target.dim, ranks)
+                    result = reduce_scatter_end(result, reduceOp, target.dim, ranks)
             elif target.is_replicate():
                 if current.is_shard():
                     submesh = mesh_resources.create_child_mesh(device_mesh, i)

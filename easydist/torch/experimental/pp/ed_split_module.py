@@ -1,14 +1,26 @@
+# Copyright (c) 2024, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 # Functions in this file are modified from
 # https://github.com/pytorch/pytorch/blob/5667a990fd0aaa1cec2df8f6666fae9df478ee03/torch/fx/passes/split_module.py#L44
 import inspect
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-from torch.fx._compatibility import compatibility
 from torch.fx.graph_module import GraphModule
 
 
-@compatibility(is_backward_compatible=True)
 class Partition:
 
     def __init__(self, name: str):
@@ -33,7 +45,6 @@ class Partition:
 
 
 # Creates subgraphs out of main graph
-@compatibility(is_backward_compatible=True)
 def ed_split_module(
     m: GraphModule,
     root_m: torch.nn.Module,
@@ -330,12 +341,11 @@ def ed_split_module(
             partition.targets, partition.graph)  # noqa: B950
 
         # Emit call in base graph to this submodule
-        output_val = base_mod_graph.create_node(
-            op='call_module',
-            target=partition.submod_name,
-            args=tuple(base_mod_env[name] for name in partition.inputs),
-            name=partition.submod_name
-        )
+        output_val = base_mod_graph.create_node(op='call_module',
+                                                target=partition.submod_name,
+                                                args=tuple(base_mod_env[name]
+                                                           for name in partition.inputs),
+                                                name=partition.submod_name)
 
         num_outputs = len(partition.outputs)
         if num_outputs > 1:
@@ -348,12 +358,10 @@ def ed_split_module(
         elif num_outputs == 1:
             # Introduce one redudant node
             output_name = list(partition.outputs)[0]
-            base_mod_env[output_name] = base_mod_graph.create_node(
-                op='call_function',
-                target=lambda x: x,
-                args=(output_val,),
-                name=output_name
-            )
+            base_mod_env[output_name] = base_mod_graph.create_node(op='call_function',
+                                                                   target=lambda x: x,
+                                                                   args=(output_val, ),
+                                                                   name=output_name)
 
     for node in m.graph.nodes:
         if node.op == "output":

@@ -1,3 +1,17 @@
+# Copyright (c) 2023, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from collections import defaultdict
 import logging
 import operator
@@ -5,22 +19,18 @@ from abc import ABC, abstractmethod
 from functools import reduce
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
-
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor
-from torch.fx.node import map_arg
 import torch.utils._pytree as pytree
-from torch.distributed._tensor import DeviceMesh, mesh_resources
 
-from easydist.metashard.metair import VarSPMDStrategy
-from easydist.torch.device_mesh import get_device_mesh, get_pp_group, get_pp_rank, get_spmd_rank, spmd_device_mesh
-from easydist.torch.experimental.pp.compile_pipeline import (
-    CompiledMeta, CompiledStage, StateType,
-    graph_outputs_to_func_outputs)
-from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer, TensorChunkSpec,
-                                                       merge_chunks, split_args_kwargs_into_chunks)
+from easydist.torch.device_mesh import get_device_mesh, get_spmd_rank
+from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage,
+                                                             graph_outputs_to_func_outputs)
+from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer,
+                                                       TensorChunkSpec, merge_chunks,
+                                                       split_args_kwargs_into_chunks)
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +41,17 @@ def _make_tensor_from_meta(
 ) -> torch.Tensor:
     return torch.empty(example_value.size(), dtype=example_value.dtype, device=device)
 
+
 class RecvBase:
-    def __init__(
-            self, 
-            input_name: str,
-            source: int,
-            example_tensor: FakeTensor
-        ):
+
+    def __init__(self, input_name: str, source: int, example_tensor: FakeTensor):
         self.input_name = input_name
         self.source = source
         self.example_tensor = example_tensor
-    
+
     def get_buffer(self, device: torch.device) -> torch.Tensor:
         raise NotImplementedError
+
 
 class RecvDynamicBuffer(RecvBase):
 
@@ -54,27 +62,25 @@ class RecvDynamicBuffer(RecvBase):
         example_tensor: FakeTensor,
     ):
         super().__init__(input_name, source, example_tensor)
-    
+
     def get_buffer(self, device: torch.device) -> torch.Tensor:
         return _make_tensor_from_meta(self.example_tensor, device)
 
+
 class RecvStaticBuffer(RecvBase):
-    
-        def __init__(
-            self,
-            input_name: str,
-            source: int,
-            example_tensor: FakeTensor
-        ):
-            super().__init__(input_name, source, example_tensor)
-            self.buffer = None
-    
-        def get_buffer(self, device: torch.device) -> torch.Tensor:
-            if self.buffer is None:
-                self.buffer = _make_tensor_from_meta(self.example_tensor, device)
-            return self.buffer
+
+    def __init__(self, input_name: str, source: int, example_tensor: FakeTensor):
+        super().__init__(input_name, source, example_tensor)
+        self.buffer = None
+
+    def get_buffer(self, device: torch.device) -> torch.Tensor:
+        if self.buffer is None:
+            self.buffer = _make_tensor_from_meta(self.example_tensor, device)
+        return self.buffer
+
 
 class StageKwargPlaceholder:
+
     def __init__(self, input_name: str):
         self.input_name = input_name
 
@@ -146,7 +152,7 @@ class ScheduleDAPPLE(Schedule):
 
         # Cool-down phase: backward for the rest of the chunks
         for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup,
-                                self.pipeline_stage.num_chunks):
+                               self.pipeline_stage.num_chunks):
             all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
 
         # Wait for all sends to finish
@@ -183,26 +189,26 @@ def modify_graph_op_device(
                 modified = True
     if modified:
         gm.recompile()
+
+
 class PipelineStage:
 
-    def __init__(
-        self,
-        schedule_cls: Type[Schedule],
-        local_gm: fx.GraphModule,
-        stage_idx: int,
-        compiled_meta: CompiledMeta,
-        compiled_stage: CompiledStage,
-        node_metas: Dict[str, Dict[str, FakeTensor]],
-        num_chunks: int,
-        args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
-        kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
-        returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
-        device: torch.device,
-        pp_group: dist.ProcessGroup,
-        sharded_graph: fx.GraphModule,
-        dynamic_buffer=False,
-        gather_output=True
-    ):
+    def __init__(self,
+                 schedule_cls: Type[Schedule],
+                 local_gm: fx.GraphModule,
+                 stage_idx: int,
+                 compiled_meta: CompiledMeta,
+                 compiled_stage: CompiledStage,
+                 node_metas: Dict[str, Dict[str, FakeTensor]],
+                 num_chunks: int,
+                 args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
+                 kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
+                 returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
+                 device: torch.device,
+                 pp_group: dist.ProcessGroup,
+                 sharded_graph: fx.GraphModule,
+                 dynamic_buffer=False,
+                 gather_output=True):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
@@ -213,8 +219,9 @@ class PipelineStage:
         self.compiled_stage = compiled_stage
         self.num_chunks = num_chunks
         self.inputs_nodes_chunk_spec = self._get_inputs_nodes_spec(compiled_meta, args_chunk_spec,
-                                                                kwargs_chunk_spec)
-        self.returns_nodes_chunk_spec = self._get_returns_nodes_spec(compiled_meta, returns_chunk_spec)
+                                                                   kwargs_chunk_spec)
+        self.returns_nodes_chunk_spec = self._get_returns_nodes_spec(compiled_meta,
+                                                                     returns_chunk_spec)
         self.device = device
         self.pp_group = pp_group
 
@@ -241,17 +248,22 @@ class PipelineStage:
         self.outputs_batch = {}  # Activation send requests of all chunk
 
     def _get_inputs_nodes_spec(self, compiled_meta: CompiledMeta, args_chunk_spec,
-                                kwargs_chunk_spec):
+                               kwargs_chunk_spec):
         node_val_chunk_spec = {}
         args_nodes_flatten, _ = pytree.tree_flatten(compiled_meta.args_nodes_unflatten)
-        args_chunk_spec = args_chunk_spec or [None] * len(args_nodes_flatten)  # input could be non tensor, use None instead of TensorChunkSpec
+        args_chunk_spec = args_chunk_spec or [None] * len(
+            args_nodes_flatten)  # input could be non tensor, use None instead of TensorChunkSpec
         args_chunk_spec_flatten, _ = pytree.tree_flatten(args_chunk_spec)
         assert len(args_chunk_spec_flatten) == len(args_nodes_flatten)
-        for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten, args_chunk_spec_flatten):
+        for node_name, arg_chunk_spec in zip(compiled_meta.args_nodes_unflatten,
+                                             args_chunk_spec_flatten):
             node_val_chunk_spec[node_name] = arg_chunk_spec
 
         kwargs_nodes_flatten, spec1 = pytree.tree_flatten(compiled_meta.kwargs_nodes_unflatten)
-        kwargs_chunk_spec = kwargs_chunk_spec or {node_name: TensorChunkSpec(DEFAULT_CHUNK_DIM) for node_name in kwargs_nodes_flatten}
+        kwargs_chunk_spec = kwargs_chunk_spec or {
+            node_name: TensorChunkSpec(DEFAULT_CHUNK_DIM)
+            for node_name in kwargs_nodes_flatten
+        }
         kwargs_chunk_spec_flatten, spec2 = pytree.tree_flatten(kwargs_chunk_spec)
         assert spec1 == spec2
         for node_name, kwarg_chunk_spec in zip(kwargs_nodes_flatten, kwargs_chunk_spec_flatten):
@@ -260,7 +272,8 @@ class PipelineStage:
 
     def _get_returns_nodes_spec(self, compiled_meta, returns_chunk_spec):
         returns_nodes_chunk_spec = {}
-        returns_chunk_spec = returns_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(compiled_meta.returns_nodes_flatten)
+        returns_chunk_spec = returns_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(
+            compiled_meta.returns_nodes_flatten)
         returns_chunk_spec_flatten, _ = pytree.tree_flatten(returns_chunk_spec)
         assert len(returns_chunk_spec_flatten) == len(compiled_meta.returns_nodes_flatten)
         for name, spec in zip(compiled_meta.returns_nodes_flatten, returns_chunk_spec_flatten):
@@ -288,7 +301,8 @@ class PipelineStage:
         self.fw_act_send_info = self._create_send_info(self.fw_node)
 
         if self.bw_node is not None:
-            self.bw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.bw_node)
+            self.bw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas,
+                                                              self.bw_node)
             self.bw_grad_send_info = self._create_send_info(self.bw_node)
 
     def _init_fw_bw_step_nodes(self, local_gm):
@@ -331,7 +345,7 @@ class PipelineStage:
                 dst_rank = self.find_dst_rank(gi_user)
                 to_sort.append((dst_rank, out_str))
 
-        to_sort.sort(key=lambda x: (x[0], x[1])) # send lower rank first and in alphabetical order
+        to_sort.sort(key=lambda x: (x[0], x[1]))  # send lower rank first and in alphabetical order
 
         act_send_info_by_stage = defaultdict(list)
         for dst_rank, out_str in to_sort:
@@ -355,12 +369,14 @@ class PipelineStage:
             src_rank = self.get_stage_index_of_node_name(kwarg.name)
             to_sort.append((src_rank, kwarg.name, example_value))
 
-        to_sort.sort(key=lambda x: (x[0], x[1]))  # receive lower rank first and in alphabetical order
+        to_sort.sort(key=lambda x:
+                     (x[0], x[1]))  # receive lower rank first and in alphabetical order
 
         kwargs_recv_info = defaultdict(list)
         for x in to_sort:
             if x[0] == -1:
-                kwargs_recv_info[0].append(StageKwargPlaceholder(x[1])) # args recev with rank 0 (lowest rank)
+                kwargs_recv_info[0].append(StageKwargPlaceholder(
+                    x[1]))  # args recev with rank 0 (lowest rank)
             else:
                 src_rank, name, example_value = x
                 kwargs_recv_info[src_rank].append(info_cls(name, src_rank, example_value))
@@ -464,7 +480,8 @@ class PipelineStage:
 
     def forward_one_chunk(self) -> List[dist.Work]:
         # Receive activations and get args kwargs
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.fw_kwargs_recv_info, self.cur_fw_chunk_id)
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.fw_kwargs_recv_info,
+                                                            self.cur_fw_chunk_id)
 
         # Compute forward
         outputs_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
@@ -480,7 +497,8 @@ class PipelineStage:
 
     def backward_one_chunk(self) -> List[dist.Work]:
         # Receive grads
-        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_kwargs_recv_info, self.cur_bw_chunk_id)
+        composite_kwargs_chunk = self._recv_and_fill_inputs(self.bw_kwargs_recv_info,
+                                                            self.cur_bw_chunk_id)
 
         # Compute backward
         outputs_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
@@ -578,7 +596,10 @@ class PipelineStage:
         device_mesh = get_device_mesh()
         spmd0, spmd1 = get_spmd_rank()
         if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
-            dist.gather_object(state_dict, state_dicts if device_mesh.get_rank() == world_rank else None, dst=world_rank, group=self.pp_group)
+            dist.gather_object(state_dict,
+                               state_dicts if device_mesh.get_rank() == world_rank else None,
+                               dst=world_rank,
+                               group=self.pp_group)
         return state_dicts
 
     def _gather_optimizer_state_dict(self, world_rank):
@@ -587,13 +608,23 @@ class PipelineStage:
         device_mesh = get_device_mesh()
         spmd0, spmd1 = get_spmd_rank()
         if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
-            dist.gather_object(optimizer_state_dict, optimizer_state_dicts if device_mesh.get_rank() == world_rank else None, dst=world_rank, group=self.pp_group)
+            dist.gather_object(
+                optimizer_state_dict,
+                optimizer_state_dicts if device_mesh.get_rank() == world_rank else None,
+                dst=world_rank,
+                group=self.pp_group)
         return optimizer_state_dicts
 
     def _all_gather_returns(self):
         returns_all_gather = [None for _ in range(self.num_stages)]
-        returns_nodes_flatten = {node_name: None for node_name in self.compiled_meta.returns_nodes_flatten}
-        returns_batch = {node_name: val for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten}
+        returns_nodes_flatten = {
+            node_name: None
+            for node_name in self.compiled_meta.returns_nodes_flatten
+        }
+        returns_batch = {
+            node_name: val
+            for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten
+        }
         dist.all_gather_object(returns_all_gather, returns_batch, group=self.pp_group)
         all_returns = {}
         for returns_stage in returns_all_gather:
@@ -605,11 +636,12 @@ class PipelineStage:
         return ret
 
     def __call__(self, *args, **kwargs) -> None:
-            # Clean per iteration
+        # Clean per iteration
         self.clear_runtime_states()
 
         args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
-        args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten((self.compiled_meta.args_nodes_unflatten, self.compiled_meta.kwargs_nodes_unflatten))
+        args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten(
+            (self.compiled_meta.args_nodes_unflatten, self.compiled_meta.kwargs_nodes_unflatten))
         assert spec_val == spec_node, "Mismatched args/kwargs"
 
         input_node_vals = {}
@@ -628,11 +660,14 @@ class PipelineStage:
         if self.return_to_all_stages:
             ret = self._all_gather_returns()
         else:
-            ret = graph_outputs_to_func_outputs(self.compiled_meta, self.outputs_batch, strict=False)[-1]
+            ret = graph_outputs_to_func_outputs(self.compiled_meta,
+                                                self.outputs_batch,
+                                                strict=False)[-1]
         return ret
 
     def run_with_graph(self, graph, *args, **kwargs):  # could construct a partial graph
         return self(*args, **kwargs)
+
 
 def print_tensor_dict(chunk, di):
     print(f'Chunk {chunk}')

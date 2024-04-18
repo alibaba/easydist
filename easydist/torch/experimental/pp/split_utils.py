@@ -1,8 +1,21 @@
+# Copyright (c) 2023, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from typing import List, Union, Tuple, Any, Dict, Callable, Sequence, Optional
 
 import torch
 import torch._custom_ops
-
 '''
 The valid parameters types are: 
 dict_keys([
@@ -79,8 +92,8 @@ class BeforeBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor):  # tensors must be passed as args
-        return torch.ops.easydist.fw_bw_split(
-            [tensor])[0]  # return must be tensor of tuple of tensors
+        return torch.ops.easydist.fw_bw_split([tensor
+                                               ])[0]  # return must be tensor of tuple of tensors
 
     @staticmethod
     def backward(ctx, grad):
@@ -130,10 +143,7 @@ def step_split_func(tensor_list: op_param_type) -> op_ret_type:
     return ret
 
 
-ANNOTATION_OPS = [
-    torch.ops.easydist.fw_bw_split.default,
-    torch.ops.easydist.step_split.default
-]
+ANNOTATION_OPS = [torch.ops.easydist.fw_bw_split.default, torch.ops.easydist.step_split.default]
 
 __updated_params_states = None, None
 __backward_flag = False
@@ -168,6 +178,7 @@ def get_step_flag():
 def set_step_flag(flag):
     global __step_flag
     __step_flag = flag
+
 
 def clear_pp_compile_states():
     set_backward_flag(False)
@@ -211,12 +222,9 @@ def get_registered_by_mro(registered, cls_begin: type) -> type:
 def split(ret):
     cls_ret = type(ret)
     ctx = {}
-    tensor_tuple: Tuple[torch.Tensor] = get_registered_by_mro(
-        _before_split, cls_ret)(ctx, ret)
-    tensor_tuple_after_split: Tuple[torch.Tensor] = fw_bw_split_func(
-        tensor_tuple)
-    ret = get_registered_by_mro(_after_split,
-                                cls_ret)(ctx, tensor_tuple_after_split)
+    tensor_tuple: Tuple[torch.Tensor] = get_registered_by_mro(_before_split, cls_ret)(ctx, ret)
+    tensor_tuple_after_split: Tuple[torch.Tensor] = fw_bw_split_func(tensor_tuple)
+    ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
 
 
@@ -231,9 +239,7 @@ def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
 
 
 @before_split_register(list)
-def list_before_split(
-        ctx: dict, input: List[Union[torch.Tensor,
-                                     Any]]) -> Tuple[torch.Tensor]:
+def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
     ctx['is_tensor'] = []
     ctx['non_tensor_vals'] = []
     tup = []
@@ -248,9 +254,7 @@ def list_before_split(
 
 
 @after_split_register(list)
-def list_after_split(
-        ctx: dict,
-        output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
+def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
     ret = []
     output = list(output)
     for is_tensor in ctx['is_tensor']:
@@ -262,17 +266,14 @@ def list_after_split(
 
 
 @before_split_register(tuple)
-def tuple_before_split(
-        ctx: dict, input: Tuple[Union[torch.Tensor,
-                                      Any]]) -> Tuple[torch.Tensor]:
+def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
     return list_before_split(ctx, list(input))
 
 
 @after_split_register(tuple)
-def tuple_after_split(
-        ctx: dict,
-        output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
+def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
     return tuple(list_after_split(ctx, output))
+
 
 if __name__ == '__main__':
     a = torch.rand(10, 10, requires_grad=True)
