@@ -572,12 +572,6 @@ class PipelineStage:
     def load_optimizer_state_dict(self, state_dict):
         self.compiled_stage.load_optimizer_state_dict(state_dict)
 
-    # def _gather_named_params(self, group_rank):
-    #     params = [None for _ in range(self.num_stages)]
-    #     named_params = self.compiled_stage.named_params()
-    #     dist.gather_object(named_params, params if self.group_rank == group_rank else None, dst=group_rank, group=self.group)
-    #     return params
-    
     def _gather_state_dict(self, world_rank):
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()  # gather spmd0, spmd1

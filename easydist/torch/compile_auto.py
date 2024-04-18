@@ -49,14 +49,13 @@ from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convolu
                                    AllocatorProfiler, ModuleProfilingInfo)
 from easydist.torch.device_mesh import get_device_mesh, get_pp_group, get_pp_rank, get_pp_size, set_device_mesh, spmd_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
-from easydist.torch.passes.fix_sharding_node_order import fix_order, fix_sharding_node_order
+from easydist.torch.passes.fix_node_order import fix_node_order
 from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
 from easydist.utils import rgetattr, rsetattr
-from easydist.utils.testing import TorchMockDeviceMesh
 
 # for pickle dump opt_strategy
 import sys
@@ -450,7 +449,7 @@ def _compile_auto(func,
             node.name: node.meta
             for node in traced_graph.graph.nodes
         }
-        sharded_graph = fix_order(sharded_graph)
+        sharded_graph = fix_node_order(sharded_graph)
         stateless_func_args = (params, buffers, named_states, args, kwargs)
         save_graphviz_dot(sharded_graph, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(

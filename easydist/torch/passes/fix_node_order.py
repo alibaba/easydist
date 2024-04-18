@@ -12,31 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import Dict, List
+from typing import Dict
 from collections import Counter
-import operator
-from matplotlib.pyplot import step
 import torch
 import torch.fx as fx
-from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS, get_backward_flag, get_step_flag
+from easydist.torch.experimental.pp.split_utils import get_backward_flag
 from easydist.torch.passes.comm_optimize import _link_nodes
-from easydist.torch.passes.sharding import COMM_FUNCS, CUSTOM_FUNCS
-
-def fix_sharding_node_order(fx_module: fx.GraphModule):
-    nodes = list(fx_module.graph.nodes)
-    for i in range(len(nodes)):
-        node = nodes[i]
-        if node.target in CUSTOM_FUNCS:
-            ancessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
-            if nodes[ancessor_id].op == 'placeholder':
-                continue
-            nodes.pop(i)
-            nodes.insert(ancessor_id + 1, node)
-
-    assert set(nodes) == set(fx_module.graph.nodes)
-    _link_nodes(fx_module, nodes)
-    fx_module.recompile()
-    return fx_module
+from easydist.torch.passes.sharding import CUSTOM_FUNCS
 
 def bfs2bottom(root: fx.Node, vis: Dict[fx.Node, bool]):
     q = [root]
@@ -64,7 +46,7 @@ def bfs2top(root: fx.Node, vis: Dict[fx.Node, bool]):
             q.append(input_node)
     return set(res)
 
-def fix_order(fx_module: fx.GraphModule):
+def fix_node_order(fx_module: fx.GraphModule):
     '''
                                     ┏ grad ┓
     Assume that the graph is fw -> bw -> step -> output
@@ -117,12 +99,12 @@ def fix_order(fx_module: fx.GraphModule):
 
     # other comm nodes
     #   1. outputs move to earlist point
-    #   2. activations, move to the latest point (i.e. cooresponding backward submod)
+    #   2. activations nodes, move to the latest point (i.e. cooresponding backward submod)
     returns = bfs2top(output, vis)
     activations = set(n for n in vis if not vis[n])
 
     nodes = list(fx_module.graph.nodes)
-    # get topological order for each partition
+
     for i, node in enumerate(nodes):
         if node in (backward_partition | returns) and node.target in CUSTOM_FUNCS :
             ancessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
@@ -136,39 +118,6 @@ def fix_order(fx_module: fx.GraphModule):
             nodes.pop(i)
             nodes.insert(successor_id - 1, node)
 
-
-    # forward nodes move to the latest point
-    # forward_nodes = forward_nodes[::-1]
-    # for i, node in enumerate(forward_nodes):
-    #     successor_id = max(map(lambda n: forward_nodes.index(n) if n in forward_partition else -1, node.users))
-    #     if successor_id == -1: continue
-    #     forward_nodes.pop(i)
-    #     forward_nodes.insert(successor_id + 1, node)
-    # forward_nodes = forward_nodes[::-1]
-    
-    # backward nodes move to earlist point
-    # for i, node in enumerate(backward_nodes):
-    #     ancessor_id = max(map(lambda n: backward_nodes.index(n) if n in backward_partition and n.op != 'placeholder' else -1, node.all_input_nodes))
-    #     if ancessor_id == -1: continue
-    #     backward_nodes.pop(i)
-    #     backward_nodes.insert(ancessor_id + 1, node)
-
-    # nodes = phs + forward_nodes + backward_nodes + step_nodes + [output]
-
-    # # output nodes
-    # for node in comm1_nodes:
-    #     # accessor_id = max(map(lambda n: nodes.index(n), node.all_input_nodes))
-    #     # if accessor_id == -1:
-    #     #     succeesor_id = min(map(lambda n: nodes.index(n), node.users))
-    #     #     nodes.insert(succeesor_id, node)
-    #     #     continue
-    #     accessor_id = len(nodes) - 1
-    #     nodes.insert(accessor_id, node)
-
-    # for node in reversed(comm2_nodes):
-    #     succeesor_id = min(map(lambda n: nodes.index(n), node.users))
-    #     nodes.insert(succeesor_id, node)
-
     assert Counter(nodes) == Counter(fx_module.graph.nodes)
 
     _link_nodes(fx_module, nodes)
@@ -176,33 +125,3 @@ def fix_order(fx_module: fx.GraphModule):
     return fx_module
 
 
-
-# def fix_sharding_node_order(fx_module: fx.GraphModule):
-#     outd = {node: len(node.users) for node in fx_module.graph.nodes}
-#     nodes = list(fx_module.graph.nodes)
-#     cur: Dict[fx.Node, None] = {ph: None for ph in fx_module.graph.nodes if ph.op == 'placeholder'}
-#     for i, node in enumerate(nodes):
-#         if node.op == 'call_function':
-#             for input_node in node.all_input_nodes:
-#                 outd[input_node] -= 1
-#                 if outd[input_node] == 0:
-#                     cur.pop(input_node)
-#             if node.target is torch.ops.easydist.fw_bw_split.default:
-#                 tensor_list = list(node.args[0])
-#                 new_cur = {}
-#                 for to_split in cur:
-#                     tensor_list.append(to_split)
-#                     new_node = fx_module.graph.create_node(
-#                         op='call_function',
-#                         target=operator.getitem,
-#                         args=(node, len(tensor_list) - 1),
-#                         name=to_split.name
-#                     )
-#                     to_split.replace_all_uses_with(new_node, delete_user_cb=lambda user: False)
-#                     outd[new_node] = outd.pop(to_split)
-#                     new_cur[new_node] = None
-#                 cur = new_cur
-#             cur[node] = None
-
-#     # fx_module.recompile()
-#     return fx_module

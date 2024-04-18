@@ -44,7 +44,7 @@ from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf,
                                         materialize_zero)
 from easydist.torch.passes import (comm_optimize, fix_embedding, runtime_prof,
                                    tile_comm)
-from easydist.torch.passes.fix_sharding_node_order import fix_order
+from easydist.torch.passes.fix_node_order import fix_node_order
 from easydist.torch.passes.rule_override import rule_override_by_graph
 from easydist.torch.passes.sharding import (sharding_transform,
                                             sharding_transform_dtensor)
@@ -511,7 +511,7 @@ def _compile_auto_local(func,
             node.name: node.meta
             for node in traced_graph.graph.nodes
         }
-        sharded_graph = fix_order(sharded_graph)
+        sharded_graph = fix_node_order(sharded_graph)
         stateless_func_args = (params, buffers, named_states, args, kwargs)
         save_graphviz_dot(sharded_graph, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
