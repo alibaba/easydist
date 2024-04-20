@@ -163,7 +163,7 @@ def gen_rand_input_imagenet():
 def factory_gen_rand_input_ids(vocab_size):
 
     def gen_rand_input_ids():
-        return torch.randint(0, vocab_size, (3, 256))
+        return torch.randint(0, vocab_size, (4, 256))
 
     return gen_rand_input_ids
 
@@ -620,20 +620,20 @@ if __name__ == '__main__':
     #          train_step)
 
     # ======== transformers ========
-    # from transformers import OpenAIGPTConfig, OpenAIGPTModel
-    # test_main(OpenAIGPTModel(OpenAIGPTConfig()), {
-    #     'h.3',
-    #     'h.6',
-    #     'h.9',
-    # }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size),
-    #           train_step_gpt)
+    from transformers import OpenAIGPTConfig, OpenAIGPTModel
+    test_main(OpenAIGPTModel(OpenAIGPTConfig()), { 
+                'h.3',                              
+                'h.6',                              
+        'h.9',
+    }, factory_gen_rand_input_ids(OpenAIGPTConfig().vocab_size),
+              train_step_gpt)
 
-    # from transformers import AutoModel
-    # test_main(AutoModel.from_pretrained("bert-base-uncased"), {
-    #     'encoder.layer.3',
-    #     'encoder.layer.6',
-    #     'encoder.layer.9',
-    # }, factory_gen_rand_input_ids(30522), train_step_gpt)
+    from transformers import AutoModel
+    test_main(AutoModel.from_pretrained("bert-base-uncased"), {
+        'encoder.layer.3',
+        'encoder.layer.6',
+        'encoder.layer.9',
+    }, factory_gen_rand_input_ids(30522), train_step_gpt)
 
     # from transformers import GPT2Config, GPT2Model
     # test_main(GPT2Model(GPT2Config()), {
@@ -649,9 +649,9 @@ if __name__ == '__main__':
     # config.hidden_size = 768
     # config.use_cache = False
     # test_main(LlamaModel(config), {
-    #     'layers.3',
-    #     'layers.7',
-    #     'layers.11',
+        # 'layers.3',
+        # 'layers.7',
+        # 'layers.11',
     # }, factory_gen_rand_input_ids(config.vocab_size), train_step_gpt)
 
-    # print("All tests passed!")
+    print("All tests passed!")

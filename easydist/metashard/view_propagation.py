@@ -30,7 +30,7 @@ def get_next_non_one(shape_, idx_):
     return idx_
 
 
-def view_propagation(input_shape, output_shape, world_size=1):
+def view_propagation(input_shape, output_shape, world_size=1):  
 
     if -1 in output_shape:
         numel = functools.reduce(operator.mul, input_shape)
@@ -49,7 +49,7 @@ def view_propagation(input_shape, output_shape, world_size=1):
         if input_shape[input_idx] == output_shape[output_idx]:
             # [**, A, **] -> [**, A, **]
             if input_shape[input_idx] >= world_size:
-                sharding_ann[0][input_idx] = ShardDim(shard_dim)
+                sharding_ann[0][input_idx] = ShardDim(shard_dim)  # TODO @botbw: add halo (vit_b_16 failed)
                 combination_ann[shard_dim] = functools.partial(CombinationFunc.gather,
                                                                dim=output_idx)
                 shard_dim += 1
@@ -58,10 +58,10 @@ def view_propagation(input_shape, output_shape, world_size=1):
         elif input_shape[input_idx] > output_shape[output_idx]:
             # [**, A, **] -> [**, a1, a2, **]
             leftmost_idx = output_idx
-            accum_shape_ = output_shape[output_idx]
+            accum_shape_out = output_shape[output_idx]
             for o_idx in range(output_idx + 1, len(output_shape)):
-                accum_shape_ *= output_shape[o_idx]
-                if accum_shape_ == input_shape[input_idx]:
+                accum_shape_out *= output_shape[o_idx]
+                if accum_shape_out == input_shape[input_idx]:
                     if output_shape[leftmost_idx] >= world_size:
                         sharding_ann[0][input_idx] = ShardDim(shard_dim)
                         combination_ann[shard_dim] = functools.partial(CombinationFunc.gather,
@@ -70,13 +70,25 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     output_idx = get_next_non_one(output_shape, o_idx + 1)
                     input_idx = get_next_non_one(input_shape, input_idx + 1)
                     break
+                elif accum_shape_out > input_shape[input_idx]:
+                    raise RuntimeError("View propagation failed")
+                    # output_idx = get_next_non_one(output_shape, o_idx + 1)
+                    # accum_shape_in = 1
+                    # while accum_shape_out != accum_shape_in:
+                    #     if accum_shape_in < accum_shape_out and input_idx < len(input_shape):
+                    #         accum_shape_in *= input_shape[input_idx]
+                    #         input_idx = get_next_non_one(input_shape, input_idx + 1)
+                    #     else:
+                    #         accum_shape_out *= output_shape[output_idx]
+                    #         output_idx = get_next_non_one(output_shape, output_idx + 1)
+                    # break
         else:
             # [**, a1, a2, **] -> [**, A, **]
             leftmost_idx = input_idx
-            accum_shape_ = input_shape[input_idx]
+            accum_shape_in = input_shape[input_idx]
             for i_idx in range(input_idx + 1, len(input_shape)):
-                accum_shape_ *= input_shape[i_idx]
-                if accum_shape_ == output_shape[output_idx]:
+                accum_shape_in *= input_shape[i_idx]
+                if accum_shape_in == output_shape[output_idx]:
                     if EXTEND_VIEW:
                         chunk_size_ = 1
                         for sub_idx in range(input_idx, i_idx + 1):
@@ -96,6 +108,18 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     output_idx = get_next_non_one(output_shape, output_idx + 1)
                     input_idx = get_next_non_one(input_shape, i_idx + 1)
                     break
+                elif accum_shape_in > output_shape[output_idx]:
+                    raise RuntimeError("View propagation failed")
+                    # input_idx = get_next_non_one(input_shape, i_idx + 1)
+                    # accum_shape_out = 1
+                    # while accum_shape_out != accum_shape_in:
+                    #     if accum_shape_in < accum_shape_out and input_idx < len(input_shape):
+                    #         accum_shape_in *= input_shape[input_idx]
+                    #         input_idx = get_next_non_one(input_shape, input_idx + 1)
+                    #     else:
+                    #         accum_shape_out *= output_shape[output_idx]
+                    #         output_idx = get_next_non_one(output_shape, output_idx + 1)
+                    # break
 
     return {'sharding_ann': sharding_ann, 'combination_ann': combination_ann}
 

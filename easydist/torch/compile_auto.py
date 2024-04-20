@@ -44,7 +44,7 @@ from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chu
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states, set_backward_flag, set_step_flag, set_updated_params_states
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
-from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
+from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias, decouple_view,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
                                    sharding_transform, sharding_transform_dtensor,
                                    AllocatorProfiler, ModuleProfilingInfo)
@@ -74,6 +74,7 @@ mem_addr_rdy_cond = threading.Condition()
 
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
+    fx_module = decouple_view(fx_module)
     fx_module = fix_meta_device(fx_module)
     fx_module = fix_embedding(fx_module)
     fx_module = fix_addmm_bias(fx_module)

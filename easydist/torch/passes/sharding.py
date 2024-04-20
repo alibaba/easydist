@@ -420,8 +420,10 @@ def override_args(node, invars_strategy):
             tuple(device_mesh.mesh.shape),
         )
 
+        if shard_out is None:  # no need to reshard
+            shard_out = input_dtensor_spec
         local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
-
+        
         node.update_arg(shape_argnum, local_out_shape)
 
 

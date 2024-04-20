@@ -69,11 +69,11 @@ def meta_spmd_placeholder(args, kwargs):
     view_ann = view_propagation(input_shape, output_shape, world_size=device_mesh_world_size())
     return view_ann['sharding_ann'], view_ann['combination_ann']
 
-
-@register_meta_spmd([
+VIEW_OPS = [
     aten.view.default,
     aten._unsafe_view.default,
-])
+]
+@register_meta_spmd(VIEW_OPS)
 def meta_spmd_view(args, kwargs):
     input_shape = args[0].shape
     output_shape = list(args[1])
