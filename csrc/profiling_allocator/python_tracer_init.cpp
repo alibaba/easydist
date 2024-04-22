@@ -39,6 +39,7 @@ PYBIND11_MODULE(profiling_allocator, m) {
     m.def("_set_temp_mem_size", set_temp_mem_size);
     m.def("_set_raw_mem_allocs", set_raw_mem_allocs);
     m.def("_get_allocator_profiling_info", get_allocator_profiling_info);
+    m.def("_save_back_allocator", save_back_allocator);
 
     py::enum_<AllocatorMode>(m, "AllocatorMode")
         .value("PROFILE", AllocatorMode::PROFILE)

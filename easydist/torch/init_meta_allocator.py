@@ -17,7 +17,7 @@ import ctypes
 import os
 import __main__
 import easydist
-
+from profiling_allocator import _save_back_allocator
 
 def init_meta_allocator():
     if not easydist.config.enable_memory_opt:
@@ -29,6 +29,10 @@ def swap_to_profiling_allocator():
     path_to_profiling_allocator = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
                         "profiling_allocator.cpython-38-x86_64-linux-gnu.so")
+    raw_allocator = ctypes.CDLL(path_to_profiling_allocator)
+    init_fn = ctypes.cast(getattr(raw_allocator, 'init_fn'), ctypes.c_void_p).value
     new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
         path_to_profiling_allocator, 'meta_malloc', 'meta_free')
+    _save_back_allocator()
     torch.cuda.memory.change_current_allocator(new_alloc)
+    new_alloc.allocator().set_init_fn(init_fn)

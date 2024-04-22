@@ -38,6 +38,8 @@ std::vector<std::string> memory_plan;
 bool customized_flag = false;
 std::vector<std::tuple<long, long, bool, std::string>> raw_mem_allocs;
 
+c10::cuda::CUDACachingAllocator::CUDAAllocator* back_allocator = nullptr;
+
 class GraphMemoryPlan {
   int malloc_counter = 0;
   std::vector<void *> mem_addresses_;
@@ -147,13 +149,19 @@ void init_memory_plan(int device) {
   memory_plan_initialized = true;
 }
 
+void init_fn(int device_count) {
+  if(back_allocator) {
+    back_allocator->init(device_count);
+  }
+}
+
 void init_reserved_space() {
-  cudaMalloc(&reserved_space_for_memory_plan, mem_size+temp_mem_size);
+  reserved_space_for_memory_plan = back_allocator->raw_alloc(mem_size+temp_mem_size);
 }
 
 void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
-  void *ptr;
-  cudaMalloc(&ptr, size);
+  void *ptr = back_allocator->raw_alloc(size);
+  // cudaMalloc(&ptr, size);
   if (!start_recording) {
     return ptr;
   }
@@ -164,7 +172,8 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
 }
 
 void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
-  cudaFree(ptr);
+  back_allocator->raw_delete(ptr);
+  // cudaFree(ptr);
 }
 
 void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
@@ -192,8 +201,8 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
 #endif
     return addr_size.first;
   } else {
-    void *ptr = nullptr;
-    cudaMalloc(&ptr, size);
+    void *ptr = back_allocator->raw_alloc(size);
+    // cudaMalloc(&ptr, size);
 #ifdef DEBUG_MEMORY
     if (device == 0) {
       std::string malloc_str = "(real malloc) rank: " + std::to_string(device) + ", ptr: ";
@@ -213,7 +222,8 @@ void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
   {
     //std::cout << "(real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
     //          << ", size: " << size << std::endl;
-    cudaFree(ptr);
+    back_allocator->raw_delete(ptr);
+    // cudaFree(ptr);
   } else {
     //std::cout << "(fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
     //          << ", size: " << size << std::endl;
@@ -277,4 +287,8 @@ void set_raw_mem_allocs(std::vector<std::tuple<long, long, bool, std::string>> p
 
 std::vector<std::tuple<std::string, uintptr_t, ssize_t>> get_allocator_profiling_info(){
   return allocator_profiling_info;
+}
+
+void save_back_allocator(){
+  back_allocator = c10::cuda::CUDACachingAllocator::get();
 }

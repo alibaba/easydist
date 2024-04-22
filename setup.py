@@ -48,7 +48,10 @@ python_include_path = sysconfig.get_path('include')
 cuda_include_path = '/usr/local/cuda/include'
 import site
 pybind11_include_path = site.getsitepackages()[0] + '/pybind11/include'
+torch_include_path = site.getsitepackages()[0] + '/torch/include'
 cupti_lib_path = '/usr/local/cuda/extras/CUPTI/lib64'
+torch_lib_path = site.getsitepackages()[0] + '/torch/lib'
+
 profiling_allocator = setuptools.Extension('profiling_allocator',
                     sources = [
                       'csrc/profiling_allocator/profiling_allocator.cpp',
@@ -58,10 +61,11 @@ profiling_allocator = setuptools.Extension('profiling_allocator',
                     include_dirs=[
                       python_include_path,
                       cuda_include_path,
+                      torch_include_path,
                       pybind11_include_path,],
-                    libraries = ['cupti'],
-                    library_dirs=[cupti_lib_path],
-                    extra_compile_args=['-fPIC', '--shared'])
+                    libraries = ['cupti', 'c10_cuda'],
+                    library_dirs=[cupti_lib_path, torch_lib_path],
+                    extra_compile_args=['-fPIC', '--shared', '--std=c++17'])
 
 
 setuptools.setup(
