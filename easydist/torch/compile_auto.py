@@ -342,6 +342,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         for name, dot_graph in dot_graphs.items():
             dot_graph.write_jpg(f"./tmp/{name}.jpg")
             dot_graph.write_raw(f"./tmp/{name}.txt")
+        print(f"sharded_graph._code: {sharded_graph._code}")
 
     # do not use mock device after get sharded_graph
     device_mesh = get_device_mesh()
@@ -440,12 +441,13 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         with ed_stream_tracer.StreamTracer() as stream_tracer:
             _ = alloc_profiler.run([])
             trace_data = stream_tracer.get_stream_trace_data()
-        print(f"py op_streams:\n{trace_data.op_streams}")
-        print(f"py op_extra_streams:\n{trace_data.op_extra_streams}")
+        #print(f"py op_streams:\n{trace_data.op_streams}")
+        #print(f"py op_extra_streams:\n{trace_data.op_extra_streams}")
 
         if rank == 0:
             logging.info("finish profiling fx module's memory")
             graph_mem_info = alloc_profiler.create_graph_mem_info()
+            #print(f"graph_mem_info:\n{str(graph_mem_info)}")
 
             op_streams = {}
             for op_name, streams in trace_data.op_streams.items():
@@ -464,6 +466,10 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems = \
                                                 mem_sched.gen_mem_addresses()
+            #print("ordered_schedules:")
+            #for idx, nd in enumerate(ordered_schedules):
+            #    print(f"{idx}: {nd}")
+
             #print(f"master proposes required_memory: {required_memory}")
             #print(f"master creates mem locations:\n{inter_op_mems}")
 

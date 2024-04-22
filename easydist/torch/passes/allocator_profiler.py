@@ -242,6 +242,7 @@ class AllocatorProfiler(Interpreter):
         else:
             qualified_name = _get_qualified_name(n.target)
 
+        # set op_name which will be read in profiling allocator
         _set_cur_op_name(n.name)
         # create dict to store addresses for this node
         node_profiling_info = NodeProfilingInfo(n.name)
@@ -269,9 +270,6 @@ class AllocatorProfiler(Interpreter):
                         continue
                     else:
                         assert False, f'Unexpected input: {type(flat_input)}, {flat_input}'
-
-            # set op_name for profiling_allocator.so
-            _set_cur_op_name(n.name)
 
             # tell profiling_allocator to start profiling
             _set_start_recording(True)

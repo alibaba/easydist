@@ -87,7 +87,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
                 out_idx = tensor[1]
                 out_var = self.graph_mem_info.get_out_var(node, out_idx)
                 addr = group_addr + out_var.offset
-                inter_op_mems[node.name][out_idx] = (addr, out_var.mem_size)  # the information is stored in mem_alloc_info as well
+                assert not inter_op_mems[node.name][out_idx]
+                inter_op_mems[node.name][out_idx] = (addr, out_var)  # the information is stored in mem_alloc_info as well
                 if not out_var.is_reference:
                     if node.name not in mem_alloc_info:
                         mem_alloc_info[node.name] = [(out_var.alloc_index, addr, out_var.mem_size, 1)]
@@ -270,13 +271,18 @@ class EfficientMemoryScheduler(MemoryScheduler):
         logger.info(f"required memory: {required_mem/1024/1024/1024}GB")
         logger.info(f"required temp memory: {required_temp_mem/1024/1024/1024}GB")
 
-        if mdconfig.dump_mem_usage_graph:
-            # dump memory addresses
-            self.dump_mem_usage_graph(inter_op_mems, required_mem, lifetime_info, mem_plans)
-
         ordered_schedules = []
         for node in self.nodes_to_schedule:
             ordered_schedules.append(node.name)
+
+        if mdconfig.dump_mem_usage_graph:
+            # dump memory addresses
+            self.dump_mem_usage_graph(inter_op_mems,
+                                      mem_alloc_info,
+                                      required_mem,
+                                      lifetime_info,
+                                      mem_plans,
+                                      ordered_schedules)
 
         return (required_mem, required_temp_mem, None, ordered_schedules, mem_alloc_info, inter_op_mems)
 
@@ -306,29 +312,49 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
     def dump_mem_usage_graph(self,
                              inter_op_mems,
+                             mem_alloc_info,
                              required_mem,
                              lifetime_info,
-                             mem_plans):
+                             mem_plans,
+                             ordered_schedules):
         node_map = {}
         for node in self.nodes_to_schedule:
             node_map[node.name] = node
 
-        graph_mem_addr_str = "graph memory addresses:\n"
-        for node_name, mem_addrs in inter_op_mems.items():
+        op_out_addr_str = "op output addresses:\n"
+        for idx,node_name in enumerate(ordered_schedules):
+            assert node_name in inter_op_mems
+            addr_vars = inter_op_mems[node_name]
             node = node_map[node_name]
             sid = self.schedule_result.get_schedule(node).log_stream_id
-            node_mem_str = node_name + "(stream: " + str(sid) + "): "
-            for addr_size in mem_addrs:
-                if addr_size:
-                    node_mem_str += "([" + str(addr_size[0]) + "~" + \
-                                    str(addr_size[0]+addr_size[1]-1) + \
-                                    "], " + str(addr_size[1]) + "),"
+            node_mem_str = str(idx) + ": " + node_name + "(stream: " + str(sid) + "): "
+            for addr_var in addr_vars:
+                if addr_var:
+                    addr = addr_var[0]
+                    var = addr_var[1]
+                    size = var.mem_size
+                    alloc_flag = "ref" if var.is_reference else "alloc"
+                    node_mem_str += "([" + str(addr) + "~" + \
+                                    str(addr+size-1) + "], " + str(size) + \
+                                    ", " + alloc_flag + "),"
                 else:
-                    node_mem_str += "([NA ~ NA], NA),"
+                    node_mem_str += "([NA ~ NA], NA, NA) from context,"
 
-            graph_mem_addr_str += node_mem_str + "\n"
+            op_out_addr_str += node_mem_str + "\n"
 
-        logger.info(graph_mem_addr_str)
+        logger.info(op_out_addr_str)
+
+        alloc_addr_str = "op allocated addresses:\n"
+        for nd_idx,node_name in enumerate(ordered_schedules):
+            alloc_addr_str += f"[{nd_idx}] {node_name}:\n"
+            if node_name not in mem_alloc_info:
+                continue
+            alloc_list = mem_alloc_info[node_name]
+            for alloc in alloc_list:
+                temp_flag = "True" if alloc[3] == 0 else "False"
+                alloc_addr_str += f"    {alloc[0]}). addr: {alloc[1]}, size: {alloc[2]}], is_temp: {temp_flag}\n"
+
+        logger.info(alloc_addr_str)
 
         # dump memory usage in graph
         for sid in range(self.schedule_result.num_streams):

@@ -20,6 +20,12 @@
 #include "cupti_callback_api.h"
 #include "profiling_allocator.h"
 
+//#define DEBUG_MEMORY
+
+#ifdef DEBUG_MEMORY
+#include <cupti.h>
+#endif
+
 void* reserved_space_for_memory_plan = nullptr;
 uintptr_t mem_start = 0;
 uintptr_t mem_end = 0;
@@ -43,26 +49,49 @@ c10::cuda::CUDACachingAllocator::CUDAAllocator* back_allocator = nullptr;
 class GraphMemoryPlan {
   int malloc_counter = 0;
   std::vector<void *> mem_addresses_;
+  std::vector<uintptr_t> mem_sizes_;    // Lansong(TODO): may only debug?
+#ifdef DEBUG_MEMORY
   std::vector<void *> mem_ends_;        // for debug
   std::vector<std::string> op_names_;   // for debug
-  std::vector<uintptr_t> mem_sizes_;   // for debug
+  std::vector<bool> temp_flags_;        // for debug
+#endif
+
 public:
-  std::pair<void*, uintptr_t> get_mem_address(int device) {
+#ifdef DEBUG_MEMORY
+  std::tuple<void*, uintptr_t, std::string, bool> get_mem_address(int device) {
     if (malloc_counter >= mem_addresses_.size()) {
       std::cerr << "allocation number exceeds limit!" << std::endl;
       exit(-1);
     }
 
-    //std::cout << "rank: " << device << ", malloc_counter: " << malloc_counter
-    //          << ", op: " << op_names_[malloc_counter] << std::endl;
     void* ptr = mem_addresses_[malloc_counter];
     uintptr_t size = mem_sizes_[malloc_counter];
+    std::string& op_name = op_names_[malloc_counter];
+    bool is_temp = temp_flags_[malloc_counter];
+
     ++malloc_counter;
     if (malloc_counter == mem_addresses_.size()) {
         malloc_counter = 0;
     }
-    return std::make_pair(ptr, size);
+    return std::make_tuple(ptr, size, op_name, is_temp);
   }
+#else
+  std::tuple<void*, uintptr_t> get_mem_address(int device) {
+    if (malloc_counter >= mem_addresses_.size()) {
+      std::cerr << "allocation number exceeds limit!" << std::endl;
+      exit(-1);
+    }
+
+    void* ptr = mem_addresses_[malloc_counter];
+    uintptr_t size = mem_sizes_[malloc_counter];
+
+    ++malloc_counter;
+    if (malloc_counter == mem_addresses_.size()) {
+        malloc_counter = 0;
+    }
+    return std::make_tuple(ptr, size);
+  }
+#endif
 
   void reset_malloc_counter() {
     malloc_counter = 0;
@@ -72,31 +101,39 @@ public:
     mem_addresses_ = std::move(mem_addresses);
   }
 
-  void set_mem_ends(std::vector<void *>& mem_ends) {
-    mem_ends_ = std::move(mem_ends);
-  }
-
   void set_mem_sizes(std::vector<uintptr_t>& mem_sizes) {
     mem_sizes_ = std::move(mem_sizes);
+  }
+
+#ifdef DEBUG_MEMORY
+  void set_mem_ends(std::vector<void *>& mem_ends) {
+    mem_ends_ = std::move(mem_ends);
   }
 
   void set_op_names(std::vector<std::string>& op_names) {
     op_names_ = std::move(op_names);
   }
 
+  void set_temp_flags(std::vector<bool>& temp_flags) {
+    temp_flags_ = std::move(temp_flags);
+  }
+
   std::string memory_info_str() {
     // print mem_addresses
     std::string res = "mem_addresses: [\n";
     for (int i=0; i<mem_addresses_.size(); ++i) {
-       res += std::to_string(i) + "(" + op_names_[i] + "): "
-              + std::to_string((uintptr_t)mem_addresses_[i]) + " ~ "
-              + std::to_string((uintptr_t)mem_ends_[i]) + ", size: "
-              + std::to_string(mem_sizes_[i]) + "\n";
+      std::string temp_flag = temp_flags_[i] ? "True" : "False";
+      res += std::to_string(i) + "(" + op_names_[i] + "): "
+             + std::to_string((uintptr_t)mem_addresses_[i]) + " ~ "
+             + std::to_string((uintptr_t)mem_ends_[i]) + ", size: "
+             + std::to_string(mem_sizes_[i])
+             + ", is temp: " + temp_flag + "\n";
     }
     res += "]\n";
 
     return res;
   }
+#endif
 };
 
 GraphMemoryPlan graph_memory_plan;
@@ -107,17 +144,22 @@ void init_memory_plan(int device) {
     exit(-1);
   }
 
-  // read memory addresses in plan and convert them to physical memory addresses
-  std::vector<void *> mem_addresses;
-  std::vector<void *> mem_ends;       // for debug
-  std::vector<std::string> op_names;  // for debug
-  std::vector<uintptr_t> mem_sizes;   // for debug
   mem_start = reinterpret_cast<uintptr_t>(reserved_space_for_memory_plan);
   mem_end = mem_start + mem_size + temp_mem_size;
   uintptr_t temp_mem_start = mem_start + mem_size;
-  //std::cout << "rank: " << device << ", mem_start: " << mem_start << std::endl;
-  //std::cout << "rank: " << device << ", temp_mem_start: " << temp_mem_start
-  //          << std::endl;
+
+  // read memory addresses in plan and convert them to physical memory addresses
+  std::vector<void *> mem_addresses;
+  std::vector<uintptr_t> mem_sizes;   // Lansong(TODO): may only debug?
+
+#ifdef DEBUG_MEMORY
+  std::vector<void *> mem_ends;       // for debug
+  std::vector<std::string> op_names;  // for debug
+  std::vector<bool> temp_flags;       // for debug
+  std::cout << "rank: " << device << ", mem_start: " << mem_start << std::endl;
+  std::cout << "rank: " << device << ", temp_mem_start: " << temp_mem_start
+            << std::endl;
+#endif
 
   for (auto& current_alloc: raw_mem_allocs) {
     uintptr_t addr = std::get<0>(current_alloc);
@@ -131,19 +173,27 @@ void init_memory_plan(int device) {
 
     uintptr_t size = std::get<1>(current_alloc);
     mem_sizes.push_back(size);
+#ifdef DEBUG_MEMORY
     mem_ends.push_back(reinterpret_cast<void *>(addr+size));
 
     std::string cur_op_name = std::get<3>(current_alloc);
     op_names.push_back(cur_op_name);
+    temp_flags.push_back(is_temp_mem);
+#endif
   }
 
   graph_memory_plan.set_mem_addresses(mem_addresses);
+  graph_memory_plan.set_mem_sizes(mem_sizes);
+#ifdef DEBUG_MEMORY
   graph_memory_plan.set_op_names(op_names);
   graph_memory_plan.set_mem_ends(mem_ends);
-  graph_memory_plan.set_mem_sizes(mem_sizes);
+  graph_memory_plan.set_temp_flags(temp_flags);
 
-  //std::cout << "rank: " << device << std::endl
-  //          << graph_memory_plan.memory_info_str();
+  if (device == 0) {
+    std::cout << "rank: " << device << std::endl
+              << graph_memory_plan.memory_info_str();
+  }
+#endif
 
   // initialization finished
   memory_plan_initialized = true;
@@ -177,6 +227,10 @@ void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 }
 
 void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
+#ifdef DEBUG_MEMORY
+  uint32_t stream_id = 0;
+  cuptiGetStreamIdEx(nullptr, stream, 1, &(stream_id));
+#endif
   if (customized_flag) {
     if (!memory_plan_initialized) {
       std::cerr << "Error: Memory plan is not initialized!" << std::endl;
@@ -187,28 +241,37 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
       return ptr;
     }
 
-    std::pair<void*, uintptr_t> addr_size = graph_memory_plan.get_mem_address(device);
-//#define DEBUG_MEMORY
 #ifdef DEBUG_MEMORY
+    std::tuple<void*, uintptr_t, std::string, bool> addr_size = graph_memory_plan.get_mem_address(device);
     if (device == 0) {
-      std::string malloc_str = "(fake malloc) rank: " + std::to_string(device) + ", ptr: ";
-      malloc_str += std::to_string((uintptr_t)addr_size.first) + ", alloced size: ";
-      malloc_str += std::to_string(addr_size.second) + ", expected size: ";
-      malloc_str += std::to_string(size) + ", stream: ";
-      malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
+      bool is_temp = std::get<3>(addr_size);
+      std::string malloc_str = "(fake malloc) rank: " + std::to_string(device);
+      malloc_str += ", ptr: " + std::to_string((uintptr_t)std::get<0>(addr_size));
+      malloc_str += ", alloced size: " + std::to_string(std::get<1>(addr_size));
+      malloc_str += ", expected size: " + std::to_string(size) + ", stream: ";
+      malloc_str += std::to_string(stream_id);
+      malloc_str += ", op: " + std::get<2>(addr_size);
+      if (is_temp) {
+        malloc_str += ", is temp: True";
+      } else {
+        malloc_str += ", is temp: False";
+      }
+      malloc_str += "\n";
       std::cout << malloc_str;
     }
+#else
+    std::tuple<void*, uintptr_t> addr_size = graph_memory_plan.get_mem_address(device);
 #endif
-    return addr_size.first;
+    return std::get<0>(addr_size);
   } else {
     void *ptr = back_allocator->raw_alloc(size);
     // cudaMalloc(&ptr, size);
 #ifdef DEBUG_MEMORY
     if (device == 0) {
-      std::string malloc_str = "(real malloc) rank: " + std::to_string(device) + ", ptr: ";
-      malloc_str += std::to_string((uintptr_t)ptr) + ", alloced size: ";
-      malloc_str += std::to_string(size) + ", stream: ";
-      malloc_str += std::to_string(reinterpret_cast<uintptr_t>(stream)) + "\n";
+      std::string malloc_str = "(real malloc) rank: " + std::to_string(device);
+      malloc_str += ", ptr: " + std::to_string((uintptr_t)ptr);
+      malloc_str += ", alloced size: " + std::to_string(size) + ", stream: ";
+      malloc_str += std::to_string(stream_id) + "\n";
       std::cout << malloc_str;
     }
 #endif
@@ -220,13 +283,20 @@ void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
   if (reinterpret_cast<uintptr_t>(ptr) >= mem_end ||
       reinterpret_cast<uintptr_t>(ptr) < mem_start)
   {
-    //std::cout << "(real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
-    //          << ", size: " << size << std::endl;
+#ifdef DEBUG_MEMORY
+    if (device == 0) {
+      std::cout << "(real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+                << ", size: " << size << std::endl;
+    }
+#endif
     back_allocator->raw_delete(ptr);
-    // cudaFree(ptr);
   } else {
-    //std::cout << "(fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
-    //          << ", size: " << size << std::endl;
+#ifdef DEBUG_MEMORY
+    if (device == 0) {
+      std::cout << "(fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+                << ", size: " << size << std::endl;
+    }
+#endif
   }
 }
 
@@ -236,6 +306,11 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
   // mode routing
   if (allocator_mode==PROFILE) {
     void* ptr = profiling_malloc(size, device, stream);
+#ifdef DEBUG_MEMORY
+    if (device == 0) {
+      std::cout << "prof malloc: " << (uintptr_t)ptr << std::endl;
+    }
+#endif
     profiling_ptrs.insert(ptr);
     return ptr;
   }
@@ -253,9 +328,19 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
 
 void meta_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
    if (profiling_ptrs.find(ptr) != profiling_ptrs.end()) {
+#ifdef DEBUG_MEMORY
+      if (device == 0) {
+        std::cout << "prof free: " << (uintptr_t)ptr << std::endl;
+      }
+#endif
       profiling_free(ptr, size, device, stream);
       profiling_ptrs.erase(ptr);
    } else {
+#ifdef DEBUG_MEMORY
+      if (device == 0) {
+        std::cout << "runtime free: " << (uintptr_t)ptr << std::endl;
+      }
+#endif
       runtime_free(ptr, size, device, stream);
    }
 }
@@ -292,3 +377,4 @@ std::vector<std::tuple<std::string, uintptr_t, ssize_t>> get_allocator_profiling
 void save_back_allocator(){
   back_allocator = c10::cuda::CUDACachingAllocator::get();
 }
+
