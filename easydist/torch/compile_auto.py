@@ -49,7 +49,8 @@ from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
-from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer, _sharding_ann_env)
+from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer,
+                                  _sharding_ann_env, extract_tensor_meta_info)
 from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
@@ -558,7 +559,10 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-            print(f"local_out: {local_out}, \nshape: {local_out.shape}")
+            if isinstance(local_out, torch.Tensor):
+                print(f"local_out: {local_out}")
+                #meta_info = extract_tensor_meta_info(local_out)
+                #print(meta_info)
 
             return local_out
 

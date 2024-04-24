@@ -34,20 +34,36 @@ def materialize_zero(tensor, materialization_device):
     return torch.zeros_like(tensor, device=materialization_device)
 
 
+def max_buffer_size(size, stride):
+    assert len(size) == len(stride)
+    buffer_size = 1
+    for size_, stride_ in zip(size, stride):
+        buffer_size += size_ * stride_
+    return buffer_size
+
+
 @torch.no_grad()
 def materialize_random(tensor, materialization_device=None):
     if materialization_device is None:
         materialization_device = tensor.device
-    if tensor.dtype == torch.bool:
-        return torch.rand(tensor.size(), dtype=torch.float, device=materialization_device) > 0.5
-    elif torch.is_floating_point(tensor):
-        return torch.rand(tensor.size(), dtype=tensor.dtype, device=materialization_device)
+
+    # if the tensor stride space is large than size (from chunk/split)
+    if len(tensor.size()) == 0:
+        size = []
     else:
-        return torch.randint(high=8,
-                             size=tensor.size(),
+        size = (max(max_buffer_size(tensor.size(), tensor.stride()), tensor.numel()), 1)
+
+    if tensor.dtype == torch.bool:
+        random_tensor = torch.rand(size, dtype=torch.float, device=materialization_device) > 0.5
+    elif torch.is_floating_point(tensor):
+        random_tensor = torch.rand(size, dtype=tensor.dtype, device=materialization_device)
+    else:
+        random_tensor = torch.randint(high=8,
+                             size=size,
                              dtype=tensor.dtype,
                              device=materialization_device)
 
+    return random_tensor.as_strided(size=tensor.size(), stride=tensor.stride())
 
 @torch.no_grad()
 def materialize_module_from_cpu(tensor, param_buf_key, cpu_model: torch.nn.Module,

@@ -23,7 +23,7 @@ from torch.fx._compatibility import compatibility
 
 from easydist.torch.utils import EDNodeType
 from easydist.torch.init_helper import materialize_random
-from easydist.torch.utils import to_meta
+from easydist.torch.utils import to_meta, extract_tensor_meta_info
 from easydist.torch.mem_allocation_info import GraphMemInfo
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from profiling_allocator import _set_cur_op_name, _activate_stream_tracer, \
@@ -265,6 +265,9 @@ class AllocatorProfiler(Interpreter):
                         node_profiling_info.record_input_tensor_info(flat_input,
                                                                   arg_index,
                                                                   tensor_index)
+                        #meta_info = extract_tensor_meta_info(flat_input)
+                        #print(f"input for node: {n.name}\n{meta_info}")
+
                         tensor_index += 1
                     elif type(flat_input) in constant_types:
                         continue
@@ -280,6 +283,10 @@ class AllocatorProfiler(Interpreter):
             else:
                 _enter_op_core()
                 output = getattr(self, n.op)(n.target, materialized_inputs, n.kwargs)
+                #if isinstance(output, torch.Tensor):
+                #    meta_info = extract_tensor_meta_info(output)
+                #    print(f"out for node: {n.name}\n{meta_info}")
+
                 _leave_op_core()
             _inactivate_stream_tracer()
 

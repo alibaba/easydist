@@ -211,7 +211,6 @@ void init_reserved_space() {
 
 void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
   void *ptr = back_allocator->raw_alloc(size);
-  // cudaMalloc(&ptr, size);
   if (!start_recording) {
     return ptr;
   }
@@ -223,7 +222,6 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
 
 void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
   back_allocator->raw_delete(ptr);
-  // cudaFree(ptr);
 }
 
 void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
@@ -265,9 +263,8 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
     return std::get<0>(addr_size);
   } else {
     void *ptr = back_allocator->raw_alloc(size);
-    // cudaMalloc(&ptr, size);
 #ifdef DEBUG_MEMORY
-    if (device == 0) {
+    if (device == 0 && size > 0) {
       std::string malloc_str = "(real malloc) rank: " + std::to_string(device);
       malloc_str += ", ptr: " + std::to_string((uintptr_t)ptr);
       malloc_str += ", alloced size: " + std::to_string(size) + ", stream: ";
@@ -307,7 +304,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
   if (allocator_mode==PROFILE) {
     void* ptr = profiling_malloc(size, device, stream);
 #ifdef DEBUG_MEMORY
-    if (device == 0) {
+    if (device == 0 && size>0) {
       std::cout << "prof malloc: " << (uintptr_t)ptr << std::endl;
     }
 #endif

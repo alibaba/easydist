@@ -28,6 +28,7 @@ from torch.utils._mode_utils import no_dispatch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor.ops.view_ops import compute_local_shape
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
+from torch._guards import detect_fake_mode
 
 from easydist.metashard.combination import ReduceOp
 from easydist.metashard import metair
@@ -49,6 +50,9 @@ def to_meta(node_output):
 
 def create_meta_from_node(node):
     fake_args = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta['val'], node.args)
+    fake_mode = detect_fake_mode(fake_args)
+    if fake_mode is not None:
+        fake_args = pytree.tree_map_only(torch.Tensor, lambda n: fake_mode.from_tensor(n), fake_args)
     fake_val = node.target(*fake_args, **node.kwargs)
     if isinstance(fake_val, list) or isinstance(fake_val, tuple):
         return {'val': fake_val}
@@ -201,3 +205,25 @@ def get_dtensor_spec(mesh, placements, shape=None, ndim=None):
     if "shape" in list(DTensorSpec.__dataclass_fields__.keys()):
         return DTensorSpec(mesh=mesh, placements=placements, shape=shape, ndim=ndim)
     return DTensorSpec(mesh=mesh, placements=tuple(placements))
+
+def extract_tensor_meta_info(tensor: torch.Tensor):
+    metadata = torch._utils.get_tensor_metadata(tensor)
+    meta_info = (
+        f"  metadata: {metadata}\n"
+        f"  size: {tensor.size()}\n"
+        f"  dtype: {tensor.dtype}\n"
+        f"  dev: {tensor.device}\n"
+        f"  requires grad: {tensor.requires_grad}\n"
+        f"  is_cuda: {tensor.is_cuda}\n"
+        f"  numel: {tensor.numel()}\n"
+        f"  grad: {tensor.grad}\n"
+        f"  storage offset: {tensor.storage_offset()}\n"
+        f"  stride: {tensor.stride()}\n"
+        f"  is_leaf: {tensor.is_leaf}\n"
+        f"  is_contiguous: {tensor.is_contiguous()}\n"
+        f"  is_sparse: {tensor.is_sparse}\n"
+        f"  layout: {tensor.layout}\n"
+    )
+
+    return meta_info
+
