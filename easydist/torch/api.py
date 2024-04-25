@@ -27,6 +27,7 @@ import easydist.config as mdconfig
 from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
 from easydist.torch.compile_auto import _compile_auto
 from easydist.torch.compile_dp import _compile_dp
+from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
 from easydist.torch.utils import get_input_signature
 
@@ -106,8 +107,11 @@ class CompiledFuncWrapper:
 
         input_signature = self.register_input_signature(*args, **kwargs)
 
-        # skip compile when only one device
-        world_size = torch.distributed.get_world_size()
+        if 'local_pp_stage_cnt' in self.compile_kwargs:
+            # for running pp in single node (debug)
+            world_size = self.compile_kwargs['local_pp_stage_cnt']
+        else:
+            world_size = torch.distributed.get_world_size()
         need_compile = world_size >= 2
         if get_device_mesh() is not None:
             need_compile = device_mesh_world_size() >= 2
@@ -117,15 +121,14 @@ class CompiledFuncWrapper:
             need_compile = True
 
         if need_compile and self.compiled_func is None:
-            mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
-            mesh = DeviceMesh("cuda", mesh_shape.tolist())
-
-            if get_device_mesh() == None:
-                set_device_mesh(mesh)
 
             if self.parallel_mode == "auto":
                 self.compiled_func = _compile_auto(self.original_func, self.tracing_mode,
                                                    self.init_helper, input_signature, args, kwargs, **self.compile_kwargs)
+            elif self.parallel_mode == "pp":
+                self.compiled_func = _compile_pp(self.original_func, self.tracing_mode,
+                                                self.init_helper, input_signature, args, kwargs,
+                                                **self.compile_kwargs)
             elif self.parallel_mode in ["ddp", "zero2", "zero3"]:
                 self.compiled_func = _compile_dp(self.original_func, self.parallel_mode,
                                                  self.tracing_mode, args, kwargs)
@@ -232,7 +235,7 @@ def easydist_compile(func=None,
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
-    if parallel_mode not in ["auto", "ddp", "zero2", "zero3"
+    if parallel_mode not in ["auto", "pp", "ddp", "zero2", "zero3"
                              ] and parallel_mode not in PARALLEL_EXTENTION:
         raise NotImplementedError(
             "please use [auto, ddp, zero2, zero3] for `parallel_mode` or register your parallel extention"

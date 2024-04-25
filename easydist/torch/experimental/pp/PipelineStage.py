@@ -85,116 +85,10 @@ class StageKwargPlaceholder:
         self.input_name = input_name
 
 
-class Schedule(ABC):
-
-    def __init__(self, pipeline_stage: 'PipelineStage'):
-        assert isinstance(pipeline_stage, PipelineStage)
-        self.pipeline_stage = pipeline_stage
-
-    @abstractmethod
-    def __call__(self) -> None:
-        raise NotImplementedError
-
-
-class ScheduleGPipe(Schedule):
-
-    def __call__(self) -> None:
-
-        all_fw_send_reqs: List[dist.Work] = []
-        all_bw_send_reqs: List[dist.Work] = []
-
-        # Forward pass of all chunks
-        for chunk in range(self.pipeline_stage.num_chunks):
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
-
-        # Backward starts here
-        if self.pipeline_stage.bw_node is not None:
-            for bwd_chunk in range(self.pipeline_stage.num_chunks):
-                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
-
-        # Wait for all sends to finish
-        # TODO okay to delay the sync till completion of all chunks?
-        for work in all_fw_send_reqs:
-            work.wait()
-
-        # Wait for all sends to finish
-        # TODO okay to delay the sync till completion of all chunks?
-        for work in all_bw_send_reqs:
-            work.wait()
-
-        self.pipeline_stage.merge_output_chunks()
-
-        if self.pipeline_stage.step_node is not None:
-            self.pipeline_stage.step()
-
-
-class ScheduleDAPPLE(Schedule):
-
-    def __init__(self, pipeline_stage: 'PipelineStage'):
-        super().__init__(pipeline_stage)
-        assert pipeline_stage.bw_node is not None, f"{type(self).__name__} requires backward node"
-
-    def __call__(self) -> None:
-        all_fw_send_reqs: List[dist.Work] = []
-        all_bw_send_reqs: List[dist.Work] = []
-        num_warmup = self.pipeline_stage.num_stages - self.pipeline_stage.stage_idx
-        num_warmup = min(num_warmup, self.pipeline_stage.num_chunks)
-
-        # Warm-up phase: forward number of chunks equal to pipeline depth.
-        for chunk in range(num_warmup):
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
-
-        # 1F1B phase
-        for fwd_chunk in range(num_warmup, self.pipeline_stage.num_chunks):
-            if self.pipeline_stage.bw_node is not None:
-                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
-            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
-
-        # Cool-down phase: backward for the rest of the chunks
-        for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup,
-                               self.pipeline_stage.num_chunks):
-            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
-
-        # Wait for all sends to finish
-        # TODO: okay to delay the sync till completion of all chunks?
-        for work in all_fw_send_reqs:
-            work.wait()
-
-        for work in all_bw_send_reqs:
-            work.wait()
-
-        self.pipeline_stage.merge_output_chunks()
-
-        if self.pipeline_stage.step_node is not None:
-            self.pipeline_stage.step()
-
-
-def modify_graph_op_device(
-    gm: torch.fx.GraphModule,
-    new_device: torch.device,
-):
-    modified = False
-    for node in gm.graph.nodes:
-        if node.op == "call_function":
-            for arg in node.args:
-                if isinstance(arg, torch.device) and arg != new_device:
-                    logger.debug(f"Changing device of Node {node.name} from {arg} to {new_device}")
-                    arg = new_device
-                    modified = True
-            if "device" in node.kwargs and node.kwargs["device"] != new_device:
-                logger.debug(
-                    f"Changing device of Node {node.name} from {node.kwargs['device']} to {new_device}"
-                )
-                node.update_kwarg("device", new_device)
-                modified = True
-    if modified:
-        gm.recompile()
-
-
 class PipelineStage:
 
     def __init__(self,
-                 schedule_cls: Type[Schedule],
+                 schedule_cls: Type['Schedule'],
                  local_gm: fx.GraphModule,
                  stage_idx: int,
                  compiled_meta: CompiledMeta,
@@ -207,8 +101,8 @@ class PipelineStage:
                  device: torch.device,
                  pp_group: dist.ProcessGroup,
                  sharded_graph: fx.GraphModule,
-                 dynamic_buffer=False,
-                 gather_output=True):
+                 dynamic_buffer: bool,
+                 gather_output: bool):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
@@ -297,13 +191,12 @@ class PipelineStage:
         self.stage_index_to_group_rank = stage_index_to_pp_rank
 
         # chunk : Dict of kwarg buffers
-        self.fw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.fw_node)
-        self.fw_act_send_info = self._create_send_info(self.fw_node)
+        self.fw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.fw_node, forward=True)
+        self.fw_act_send_info = self._create_send_info(self.fw_node, forward=True)
 
         if self.bw_node is not None:
-            self.bw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas,
-                                                              self.bw_node)
-            self.bw_grad_send_info = self._create_send_info(self.bw_node)
+            self.bw_kwargs_recv_info = self._create_recv_info(dynamic_buffer, node_metas, self.bw_node, forward=False)
+            self.bw_grad_send_info = self._create_send_info(self.bw_node, forward=False)
 
     def _init_fw_bw_step_nodes(self, local_gm):
         # Find stage forward node in graph
@@ -335,7 +228,7 @@ class PipelineStage:
     ):
         return self.node_to_stage_idx[node_name]
 
-    def _create_send_info(self, node):  # TODO @botbw: simplify
+    def _create_send_info(self, node, forward: bool):  # TODO @botbw: simplify
         to_sort = []
         for user in node.users:
             assert user.target is operator.getitem, "Output must be a dict"
@@ -344,8 +237,10 @@ class PipelineStage:
             for gi_user in user.users:
                 dst_rank = self.find_dst_rank(gi_user)
                 to_sort.append((dst_rank, out_str))
-
-        to_sort.sort(key=lambda x: (x[0], x[1]))  # send lower rank first and in alphabetical order
+        if forward:
+            to_sort.sort(key=lambda x: (x[0], x[1]))  # send lower to rank first and in alphabetical order
+        else:
+            to_sort.sort(key=lambda x: (-x[0], x[1])) # send higher to rank first and in alphabetical order
 
         act_send_info_by_stage = defaultdict(list)
         for dst_rank, out_str in to_sort:
@@ -358,6 +253,7 @@ class PipelineStage:
         dynamic_buffer,
         node_metas,
         kwarg,
+        forward,
     ):
         info_cls = RecvDynamicBuffer if dynamic_buffer else RecvStaticBuffer
         to_sort = []
@@ -369,12 +265,16 @@ class PipelineStage:
             src_rank = self.get_stage_index_of_node_name(kwarg.name)
             to_sort.append((src_rank, kwarg.name, example_value))
 
-        to_sort.sort(key=lambda x:
-                     (x[0], x[1]))  # receive lower rank first and in alphabetical order
-
+        if forward:
+            # receive lower rank first and in alphabetical order
+            to_sort.sort(key=lambda x: (x[0], x[1]))
+        else:
+            # receive higer rank first and in alphabetical order
+            to_sort.sort(key=lambda x: (-x[0], x[1]))
         kwargs_recv_info = defaultdict(list)
         for x in to_sort:
             if x[0] == -1:
+                assert forward
                 kwargs_recv_info[0].append(StageKwargPlaceholder(
                     x[1]))  # args recev with rank 0 (lowest rank)
             else:
@@ -673,3 +573,87 @@ def print_tensor_dict(chunk, di):
     print(f'Chunk {chunk}')
     for k, v in di.items():
         print(f'{k} size {v.size()} mean {v.float().mean()}')
+
+
+
+class Schedule(ABC):
+
+    def __init__(self, pipeline_stage: PipelineStage):
+        assert isinstance(pipeline_stage, PipelineStage)
+        self.pipeline_stage = pipeline_stage
+
+    @abstractmethod
+    def __call__(self) -> None:
+        raise NotImplementedError
+
+
+class ScheduleGPipe(Schedule):
+
+    def __call__(self) -> None:
+
+        all_fw_send_reqs: List[dist.Work] = []
+        all_bw_send_reqs: List[dist.Work] = []
+
+        # Forward pass of all chunks
+        for chunk in range(self.pipeline_stage.num_chunks):
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
+
+        # Backward starts here
+        if self.pipeline_stage.bw_node is not None:
+            for bwd_chunk in range(self.pipeline_stage.num_chunks):
+                all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
+
+        # Wait for all sends to finish
+        # TODO okay to delay the sync till completion of all chunks?
+        for work in all_fw_send_reqs:
+            work.wait()
+
+        # Wait for all sends to finish
+        # TODO okay to delay the sync till completion of all chunks?
+        for work in all_bw_send_reqs:
+            work.wait()
+
+        self.pipeline_stage.merge_output_chunks()
+
+        if self.pipeline_stage.step_node is not None:
+            self.pipeline_stage.step()
+
+
+class ScheduleDAPPLE(Schedule):
+
+    def __init__(self, pipeline_stage: PipelineStage):
+        super().__init__(pipeline_stage)
+        assert pipeline_stage.bw_node is not None, f"{type(self).__name__} requires backward node"
+
+    def __call__(self) -> None:
+        all_fw_send_reqs: List[dist.Work] = []
+        all_bw_send_reqs: List[dist.Work] = []
+        num_warmup = self.pipeline_stage.num_stages - self.pipeline_stage.stage_idx
+        num_warmup = min(num_warmup, self.pipeline_stage.num_chunks)
+
+        # Warm-up phase: forward number of chunks equal to pipeline depth.
+        for chunk in range(num_warmup):
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
+
+        # 1F1B phase
+        for fwd_chunk in range(num_warmup, self.pipeline_stage.num_chunks):
+            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
+            all_fw_send_reqs += self.pipeline_stage.forward_one_chunk()
+
+        # Cool-down phase: backward for the rest of the chunks
+        for bwd_chunk in range(self.pipeline_stage.num_chunks - num_warmup,
+                               self.pipeline_stage.num_chunks):
+            all_bw_send_reqs += self.pipeline_stage.backward_one_chunk()
+
+        # Wait for all sends to finish
+        # TODO: okay to delay the sync till completion of all chunks?
+        for work in all_fw_send_reqs:
+            work.wait()
+
+        for work in all_bw_send_reqs:
+            work.wait()
+
+        self.pipeline_stage.merge_output_chunks()
+
+        if self.pipeline_stage.step_node is not None:
+            self.pipeline_stage.step()

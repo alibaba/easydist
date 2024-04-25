@@ -12,9 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
+# python benchmark/torch/pp/resnet101/local_pipeline.py
 import os
 import random
+import time
+
+os.environ["MASTER_PORT"] = "-1"
 
 import numpy as np
 
@@ -22,16 +25,11 @@ import torch
 import torch.distributed as dist
 
 from torchvision import datasets, transforms
-from torchvision.models import resnet18
-from torch.distributed._tensor import DeviceMesh
+from torchvision.models import resnet101
 from tqdm import tqdm
 
-from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
-from easydist.torch.device_mesh import get_pp_size, set_device_mesh
-from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE
-from easydist.torch.experimental.pp.compile_pipeline import (
-    split_into_equal_size)
+from easydist.torch.experimental.pp.compile_pipeline import split_into_equal_size
 
 
 def seed(seed=42):
@@ -52,11 +50,13 @@ def seed(seed=42):
 
 criterion = torch.nn.CrossEntropyLoss()
 
-
-@easydist_compile(tracing_mode="fake",
+local_pp_stage_cnt = 4
+@easydist_compile(parallel_mode="pp",
+                  tracing_mode="fake",
                   cuda_graph=False,
-                  schedule_cls=ScheduleDAPPLE,
-                  num_chunks=4)
+                  local=True,
+                  local_pp_stage_cnt=local_pp_stage_cnt,
+                  num_chunks=1)
 def train_step(input, label, model, opt):
     opt.zero_grad()
     out = model(input)
@@ -68,28 +68,15 @@ def train_step(input, label, model, opt):
 
 def test_main():
     seed(42)
-    easydist_setup(backend="torch", device="cuda", allow_tf32=False)
-
-    dist.init_process_group(backend="nccl")
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(rank)
-
-    set_device_mesh(
-        DeviceMesh("cuda", [[[0, 2], [1, 3]]],
-                   mesh_dim_names=["spmd0", "spmd1", "pp"]))
-
     device = torch.device('cuda')
-
-    module = resnet18().train().to(device)
-    module.fc = torch.nn.Linear(512, 10).to(device)
-    pp_size = get_pp_size()
-    _, module = split_into_equal_size(pp_size)(module)
+    module = resnet101().train().to(device)
+    module.fc = torch.nn.Linear(2048, 10).to(device)
+    _, module = split_into_equal_size(local_world_size)(module)
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
-    batch_size = 64
+    batch_size = 2048
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
@@ -104,27 +91,13 @@ def test_main():
                                                    batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data,
                                                    batch_size=batch_size)
-
-    def validation(module, valid_dataloader, epoch, state_dict):
-        module.load_state_dict(state_dict)
-        module.to(rank)
-        module.eval()
-        correct_cnt = 0
-        all_cnt = 0
-        for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
-            x_batch = x_batch.to(f'cuda:{rank}')
-            y_batch = y_batch.to(f'cuda:{rank}')
-            out = module(x_batch)
-            preds = out.argmax(-1)
-            correct_cnt += (preds == y_batch).sum()
-            all_cnt += len(y_batch)
-        print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
-
+    x_batch, y_batch = next(iter(train_dataloader))
+    train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
     epochs = 5
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
-        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True) if rank == 0
-                                    else train_dataloader):
+        time_start = time.time()
+        for x_batch, y_batch in tqdm(train_dataloader, dynamic_ncols=True):
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
             if x_batch.size(0) != batch_size:  # TODO need to solve this
@@ -132,29 +105,12 @@ def test_main():
             out, loss = train_step(x_batch, y_batch, module, opt)
             all_cnt += len(out)
             preds = out.argmax(-1)
-            correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
+            correct_cnt += (preds == y_batch).sum()
             loss_sum += loss.mean().item()
-        state_dict_list = train_step.compiled_func.state_dict(world_rank=0)
-        if rank == 0:
-            print(
-                f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
-            )
-            state_dict = {}
-            for st in state_dict_list:
-                state_dict.update(st)
-            validation(module, valid_dataloader, epoch, state_dict)
-
-    print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    ckpt_dir = os.path.join(cur_dir, 'ckpt')
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    state_dict_list = train_step.compiled_func.state_dict(0)
-    if rank == 0:
-        state_dict = {}
-        for st in state_dict_list:
-            state_dict.update(st)
-        torch.save(state_dict, os.path.join(ckpt_dir, 'resnet.pth'))
+        print(
+            f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
+            f'time: {time.time() - time_start}'
+        )
 
 
 if __name__ == '__main__':
