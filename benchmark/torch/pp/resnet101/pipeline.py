@@ -32,6 +32,7 @@ from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
 from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import (
+    annotate_split_points,
     split_into_equal_size)
 
 
@@ -55,21 +56,12 @@ criterion = torch.nn.CrossEntropyLoss()
 
 
 per_chunk_sz = 128
-num_chunks = 128
-# 1: 31.19460916519165s
-# 2: 22.191031455993652 3: 19.14109468460083
-# 4: 17.77243995666504
-# 8: 15.504834175109863
-# 16:
-# 32:
-# 64: 15.155353307723999
-# 128:
-
+num_chunks = 8
 
 @easydist_compile(parallel_mode="pp",
                   tracing_mode="fake",
                   cuda_graph=False,
-                  schedule_cls=ScheduleDAPPLE,
+                  schedule_cls=ScheduleGPipe,
                   num_chunks=num_chunks)
 def train_step(input, label, model, opt):
     opt.zero_grad()
@@ -92,7 +84,11 @@ def test_main():
 
     module = resnet101().train().to(device)
     module.fc = torch.nn.Linear(2048, 10).to(device)
-    _, module = split_into_equal_size(pp_size)(module)
+    annotate_split_points(module, {
+        'layer3.4',
+        'layer3.11',
+        'layer3.18'
+    })
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
@@ -114,7 +110,8 @@ def test_main():
                                                    batch_size=batch_size)
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
-    epochs = 5
+    epochs = 2
+    time_sum = 0
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
         time_start = time.time()
@@ -128,11 +125,15 @@ def test_main():
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
             loss_sum += loss.mean().item()
+        time_sum += time.time() - time_start
         if rank == 0:
             print(
                 f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
                 f'time: {time.time() - time_start}'
             )
+    if rank == 0:
+        print(f'average time: {time_sum / epochs}')
+    print(f'rank {rank} max memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024}')
 
 
 if __name__ == '__main__':

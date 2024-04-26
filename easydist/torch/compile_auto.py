@@ -210,7 +210,6 @@ def _compile_auto(func,
                   kwargs_chunk_spec=None,
                   outputs_chunk_spec=None,
                   num_chunks=1,
-                  dynamic_buffer=True,
                   all_gather_output=True,
                   strict=True) -> Union[PipelineStage, Any]:
     args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
@@ -483,7 +482,6 @@ def _compile_auto(func,
             pp_group=get_pp_group(),
             device=torch.device(f"cuda:{rank}"),
             sharded_graph=sharded_graph,
-            dynamic_buffer=dynamic_buffer,
             gather_output=all_gather_output
         )
         return pipe

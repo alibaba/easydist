@@ -55,7 +55,6 @@ def _compile_pp(func,
                 kwargs_chunk_spec=None,
                 outputs_chunk_spec=None,
                 num_chunks=1,
-                dynamic_buffer=True,
                 all_gather_output=True,
                 strict=True,
                 local=False,
@@ -205,7 +204,6 @@ def _compile_pp(func,
         pp_group=None,
         device=torch.device(f"cuda:{rank}"),
         sharded_graph=traced_stateless_func,
-        dynamic_buffer=dynamic_buffer,
         gather_output=all_gather_output
     )
 
