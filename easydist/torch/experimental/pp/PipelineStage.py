@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 import torch.distributed as dist
 import torch.fx as fx
+from torch.profiler import record_function
 from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
 from zmq import has
@@ -38,6 +39,10 @@ from easydist.torch.init_helper import materialize_zero
 logger = logging.getLogger(__name__)
 
 def maybe_batch_isend_irecv(p2p_op_list):
+    '''
+    note: this might lead to hang when the first collective call in the group
+    see dist.batch_isend_irecv for more details
+    '''
     if len(p2p_op_list) == 0:
         return []
     return dist.batch_isend_irecv(p2p_op_list)
@@ -50,6 +55,9 @@ class StageKwargPlaceholder(Placeholder):
 
     def __init__(self, input_name: str):
         super().__init__(input_name)
+
+    def __repr__(self):
+        return f"{type(self).__class__}({self.input_name})"
 
 class RecevPlaceholder(Placeholder):
 
@@ -100,6 +108,7 @@ class PipelineStage:
 
         # communication infra
         self._init_communication(node_metas)
+        # self._init_batch_isend_irecv()
 
         # runtime states
         self._init_runtime_states()
@@ -191,7 +200,42 @@ class PipelineStage:
             self.bw_kwargs_recv_info = self._create_recv_info(node_metas, self.bw_node, is_forward=False)
             self.bw_grad_send_info = self._create_send_info(self.bw_node, is_forward=False)
 
+    def _init_batch_isend_irecv(self):
+        '''
+        See batch_isend_irecv in torch.distributed for more details:
+            .. note:: Note that when this API is used with the NCCL PG backend, users must set
+                the current GPU device with `torch.cuda.set_device`, otherwise it will
+                lead to unexpected hang issues.
+
+            In addition, if this API is the first collective call in the ``group``
+            passed to ``dist.P2POp``, all ranks of the ``group`` must participate in
+            this API call; otherwise, the behavior is undefined. If this API call is
+            not the first collective call in the ``group``, batched P2P operations
+            involving only a subset of ranks of the ``group`` are allowed.
+        '''
+        torch.cuda.set_device(self.device)
+        succeesor = self.stage_index_to_group_rank[(self.stage_idx + 1) % self.num_stages]
+        succeesor_global = succeesor if self.pp_group is None else dist.get_global_rank(self.pp_group, succeesor)
+        succeesor_recv = torch.zeros(1, device=self.device)
+        ancessor = self.stage_index_to_group_rank[(self.stage_idx - 1) % self.num_stages]
+        ancessor_global = ancessor if self.pp_group is None else dist.get_global_rank(self.pp_group, ancessor)
+        ancessor_recv = torch.zeros(1, device=self.device)
+        send_tensor = torch.zeros(1, device=self.device) + self.stage_idx
+        ops = [
+            dist.P2POp(dist.isend, send_tensor, succeesor_global, self.pp_group),
+            dist.P2POp(dist.isend, send_tensor, ancessor_global, self.pp_group),
+            dist.P2POp(dist.irecv, succeesor_recv, succeesor_global, self.pp_group),
+            dist.P2POp(dist.irecv, ancessor_recv, ancessor_global, self.pp_group)
+        ]
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        assert succeesor_recv.item() == (self.stage_idx + 1) % self.num_stages
+        assert ancessor_recv.item() == (self.stage_idx - 1) % self.num_stages
+
     def _init_runtime_states(self):
+        self.cur_fw_send_chunk = None
+        self.cur_bw_send_chunk = None
         self.cur_fw_chunk_id = 0
         self.cur_bw_chunk_id = 0
         self.cur_step_chunk_id = 0
@@ -225,10 +269,10 @@ class PipelineStage:
         send_ops: List[dist.P2POp] = []
 
         for dst, nodes in send_info.items():
+            peer_rank = self.stage_index_to_group_rank[dst]
+            peer_global_rank = peer_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, peer_rank)
             for node in nodes:
                 val = output_dict[node]
-                peer_rank = self.stage_index_to_group_rank[dst]
-                peer_global_rank = peer_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, peer_rank)
                 send_ops.append(dist.P2POp(dist.isend, val, peer_global_rank, self.pp_group))
 
         return send_ops
@@ -267,7 +311,7 @@ class PipelineStage:
 
         return kwargs_recv_info
 
-    def create_recv_ops(self, recv_info: Dict[int, List[Placeholder]]):
+    def _create_recv_ops(self, recv_info: Dict[int, List[Placeholder]]):
         recv_ops = []
         for src, ph_list in recv_info.items():
             for ph in ph_list:
@@ -292,149 +336,59 @@ class PipelineStage:
 
         return composite_kwargs
 
-
-    def forward_one_chunk(self) -> List[dist.Work]:
+    def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         # Receive activations
-        recv_ops = self.create_recv_ops(self.fw_kwargs_recv_info)
-        works = maybe_batch_isend_irecv(recv_ops)
-        for work in works:
-            work.wait()
+        recv_ops = self._create_recv_ops(self.fw_kwargs_recv_info)
+        recv_reqs = maybe_batch_isend_irecv(recv_ops)
+        if wait:
+            for req in recv_reqs:
+                req.wait()
+        return recv_reqs
 
+        
+    def forward_compute_one_chunk(self):
         # Collect activations and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.fw_kwargs_recv_info,
                                                             self.cur_fw_chunk_id)
 
         # Compute forward
-        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
+        self.cur_fw_send_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
                                                     self.outputs_chunks[self.cur_fw_chunk_id],
                                                     **composite_kwargs_chunk)
         # Update runtime states
         self.cur_fw_chunk_id += 1
-
+    
+    def forward_send_one_chunk(self) -> List[dist.Work]:
         # Send activations
-        send_ops = self._create_send_ops(self.fw_act_send_info, outputs_chunk)
-        fw_send_reqs = maybe_batch_isend_irecv(send_ops)
+        send_ops = self._create_send_ops(self.fw_act_send_info, self.cur_fw_send_chunk)
+        return maybe_batch_isend_irecv(send_ops)
 
-        return fw_send_reqs
-
-    def backward_one_chunk(self) -> List[dist.Work]:
+    def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         # Receive grads
-        recv_ops = self.create_recv_ops(self.bw_kwargs_recv_info)
-        works = maybe_batch_isend_irecv(recv_ops)
-        for work in works:
-            work.wait()
-
+        recv_ops = self._create_recv_ops(self.bw_kwargs_recv_info)
+        recv_reqs = maybe_batch_isend_irecv(recv_ops)
+        if wait:
+            for req in recv_reqs:
+                req.wait()
+        return recv_reqs
+        
+    def backward_compute_one_chunk(self):
         # Collect grads and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.bw_kwargs_recv_info,
                                                             self.cur_bw_chunk_id)
 
         # Compute backward
-        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
+        self.cur_bw_send_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
                                                      self.outputs_chunks[self.cur_bw_chunk_id],
                                                      **composite_kwargs_chunk)
         # Update runtime states
         self.cur_bw_chunk_id += 1
 
+    def backward_send_one_chunk(self) -> List[dist.Work]:
         # Send grads
-        send_ops = self._create_send_ops(self.bw_grad_send_info, outputs_chunk)
-        bw_send_reqs = maybe_batch_isend_irecv(send_ops)
-
-        return bw_send_reqs
+        send_ops = self._create_send_ops(self.bw_grad_send_info, self.cur_bw_send_chunk)
+        return maybe_batch_isend_irecv(send_ops)
     
-    def forward_and_backward_one_chunk(self) -> List[dist.Work]:
-        # Receive activations
-        recv_ops = self.create_recv_ops(self.fw_kwargs_recv_info)
-        works = maybe_batch_isend_irecv(recv_ops)
-        for work in works:
-            work.wait()
-
-        # Collect activations and kwargs
-        composite_kwargs_chunk = self.collect_kwargs(self.fw_kwargs_recv_info, self.cur_fw_chunk_id)
-
-        # Compute forward
-        outputs_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
-                                                    self.outputs_chunks[self.cur_fw_chunk_id],
-                                                    **composite_kwargs_chunk)
-        # Update runtime states
-        self.cur_fw_chunk_id += 1
-
-        # Send activations and receive grads
-        # IMPORTRANT: use batch_isend here because we are sending to and receiving from the same worker
-        bw_recv_ops = self.create_recv_ops(self.bw_kwargs_recv_info)
-        fw_send_ops = self._create_send_ops(self.fw_act_send_info, outputs_chunk)
-        # Do the communication
-        all_reqs = maybe_batch_isend_irecv(bw_recv_ops + fw_send_ops)
-        bw_recv_reqs = all_reqs[:len(bw_recv_ops)]
-        fw_send_reqs = all_reqs[len(bw_recv_ops):]
-
-        # Receive grads
-        for work in bw_recv_reqs:
-            work.wait()
-
-        # Collect grads and kwargs
-        composite_kwargs_chunk = self.collect_kwargs(self.bw_kwargs_recv_info, self.cur_bw_chunk_id)
-
-        # Compute backward
-        outputs_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
-                                                        self.outputs_chunks[self.cur_bw_chunk_id],
-                                                        **composite_kwargs_chunk)
-        # Update runtime states
-        self.cur_bw_chunk_id += 1
-
-        # Send grads
-        bw_send_ops = self._create_send_ops(self.bw_grad_send_info, outputs_chunk)
-        bw_send_reqs = maybe_batch_isend_irecv(bw_send_ops)
-
-        return fw_send_reqs + bw_send_reqs
-
-
-
-    def backward_and_forward_one_chunk(self) -> List[dist.Work]:
-        # Receive grads
-        bw_recv_ops = self.create_recv_ops(self.bw_kwargs_recv_info)
-        works = maybe_batch_isend_irecv(bw_recv_ops)
-        for work in works:
-            work.wait()
-
-        # Collect grads and kwargs
-        composite_grads_chunk = self.collect_kwargs(self.bw_kwargs_recv_info, self.cur_bw_chunk_id)
-
-        # Compute backward
-        returns_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
-                                                        self.outputs_chunks[self.cur_bw_chunk_id],
-                                                        **composite_grads_chunk)
-        # Update runtime states
-        self.cur_bw_chunk_id += 1
-        
-        # Send grads and receive activations
-        # IMPORTRANT: use batch_isend here because we are sending to and receiving from the same worker
-        fw_recv_ops = self.create_recv_ops(self.fw_kwargs_recv_info)
-        bw_send_ops = self._create_send_ops(self.bw_grad_send_info, returns_chunk)
-        # Do the communication
-        all_reqs = maybe_batch_isend_irecv(fw_recv_ops + bw_send_ops)
-        fw_recv_reqs = all_reqs[:len(fw_recv_ops)]
-        bw_send_reqs = all_reqs[len(fw_recv_ops):]
-
-        # Receive activations
-        for work in fw_recv_reqs:
-            work.wait()
-
-        # Collect activations and kwargs
-        composite_kwargs_chunk = self.collect_kwargs(self.fw_kwargs_recv_info, self.cur_fw_chunk_id)
-
-        # Compute forward
-        returns_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
-                                                    self.outputs_chunks[self.cur_fw_chunk_id],
-                                                    **composite_kwargs_chunk)
-        # Update runtime states
-        self.cur_fw_chunk_id += 1
-
-        # Send activations
-        fw_send_ops = self._create_send_ops(self.fw_act_send_info, returns_chunk)
-        fw_send_reqs = maybe_batch_isend_irecv(fw_send_ops)
-
-        return bw_send_reqs + fw_send_reqs
-
     def step(self, step_chunk=False):
         if step_chunk:
             self.compiled_stage.step(self.outputs_chunks(self.cur_step_chunk_id))
@@ -443,6 +397,8 @@ class PipelineStage:
         self.compiled_stage.step(self.outputs_batch)
 
     def clear_runtime_states(self):
+        self.cur_fw_send_chunk = None
+        self.cur_bw_send_chunk = None
         self.cur_fw_chunk_id = 0
         self.cur_bw_chunk_id = 0
         self.cur_step_chunk_id = 0
@@ -623,14 +579,18 @@ class ScheduleGPipe(Schedule):
 
         all_send_reqs: List[dist.Work] = []
 
-        # Forward pass of all chunks
+        # Forward all chunks
         for fw_chunk in range(self.num_chunks):
-            all_send_reqs += self.forward_one_chunk()
+            self.forward_recv_one_chunk()
+            self.forward_compute_one_chunk()
+            all_send_reqs += self.forward_send_one_chunk()
 
-        # Backward starts here
+        # Backward all chunks
         if self.bw_node is not None:
             for bwd_chunk in range(self.num_chunks):
-                all_send_reqs += self.backward_one_chunk()
+                self.backward_recv_one_chunk()
+                self.backward_compute_one_chunk()
+                all_send_reqs += self.backward_send_one_chunk()
 
         for work in all_send_reqs:
             work.wait()
@@ -654,16 +614,28 @@ class ScheduleDAPPLE(Schedule):
 
         # Warm-up phase: forward number of chunks equal to pipeline depth.
         for chunk in range(self.num_warmup):
-            all_send_reqs += self.forward_one_chunk()
+            self.forward_recv_one_chunk()
+            self.forward_compute_one_chunk()
+            all_send_reqs += self.forward_send_one_chunk()
 
         # 1F1B phase
         for fwd_chunk in range(self.num_warmup, self.num_chunks):
-            all_send_reqs += self.backward_and_forward_one_chunk()
+            # recv backward first
+            self.backward_recv_one_chunk()
+            self.backward_compute_one_chunk()
+            # IMPORTANT: recv forward first
+            reqs = self.forward_recv_one_chunk(wait=False)
+            all_send_reqs += self.backward_send_one_chunk()
+            for req in reqs:
+                req.wait()
+            self.forward_compute_one_chunk()
+            all_send_reqs += self.forward_send_one_chunk()
 
         # Cool-down phase: backward for the rest of the chunks
-        for bwd_chunk in range(self.num_chunks - self.num_warmup,
-                               self.num_chunks):
-            all_send_reqs += self.backward_one_chunk()
+        for bwd_chunk in range(self.num_chunks - self.num_warmup, self.num_chunks):
+            self.backward_recv_one_chunk()
+            self.backward_compute_one_chunk()
+            all_send_reqs += self.backward_send_one_chunk()
 
         for work in all_send_reqs:
             work.wait()

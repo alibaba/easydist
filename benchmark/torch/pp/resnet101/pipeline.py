@@ -13,6 +13,7 @@
 # ==============================================================================
 
 # ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 benchmark/torch/pp/resnet101/pipeline.py
+import argparse
 import os
 import random
 import time
@@ -54,25 +55,11 @@ def seed(seed=42):
 
 criterion = torch.nn.CrossEntropyLoss()
 
+def test_main(args):
+    per_chunk_sz = args.micro_batch_size
+    num_chunks = args.num_chunks
+    batch_size = per_chunk_sz * num_chunks
 
-per_chunk_sz = 128
-num_chunks = 8
-
-@easydist_compile(parallel_mode="pp",
-                  tracing_mode="fake",
-                  cuda_graph=False,
-                  schedule_cls=ScheduleGPipe,
-                  num_chunks=num_chunks)
-def train_step(input, label, model, opt):
-    opt.zero_grad()
-    out = model(input)
-    loss = criterion(out, label)
-    loss.backward()
-    opt.step()
-    return out, loss
-
-
-def test_main():
     seed(42)
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
@@ -83,35 +70,35 @@ def test_main():
     torch.cuda.set_device(rank)
 
     module = resnet101().train().to(device)
-    module.fc = torch.nn.Linear(2048, 10).to(device)
-    annotate_split_points(module, {
-        'layer3.4',
-        'layer3.11',
-        'layer3.18'
-    })
+    module.fc = torch.nn.Linear(module.fc.in_features, 1000).to(device)
+    _, module = split_into_equal_size(pp_size)(module)
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+    schedule_cls = ScheduleDAPPLE
+    @easydist_compile(parallel_mode="pp",
+                    tracing_mode="fake",
+                    cuda_graph=False,
+                    schedule_cls=schedule_cls,
+                    num_chunks=num_chunks)
+    def train_step(input, label, model, opt):
+        opt.zero_grad()
+        out = model(input)
+        loss = criterion(out, label)
+        loss.backward()
+        opt.step()
+        return out, loss
 
-    batch_size = per_chunk_sz * num_chunks
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
-    ])
-    train_data = datasets.CIFAR10('./data',
-                                  train=True,
-                                  download=True,
-                                  transform=transform)
-    valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=batch_size)
-    valid_dataloader = torch.utils.data.DataLoader(valid_data,
-                                                   batch_size=batch_size)
+    dataset_size = 10000
+    train_dataloader = [
+        (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
+    ] * (dataset_size // batch_size)
+
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
-    epochs = 2
+    epochs = 1
     time_sum = 0
+    # with torch.autograd.profiler.profile() as prof:
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
         time_start = time.time()
@@ -126,15 +113,15 @@ def test_main():
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
             loss_sum += loss.mean().item()
         time_sum += time.time() - time_start
-        if rank == 0:
-            print(
-                f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
-                f'time: {time.time() - time_start}'
-            )
-    if rank == 0:
-        print(f'average time: {time_sum / epochs}')
-    print(f'rank {rank} max memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024}')
-
+    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
+        f.write(
+            f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
+        )
+    # print(prof.key_averages().table(sort_by="self_cpu_time_total"))
 
 if __name__ == '__main__':
-    test_main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--micro-batch-size', type=int, default=16)
+    parser.add_argument('--num-chunks', type=int, default=2)
+    args = parser.parse_args()
+    test_main(args)
