@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 benchmark/torch/pp/resnet101/pipeline.py
+# torchrun --nproc_per_node 4 benchmark/torch/pp/resnet101/accuracy/pipeline.py
 import argparse
 import os
 import random
@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 
 from torchvision import datasets, transforms
-from torchvision.models import resnet101
+from torchvision.models import resnet18
 from torch.distributed._tensor import DeviceMesh
 from tqdm import tqdm
 
@@ -69,8 +69,8 @@ def test_main(args):
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
-    module = resnet101().train().to(device)
-    module.fc = torch.nn.Linear(module.fc.in_features, 1000).to(device)
+    module = resnet18().train().to(device)
+    module.fc = torch.nn.Linear(module.fc.in_features, 10).to(device)
     _, module = split_into_equal_size(pp_size)(module)
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
@@ -89,14 +89,20 @@ def test_main(args):
         opt.step()
         return out, loss
 
-    dataset_size = 10000
-    train_dataloader = [
-        (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
-    ] * (dataset_size // batch_size)
-
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
+    train_data = datasets.CIFAR10('./data',
+                                  train=True,
+                                  download=True,
+                                  transform=transform)
+    train_dataloader = torch.utils.data.DataLoader(train_data,
+                                                   batch_size=batch_size)
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
-    epochs = 1
+    epochs = 5
     time_sum = 0
     # with torch.autograd.profiler.profile() as prof:
     for epoch in range(epochs):
@@ -113,6 +119,11 @@ def test_main(args):
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
             loss_sum += loss.mean().item()
         time_sum += time.time() - time_start
+        if rank == 0:
+            print(
+                f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
+                f'time: {time.time() - time_start}'
+            )
     with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
@@ -121,7 +132,7 @@ def test_main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--micro-batch-size', type=int, default=16)
-    parser.add_argument('--num-chunks', type=int, default=2)
+    parser.add_argument('--micro-batch-size', type=int, default=1024 // 32)
+    parser.add_argument('--num-chunks', type=int, default=32)
     args = parser.parse_args()
     test_main(args)

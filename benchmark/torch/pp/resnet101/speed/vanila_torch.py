@@ -12,24 +12,20 @@
 # limitations under the License.
 # ==============================================================================
 
-# python benchmark/torch/pp/resnet101/local_pipeline.py
 import os
 import random
 import time
 
-os.environ["MASTER_PORT"] = "-1"
-
 import numpy as np
 
 import torch
-import torch.distributed as dist
 
 from torchvision import datasets, transforms
 from torchvision.models import resnet101
+from torch.profiler import profile, record_function, ProfilerActivity
+
 from tqdm import tqdm
 
-from easydist.torch.api import easydist_compile
-from easydist.torch.experimental.pp.compile_pipeline import split_into_equal_size
 
 
 def seed(seed=42):
@@ -50,13 +46,7 @@ def seed(seed=42):
 
 criterion = torch.nn.CrossEntropyLoss()
 
-local_pp_stage_cnt = 4
-@easydist_compile(parallel_mode="pp",
-                  tracing_mode="fake",
-                  cuda_graph=False,
-                  local=True,
-                  local_pp_stage_cnt=local_pp_stage_cnt,
-                  num_chunks=1)
+
 def train_step(input, label, model, opt):
     opt.zero_grad()
     out = model(input)
@@ -68,31 +58,24 @@ def train_step(input, label, model, opt):
 
 def test_main():
     seed(42)
+
     device = torch.device('cuda')
+
     module = resnet101().train().to(device)
     module.fc = torch.nn.Linear(2048, 10).to(device)
-    _, module = split_into_equal_size(local_world_size)(module)
+
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
-    batch_size = 2048
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
-    ])
-    train_data = datasets.CIFAR10('./data',
-                                  train=True,
-                                  download=True,
-                                  transform=transform)
-    valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=batch_size)
-    valid_dataloader = torch.utils.data.DataLoader(valid_data,
-                                                   batch_size=batch_size)
+    dataset_size = 10000
+    batch_size = 16
+    train_dataloader = [
+        (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
+    ] * (dataset_size // batch_size)
+
     x_batch, y_batch = next(iter(train_dataloader))
-    train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
+    train_step(x_batch.to(device), y_batch.to(device), module, opt)
     epochs = 5
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
@@ -111,7 +94,6 @@ def test_main():
             f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
             f'time: {time.time() - time_start}'
         )
-
 
 if __name__ == '__main__':
     test_main()

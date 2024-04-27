@@ -63,17 +63,22 @@ def test_main():
 
     module = resnet101().train().to(device)
     module.fc = torch.nn.Linear(2048, 10).to(device)
-
+    batch_size = 1024
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
-
-    dataset_size = 10000
-    batch_size = 256
-    train_dataloader = [
-        (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
-    ] * (dataset_size // batch_size)
-
+p
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
+    train_data = datasets.CIFAR10('./data',
+                                  train=True,
+                                  download=True,
+                                  transform=transform)
+    train_dataloader = torch.utils.data.DataLoader(train_data,
+                                                   batch_size=batch_size)
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt)
     epochs = 5
