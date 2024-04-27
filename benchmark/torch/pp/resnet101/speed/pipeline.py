@@ -75,9 +75,9 @@ def test_main(args):
 
     if schedule_cls == ScheduleGPipe:
         annotate_split_points(module, {
-                'layer2.0',
-                'layer3.3',
-                'layer3.13'
+                'layer1.1',
+                'layer3.2',
+                'layer3.11'
         })
     else:
         annotate_split_points(module, {
