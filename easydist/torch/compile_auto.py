@@ -18,7 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial
-from typing import Any, cast
+from typing import Any, cast, Set
 from contextlib import nullcontext
 
 import numpy
@@ -192,6 +192,144 @@ def fetch_mem_sol():
 
     return mem_sol
 
+@torch.fx.has_side_effect
+def start_customized_allocator():
+    _set_customized_flag(True)
+    return None
+
+@torch.fx.has_side_effect
+def stop_customized_allocator():
+    _set_customized_flag(False)
+    return None
+
+def insert_customized_allocator_flag(
+                              gm: torch.fx.GraphModule,
+                              back_alloced_nodes: Set[str]):
+    start_before_nodes = []
+    stop_before_nodes = []
+    customized_alloc_active = False
+    for node in gm.graph.nodes:
+        if node.op == 'placeholder' or node.op == 'get_attr' or node.op == 'output':
+            if customized_alloc_active:
+                stop_before_nodes.append(node)
+                customized_alloc_active = False
+        elif node.name in back_alloced_nodes:
+            if customized_alloc_active:
+                stop_before_nodes.append(node)
+                customized_alloc_active = False
+        else:
+            if not customized_alloc_active:
+                start_before_nodes.append(node)
+                customized_alloc_active = True
+
+    #print(f"start: {start_before_nodes}")
+    #print(f"stop: {stop_before_nodes}")
+
+    for start_nd in start_before_nodes:
+        with gm.graph.inserting_before(start_nd):
+            start_flag_nd = gm.graph.call_function(start_customized_allocator)
+            #print(f"add start flag: {start_flag_nd}")
+
+    for stop_nd in stop_before_nodes:
+        with gm.graph.inserting_before(stop_nd):
+            stop_flag_nd = gm.graph.call_function(stop_customized_allocator)
+            #print(f"add stop flag: {stop_flag_nd}")
+
+    #print("updated graph node list:")
+    #for node in gm.graph.nodes:
+    #    print(node)
+
+def memory_opt(gm: torch.fx.GraphModule):
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+    if rank == 0:
+        logging.info("profiling fx module's memory...")
+
+    # setting allocator to profiling mode
+    _set_allocator_mode(AllocatorMode.PROFILE)
+
+    # save all profiling information in this dict
+    profiling_info = ModuleProfilingInfo(rank)
+    alloc_profiler = AllocatorProfiler(gm, profiling_info)
+    with ed_stream_tracer.StreamTracer() as stream_tracer:
+        _ = alloc_profiler.run([])
+        trace_data = stream_tracer.get_stream_trace_data()
+    #print(f"py op_streams:\n{trace_data.op_streams}")
+    #print(f"py op_extra_streams:\n{trace_data.op_extra_streams}")
+
+    if rank == 0:
+        logging.info("finish profiling fx module's memory")
+        graph_mem_info = alloc_profiler.create_graph_mem_info()
+        #print(f"graph_mem_info:\n{str(graph_mem_info)}")
+
+        op_streams = {}
+        for op_name, streams in trace_data.op_streams.items():
+            op_streams[op_name] = streams[0]
+
+        for op_name, streams in trace_data.op_extra_streams.items():
+            if op_name not in op_streams:
+                op_streams[op_name] = streams[0]
+
+        if mdconfig.mem_opt_by_solver:
+            mem_sched = ILPMemoryScheduler(gm, graph_mem_info,
+                                           1024*128, op_streams)
+        else:
+            mem_sched = EfficientMemoryScheduler(gm, graph_mem_info, op_streams)
+
+        required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes = \
+                                            mem_sched.gen_mem_addresses()
+        #print("ordered_schedules:")
+        #for idx, nd in enumerate(ordered_schedules):
+        #    print(f"{idx}: {nd}")
+
+        #print(f"master proposes required_memory: {required_memory}")
+        #print(f"master creates mem locations:\n{inter_op_mems}")
+
+        with mem_addr_rdy_cond:
+            global mem_sol
+            mem_sol = [
+                required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes
+            ]
+            mem_addr_rdy_cond.notify_all()
+
+        assert len(ordered_schedules) == len(mem_sched.nodes_to_schedule), \
+            f"schedule {len(ordered_schedules)} nodes, but totally {len(mem_sched.nodes_to_schedule)} nodes"
+    else:
+        required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes = rpc.rpc_sync(
+                            "ed_worker0", fetch_mem_sol, args=(), timeout=0)
+        #print(f"worker {rank} receives required_memory: {required_memory}")
+        #print(f"worker {rank} receives mem locations:\n{inter_op_mems}")
+
+    rpc.shutdown()
+
+    graph_mem_plan = GraphMemPlan(required_memory, temp_memory)
+
+    for name in ordered_schedules:
+        if name in mem_alloc_info:
+            alloc_list = mem_alloc_info[name]
+            for alloc_info in alloc_list:
+                addr = alloc_info[1]
+                size = alloc_info[2]
+                if alloc_info[3] == 0:
+                    is_temp_mem = True
+                else:
+                    is_temp_mem = False
+
+                graph_mem_plan.append_addr_size(addr, size, is_temp_mem, name)
+
+    #print("graph memory plan:")
+    #print(str(graph_mem_plan))
+
+    # setting allocator back to runtime mode
+    alloc_profiler.load_memory_plan(graph_mem_plan)
+
+    #print(f"graph details:\n{str(gm.graph)}\nend of graph\n")
+    insert_customized_allocator_flag(gm, back_alloced_nodes)
+    gm.recompile()
+    #print(f"python codes\n{gm.code}")
+
 
 def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
     module, opt = None, None
@@ -314,38 +452,38 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     rpc.shutdown()
 
     if mdconfig.use_dtensor:
-        sharded_graph = sharding_transform_dtensor(traced_graph, sharding_strategy)
+        sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
     else:
-        sharded_graph = sharding_transform(traced_graph, opt_strategy, state_io_map)
+        sharded_gm = sharding_transform(traced_graph, opt_strategy, state_io_map)
         if mdconfig.enable_tile_comm:
-            sharded_graph = runtime_prof(sharded_graph, tiling_prof=True)
-            sharded_graph = tile_comm(sharded_graph)
+            sharded_gm = runtime_prof(sharded_gm, tiling_prof=True)
+            sharded_gm = tile_comm(sharded_gm)
 
-    sharded_graph = fix_embedding(sharded_graph, recover=True)
+    sharded_gm = fix_embedding(sharded_gm, recover=True)
 
     if not mdconfig.use_dtensor:
         if mdconfig.comm_optimization is True:
-            sharded_graph = runtime_prof(sharded_graph)
-            sharded_graph = comm_optimize(sharded_graph, 'rcpsp', grouping=True, mem_restrain=False)
+            sharded_gm = runtime_prof(sharded_gm)
+            sharded_gm = comm_optimize(sharded_gm, 'rcpsp', grouping=True, mem_restrain=False)
 
         # override pytorch dtensor propagate rules to optimize dispater behavior
         if mdconfig.override_dtensor_rule is True:
-            sharded_graph = rule_override_by_graph(sharded_graph, opt_strategy, shape_info)
+            sharded_gm = rule_override_by_graph(sharded_gm, opt_strategy, shape_info)
 
 
     if mdconfig.log_level <= logging.DEBUG:
-        sharded_graph.print_readable()
+        sharded_gm.print_readable()
 
     if mdconfig.dump_fx_graph:
-        print(f"node num in sharded graph: {len(sharded_graph.graph.nodes)}")
-        drawer = FxGraphDrawer(sharded_graph, "shard_fx", ignore_getattr=True)
+        print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
+        drawer = FxGraphDrawer(sharded_gm, "shard_fx", ignore_getattr=True)
         dot_graphs = drawer.get_all_dot_graphs()
         for name, dot_graph in dot_graphs.items():
             dot_graph.write_jpg(f"./tmp/{name}.jpg")
             dot_graph.write_raw(f"./tmp/{name}.txt")
-        print(f"sharded_graph._code: {sharded_graph._code}")
+        print(f"sharded_gm._code: {sharded_gm._code}")
 
-    # do not use mock device after get sharded_graph
+    # do not use mock device after get sharded_gm
     device_mesh = get_device_mesh()
     if isinstance(device_mesh, TorchMockDeviceMesh):
         if device_mesh.debug_only:
@@ -429,90 +567,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
     if mdconfig.enable_memory_opt:
-        rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
-        if rank == 0:
-            logging.info("profiling fx module's memory...")
-
-        # setting allocator to profiling mode
-        _set_allocator_mode(AllocatorMode.PROFILE)
-
-        # save all profiling information in this dict
-        profiling_info = ModuleProfilingInfo(rank)
-        alloc_profiler = AllocatorProfiler(sharded_graph, profiling_info)
-        with ed_stream_tracer.StreamTracer() as stream_tracer:
-            _ = alloc_profiler.run([])
-            trace_data = stream_tracer.get_stream_trace_data()
-        #print(f"py op_streams:\n{trace_data.op_streams}")
-        #print(f"py op_extra_streams:\n{trace_data.op_extra_streams}")
-
-        if rank == 0:
-            logging.info("finish profiling fx module's memory")
-            graph_mem_info = alloc_profiler.create_graph_mem_info()
-            #print(f"graph_mem_info:\n{str(graph_mem_info)}")
-
-            op_streams = {}
-            for op_name, streams in trace_data.op_streams.items():
-                op_streams[op_name] = streams[0]
-
-            for op_name, streams in trace_data.op_extra_streams.items():
-                if op_name not in op_streams:
-                    op_streams[op_name] = streams[0]
-
-            if mdconfig.mem_opt_by_solver:
-                mem_sched = ILPMemoryScheduler(sharded_graph, graph_mem_info,
-                                               1024*128, op_streams)
-            else:
-                mem_sched = EfficientMemoryScheduler(
-                                    sharded_graph, graph_mem_info, op_streams)
-
-            required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems = \
-                                                mem_sched.gen_mem_addresses()
-            #print("ordered_schedules:")
-            #for idx, nd in enumerate(ordered_schedules):
-            #    print(f"{idx}: {nd}")
-
-            #print(f"master proposes required_memory: {required_memory}")
-            #print(f"master creates mem locations:\n{inter_op_mems}")
-
-            with mem_addr_rdy_cond:
-                global mem_sol
-                mem_sol = [
-                    required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems
-                ]
-                mem_addr_rdy_cond.notify_all()
-
-            assert len(ordered_schedules) == len(mem_sched.nodes_to_schedule), \
-                f"schedule {len(ordered_schedules)} nodes, but totally {len(mem_sched.nodes_to_schedule)} nodes"
-        else:
-            required_memory, temp_memory, ordered_schedules, mem_alloc_info, inter_op_mems = rpc.rpc_sync(
-                                "ed_worker0", fetch_mem_sol, args=(), timeout=0)
-            #print(f"worker {rank} receives required_memory: {required_memory}")
-            #print(f"worker {rank} receives mem locations:\n{inter_op_mems}")
-
-        rpc.shutdown()
-
-        graph_mem_plan = GraphMemPlan(required_memory, temp_memory)
-
-        for name in ordered_schedules:
-            if name in mem_alloc_info:
-                alloc_list = mem_alloc_info[name]
-                for alloc_info in alloc_list:
-                    addr = alloc_info[1]
-                    size = alloc_info[2]
-                    if alloc_info[3] == 0:
-                        is_temp_mem = True
-                    else:
-                        is_temp_mem = False
-
-                    graph_mem_plan.append_addr_size(addr, size, is_temp_mem, name)
-
-        #print("graph memory plan:")
-        #print(str(graph_mem_plan))
-
-        # setting allocator back to runtime mode
-        alloc_profiler.load_memory_plan(graph_mem_plan)
-
-        #print(f"graph details:\n{str(sharded_graph.graph)}\nend of graph\n")
+        memory_opt(sharded_gm)
 
     class EDCompiledFunc:
 
@@ -543,13 +598,11 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
 
             args, kwargs = pytree.tree_unflatten(flatten_args, args_specs)
 
-            # run the sharded_graph
+            # run the sharded_gm
             if mdconfig.enable_memory_opt:
                 _set_allocator_mode(AllocatorMode.RUNTIME)
-                _set_customized_flag(True)
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)
-                _set_customized_flag(False)
             else:
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)
@@ -607,4 +660,4 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
 
-    return EDCompiledFunc(sharded_graph)
+    return EDCompiledFunc(sharded_gm)

@@ -111,6 +111,9 @@ class EfficientMemoryScheduler(MemoryScheduler):
         for ten_group in buf_makespans.keys():
             assert not ten_group.src_from_ctx
             src_node = ten_group.src_tensor[0]
+            if src_node in self.nodes_by_back_allocator:
+                continue
+
             src_node_sched = self.schedule_result.get_schedule(src_node)
             src_node_stream_id = src_node_sched.log_stream_id
             assert src_node_stream_id == stream_id
@@ -175,6 +178,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
         # 2. generate memory address for temp allocation inside an op
         max_temp_addr = 0
         for node in cur_stream_seq:
+            if node in self.nodes_by_back_allocator:
+                continue
             temp_vars = self.graph_mem_info.get_temp_vars(node)
             node_temp_addr = temp_mem_start
             for temp_var in temp_vars:
@@ -198,6 +203,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
         for ten_group in buf_makespans.keys():
             assert not ten_group.src_from_ctx
             src_node = ten_group.src_tensor[0]
+            if src_node in self.nodes_by_back_allocator:
+                continue
             src_node_sched = self.schedule_result.get_schedule(src_node)
             src_node_stream_id = src_node_sched.log_stream_id
             assert src_node_stream_id == stream_id
@@ -215,6 +222,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
         node_temp_addr = temp_mem_start
         cur_stream_seq = self.schedule_result.get_sequence(stream_id)
         for node in cur_stream_seq:
+            if node in self.nodes_by_back_allocator:
+                continue
             temp_vars = self.graph_mem_info.get_temp_vars(node)
             for temp_var in temp_vars:
                 if node.name not in mem_alloc_info:
@@ -284,7 +293,11 @@ class EfficientMemoryScheduler(MemoryScheduler):
                                       mem_plans,
                                       ordered_schedules)
 
-        return (required_mem, required_temp_mem, None, ordered_schedules, mem_alloc_info, inter_op_mems)
+        back_alloced_nodes = set()
+        for nd in self.nodes_by_back_allocator:
+            back_alloced_nodes.add(nd.name)
+
+        return (required_mem, required_temp_mem, None, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes)
 
     def create_stream_plan(self, lifetime_info, stream_id, scaled_mem_start,
                            temp_mem_start, mem_alloc_info, inter_op_mems):
@@ -304,8 +317,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
                                                       mem_alloc_info)
 
         scaled_stream_end_addr = self.export_mem_plan(group_addresses,
-                                                    inter_op_mems,
-                                                    mem_alloc_info)
+                                                      inter_op_mems,
+                                                      mem_alloc_info)
 
         #print(f"scaled_stream_end_addr: {scaled_stream_end_addr}")
         return (scaled_stream_end_addr, stream_temp_end_addr, group_addresses)
@@ -369,7 +382,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
                 left = lb
                 width = ub - lb + 1
                 assert width > 0
-                assert group in group_addresses
+                if group not in group_addresses:
+                    continue
                 addr_size = group_addresses[group]
                 bottom = addr_size[0]*self.gcd
                 height = addr_size[1]*self.gcd

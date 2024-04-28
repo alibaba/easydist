@@ -156,9 +156,10 @@ void init_memory_plan(int device) {
   std::vector<void *> mem_ends;       // for debug
   std::vector<std::string> op_names;  // for debug
   std::vector<bool> temp_flags;       // for debug
-  std::cout << "rank: " << device << ", mem_start: " << mem_start << std::endl;
+  std::cout << "rank: " << device << ", mem_start: " << mem_start << std::endl
+            << std::flush;
   std::cout << "rank: " << device << ", temp_mem_start: " << temp_mem_start
-            << std::endl;
+            << std::endl << std::flush;
 #endif
 
   for (auto& current_alloc: raw_mem_allocs) {
@@ -191,7 +192,7 @@ void init_memory_plan(int device) {
 
   if (device == 0) {
     std::cout << "rank: " << device << std::endl
-              << graph_memory_plan.memory_info_str();
+              << graph_memory_plan.memory_info_str() << std::flush;
   }
 #endif
 
@@ -221,6 +222,12 @@ void* profiling_malloc(ssize_t size, int device, cudaStream_t stream) {
 }
 
 void profiling_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+#ifdef DEBUG_MEMORY
+  if (device == 0) {
+    std::cout << "[profiler] (real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+              << ", size: " << size << std::endl << std::flush;
+  }
+#endif
   back_allocator->raw_delete(ptr);
 }
 
@@ -243,7 +250,7 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
     std::tuple<void*, uintptr_t, std::string, bool> addr_size = graph_memory_plan.get_mem_address(device);
     if (device == 0) {
       bool is_temp = std::get<3>(addr_size);
-      std::string malloc_str = "(fake malloc) rank: " + std::to_string(device);
+      std::string malloc_str = "[runtime] (fake malloc) rank: " + std::to_string(device);
       malloc_str += ", ptr: " + std::to_string((uintptr_t)std::get<0>(addr_size));
       malloc_str += ", alloced size: " + std::to_string(std::get<1>(addr_size));
       malloc_str += ", expected size: " + std::to_string(size) + ", stream: ";
@@ -255,7 +262,7 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
         malloc_str += ", is temp: False";
       }
       malloc_str += "\n";
-      std::cout << malloc_str;
+      std::cout << malloc_str << std::flush;
     }
 #else
     std::tuple<void*, uintptr_t> addr_size = graph_memory_plan.get_mem_address(device);
@@ -265,11 +272,11 @@ void* runtime_malloc(ssize_t size, int device, cudaStream_t stream) {
     void *ptr = back_allocator->raw_alloc(size);
 #ifdef DEBUG_MEMORY
     if (device == 0 && size > 0) {
-      std::string malloc_str = "(real malloc) rank: " + std::to_string(device);
+      std::string malloc_str = "[runtime] (real malloc) rank: " + std::to_string(device);
       malloc_str += ", ptr: " + std::to_string((uintptr_t)ptr);
       malloc_str += ", alloced size: " + std::to_string(size) + ", stream: ";
       malloc_str += std::to_string(stream_id) + "\n";
-      std::cout << malloc_str;
+      std::cout << malloc_str << std::flush;
     }
 #endif
     return ptr;
@@ -282,16 +289,16 @@ void runtime_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
   {
 #ifdef DEBUG_MEMORY
     if (device == 0) {
-      std::cout << "(real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
-                << ", size: " << size << std::endl;
+      std::cout << "[runtime] (real free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+                << ", size: " << size << std::endl << std::flush;
     }
 #endif
     back_allocator->raw_delete(ptr);
   } else {
 #ifdef DEBUG_MEMORY
     if (device == 0) {
-      std::cout << "(fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
-                << ", size: " << size << std::endl;
+      std::cout << "[runtime] (fake free) rank: " << device << ", ptr: " << (uintptr_t)ptr
+                << ", size: " << size << std::endl << std::flush;
     }
 #endif
   }
@@ -305,7 +312,7 @@ void* meta_malloc(ssize_t size, int device, cudaStream_t stream) {
     void* ptr = profiling_malloc(size, device, stream);
 #ifdef DEBUG_MEMORY
     if (device == 0 && size>0) {
-      std::cout << "prof malloc: " << (uintptr_t)ptr << std::endl;
+      std::cout << "[profiler] malloc: " << (uintptr_t)ptr << std::endl << std::flush;
     }
 #endif
     profiling_ptrs.insert(ptr);
@@ -327,7 +334,7 @@ void meta_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
    if (profiling_ptrs.find(ptr) != profiling_ptrs.end()) {
 #ifdef DEBUG_MEMORY
       if (device == 0) {
-        std::cout << "prof free: " << (uintptr_t)ptr << std::endl;
+        std::cout << "[profiler] free: " << (uintptr_t)ptr << std::endl << std::flush;
       }
 #endif
       profiling_free(ptr, size, device, stream);
@@ -335,7 +342,7 @@ void meta_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
    } else {
 #ifdef DEBUG_MEMORY
       if (device == 0) {
-        std::cout << "runtime free: " << (uintptr_t)ptr << std::endl;
+        std::cout << "[runtime] free: " << (uintptr_t)ptr << std::endl << std::flush;
       }
 #endif
       runtime_free(ptr, size, device, stream);
