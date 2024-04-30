@@ -26,7 +26,6 @@ import torch.fx as fx
 from torch.profiler import record_function
 from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
-from zmq import has
 
 from easydist.torch.device_mesh import get_device_mesh, get_spmd_rank
 from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage,
@@ -82,7 +81,7 @@ class PipelineStage:
                  device: torch.device,
                  pp_group: dist.ProcessGroup,
                  sharded_graph: fx.GraphModule,
-                 gather_output: bool):
+                 all_gather_output: bool):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
@@ -99,7 +98,7 @@ class PipelineStage:
         self.pp_rank = dist.get_rank(pp_group)
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
-        self.return_to_all_stages = gather_output
+        self.return_to_all_stages = all_gather_output
         self.graph = sharded_graph
 
         if dist.get_world_size(self.pp_group) > self.num_stages:
@@ -266,16 +265,15 @@ class PipelineStage:
 
     def _create_send_ops(self, send_info: Dict[int, List[str]], output_dict: Dict[str, torch.Tensor]):
         # Send requests of a chunk
-        send_ops: List[dist.P2POp] = []
-
+        send_ops_by_dst = defaultdict(list)
         for dst, nodes in send_info.items():
             peer_rank = self.stage_index_to_group_rank[dst]
             peer_global_rank = peer_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, peer_rank)
             for node in nodes:
                 val = output_dict[node]
-                send_ops.append(dist.P2POp(dist.isend, val, peer_global_rank, self.pp_group))
+                send_ops_by_dst[dst].append(dist.P2POp(dist.isend, val, peer_global_rank, self.pp_group))
 
-        return send_ops
+        return [send_ops_by_dst[dst] for dst in sorted(send_info.keys())]
 
     def _create_recv_info(
         self,
@@ -312,12 +310,14 @@ class PipelineStage:
         return kwargs_recv_info
 
     def _create_recv_ops(self, recv_info: Dict[int, List[Placeholder]]):
-        recv_ops = []
+        recv_ops_by_src = []
         for src, ph_list in recv_info.items():
+            rec_ops = []
             for ph in ph_list:
                 if isinstance(ph, RecevPlaceholder):
-                    recv_ops.append(dist.P2POp(dist.irecv, ph.buffer, src, self.pp_group))
-        return recv_ops
+                    rec_ops.append(dist.P2POp(dist.irecv, ph.buffer, src, self.pp_group))
+            recv_ops_by_src.append(rec_ops)
+        return recv_ops_by_src
 
     def collect_kwargs(
         self,
@@ -338,14 +338,16 @@ class PipelineStage:
 
     def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         # Receive activations
-        recv_ops = self._create_recv_ops(self.fw_kwargs_recv_info)
-        recv_reqs = maybe_batch_isend_irecv(recv_ops)
+        recv_ops_by_src = self._create_recv_ops(self.fw_kwargs_recv_info)
+        recv_reqs = []
+        for ops in recv_ops_by_src:
+            recv_reqs += maybe_batch_isend_irecv(ops)
         if wait:
             for req in recv_reqs:
                 req.wait()
         return recv_reqs
 
-        
+
     def forward_compute_one_chunk(self):
         # Collect activations and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.fw_kwargs_recv_info,
@@ -357,21 +359,26 @@ class PipelineStage:
                                                     **composite_kwargs_chunk)
         # Update runtime states
         self.cur_fw_chunk_id += 1
-    
+
     def forward_send_one_chunk(self) -> List[dist.Work]:
         # Send activations
-        send_ops = self._create_send_ops(self.fw_act_send_info, self.cur_fw_send_chunk)
-        return maybe_batch_isend_irecv(send_ops)
+        send_ops_by_dst = self._create_send_ops(self.fw_act_send_info, self.cur_fw_send_chunk)
+        reqs = []
+        for ops in send_ops_by_dst:
+            reqs += maybe_batch_isend_irecv(ops)
+        return reqs
 
     def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         # Receive grads
-        recv_ops = self._create_recv_ops(self.bw_kwargs_recv_info)
-        recv_reqs = maybe_batch_isend_irecv(recv_ops)
+        recv_ops_by_src = self._create_recv_ops(self.bw_kwargs_recv_info)
+        recv_reqs = []
+        for ops in recv_ops_by_src:
+            recv_reqs += maybe_batch_isend_irecv(ops)
         if wait:
             for req in recv_reqs:
                 req.wait()
         return recv_reqs
-        
+
     def backward_compute_one_chunk(self):
         # Collect grads and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.bw_kwargs_recv_info,
@@ -386,14 +393,13 @@ class PipelineStage:
 
     def backward_send_one_chunk(self) -> List[dist.Work]:
         # Send grads
-        send_ops = self._create_send_ops(self.bw_grad_send_info, self.cur_bw_send_chunk)
-        return maybe_batch_isend_irecv(send_ops)
-    
-    def step(self, step_chunk=False):
-        if step_chunk:
-            self.compiled_stage.step(self.outputs_chunks(self.cur_step_chunk_id))
-            self.cur_step_chunk_id += 1
-            return
+        send_ops_by_dst = self._create_send_ops(self.bw_grad_send_info, self.cur_bw_send_chunk)
+        reqs = []
+        for ops in send_ops_by_dst:
+            reqs += maybe_batch_isend_irecv(ops)
+        return reqs
+
+    def step(self):
         self.compiled_stage.step(self.outputs_batch)
 
     def clear_runtime_states(self):
@@ -568,7 +574,7 @@ class Schedule(ABC):
     @abstractmethod
     def __call__(self) -> None:
         raise NotImplementedError
-    
+
     def __getattr__(self, name):
         return getattr(self.pipeline_stage, name)
 
@@ -622,9 +628,9 @@ class ScheduleDAPPLE(Schedule):
         for fwd_chunk in range(self.num_warmup, self.num_chunks):
             # recv backward first
             self.backward_recv_one_chunk()
-            self.backward_compute_one_chunk()
-            # IMPORTANT: recv forward first
+            # IMPORTANT: recv forward after recv backward and before send backward
             reqs = self.forward_recv_one_chunk(wait=False)
+            self.backward_compute_one_chunk()
             all_send_reqs += self.backward_send_one_chunk()
             for req in reqs:
                 req.wait()

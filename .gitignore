@@ -141,11 +141,17 @@ build/
 # temporary files
 tmp
 
-# graphviz output
+# graphviz output files
 *.dot
 
-# torchvision dataset
+# cached datasets
 data
 
-# pt file
+# pt files
 *.pt
+
+# txt files
+*.txt
+
+# svg files
+*.svg

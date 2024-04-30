@@ -396,7 +396,8 @@ class CompiledStage:
             if self.has_bw() and arg_name in self.activation_nodes:
                 activations_chunk[arg_name] = kwargs4gm[arg_name]
 
-        output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
+        with torch.profiler.record_function("actual_compute"):
+            output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
 
         ret = {}
         assert len(output_from_gm) == len(
@@ -453,7 +454,8 @@ class CompiledStage:
                 raise RuntimeError(f"arg {arg_name} not found")
 
         assert len(activations_chunk) == 0, "all backward args should be used"
-        output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
+        with torch.profiler.record_function("actual_compute"):
+            output_from_gm = _to_tuple(self.bw_gm(**kwargs4gm))
 
         ret = {}
         assert len(output_from_gm) == len(
@@ -492,7 +494,8 @@ class CompiledStage:
             else:
                 raise RuntimeError(f"arg {arg_name} not sure where to go")
 
-        rets = _to_tuple(self.step_gm(**kwargs))
+        with torch.profiler.record_function("actual_compute"):
+            rets = _to_tuple(self.step_gm(**kwargs))
 
         for output, ret in zip(self.step_gm.outputs_spec, rets):
             if output in self.compiled_meta.output2input_params:  # params

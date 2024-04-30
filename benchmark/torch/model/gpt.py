@@ -1,4 +1,5 @@
 import math
+from typing import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -158,3 +159,28 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+
+class SequentialGPT(nn.Sequential):
+    def __init__(self,
+                 depth: int,
+                 dim: int,
+                 num_heads: int,
+                 mlp_ratio: int = 4,
+                 attention_dropout: float = 0.,
+                 dropout: float = 0.,
+                 dtype: torch.dtype = None):
+        super().__init__(OrderedDict(
+            [
+                (f'block{i}', GPTLayer(
+                    dim=dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attention_dropout=attention_dropout,
+                    dropout=dropout,
+                    dtype=dtype,
+                )) for i in range(depth)
+            ]
+        ))
+
+    def forward(self, x):
+        return super().forward(x)

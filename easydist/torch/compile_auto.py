@@ -482,7 +482,7 @@ def _compile_auto(func,
             pp_group=get_pp_group(),
             device=torch.device(f"cuda:{rank}"),
             sharded_graph=sharded_graph,
-            gather_output=all_gather_output
+            all_gather_output=all_gather_output
         )
         return pipe
 

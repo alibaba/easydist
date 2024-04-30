@@ -204,7 +204,7 @@ def _compile_pp(func,
         pp_group=None,
         device=torch.device(f"cuda:{rank}"),
         sharded_graph=traced_stateless_func,
-        gather_output=all_gather_output
+        all_gather_output=all_gather_output
     )
 
     return pipe

@@ -48,11 +48,11 @@ criterion = torch.nn.CrossEntropyLoss()
 
 
 def train_step(input, label, model, opt):
-    opt.zero_grad()
     out = model(input)
     loss = criterion(out, label)
     loss.backward()
     opt.step()
+    opt.zero_grad()
     return out, loss
 
 
@@ -66,17 +66,16 @@ def test_main():
 
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     dataset_size = 10000
-    batch_size = 16
+    batch_size = 128
     train_dataloader = [
         (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
     ] * (dataset_size // batch_size)
 
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt)
-    epochs = 5
+    epochs = 1
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
         time_start = time.time()
@@ -90,10 +89,11 @@ def test_main():
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch).sum()
             loss_sum += loss.mean().item()
-        print(
-            f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
-            f'time: {time.time() - time_start}'
-        )
+    print(
+        f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
+        f'time: {time.time() - time_start}'
+        f'max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024}mb'
+    )
 
 if __name__ == '__main__':
     test_main()
