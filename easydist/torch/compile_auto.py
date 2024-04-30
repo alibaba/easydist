@@ -60,7 +60,7 @@ from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer,
 from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
-from profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode
+from profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode, _set_cur_op_name
 # for pickle dump opt_strategy
 import sys
 
@@ -245,6 +245,18 @@ def insert_customized_allocator_flag(
     #for node in gm.graph.nodes:
     #    print(node)
 
+@torch.fx.has_side_effect
+def op_tagger(op_name: str=""):
+    _set_cur_op_name(op_name)
+    print(f"cur node: {op_name}")
+
+def insert_taggers(gm: torch.fx.GraphModule):
+    nodes = [node for node in gm.graph.nodes]
+    for node in nodes:
+        with gm.graph.inserting_before(node):
+            tagger = gm.graph.call_function(op_tagger, args=(node.name,))
+            print(f"add tagger: {tagger}")
+
 def memory_opt(gm: torch.fx.GraphModule):
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -333,6 +345,8 @@ def memory_opt(gm: torch.fx.GraphModule):
 
     #print(f"graph details:\n{str(gm.graph)}\nend of graph\n")
     insert_customized_allocator_flag(gm, back_alloced_nodes)
+    if mdconfig.enable_runtime_trace:
+        insert_taggers(gm)
     gm.recompile()
     #print(f"python codes\n{gm.code}")
 
