@@ -155,3 +155,6 @@ data
 
 # svg files
 *.svg
+
+# log folder
+log

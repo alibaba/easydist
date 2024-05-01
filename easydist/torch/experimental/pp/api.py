@@ -141,8 +141,8 @@ def _compile_pp(func,
                                                                          named_states,
                                                                          args_split[0],
                                                                          kwargs_split[0])
-
     assert len(list(traced_stateless_func.named_buffers())) == 0, "Make sure there is no tensor created in the forward function"
+    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func_node_metas = {
         node.name: node.meta
         for node in traced_stateless_func.graph.nodes
@@ -189,20 +189,32 @@ def _compile_pp(func,
                                                                 world_size,
                                                                 stateless_func_args,
                                                                 strict=strict)
+
+    # materialize stage and move states to device
+    device = torch.device(f"cuda:{rank}")
+    # materialize_fn = init_helper.get_materialize_fn()
+    compiled_stage = compiled_stages[rank]
+    for gm_type in ['fw_gm', 'bw_gm', 'step_gm']:
+        if hasattr(compiled_stage, gm_type):
+            gm: EDGraphModule = getattr(compiled_stage, gm_type)
+            for state_type in gm.injected_states:
+                for name, state in gm.injected_states[state_type].items():
+                    gm.injected_states[state_type][name] = state.to(device)
+
     save_graphviz_dot(local_gm, "local_gm")
     pipe = PipelineStage(
         schedule_cls=schedule_cls,
         local_gm=local_gm,
         compiled_meta=compiled_meta,
         stage_idx=rank,
-        compiled_stage=compiled_stages[rank],
+        compiled_stage=compiled_stage,
         node_metas=traced_stateless_func_node_metas,
         num_chunks=num_chunks,
         args_chunk_spec=args_chunk_spec,
         kwargs_chunk_spec=kwargs_chunk_spec,
         returns_chunk_spec=outputs_chunk_spec,
         pp_group=None,
-        device=torch.device(f"cuda:{rank}"),
+        device=device,
         sharded_graph=traced_stateless_func,
         all_gather_output=all_gather_output
     )
