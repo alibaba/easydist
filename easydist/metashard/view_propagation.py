@@ -30,7 +30,7 @@ def get_next_non_one(shape_, idx_):
     return idx_
 
 
-def view_propagation(input_shape, output_shape, world_size=1):  
+def view_propagation(input_shape, output_shape, world_size=1):
 
     if -1 in output_shape:
         numel = functools.reduce(operator.mul, input_shape)
@@ -49,7 +49,7 @@ def view_propagation(input_shape, output_shape, world_size=1):
         if input_shape[input_idx] == output_shape[output_idx]:
             # [**, A, **] -> [**, A, **]
             if input_shape[input_idx] >= world_size:
-                sharding_ann[0][input_idx] = ShardDim(shard_dim)  # TODO @botbw: add halo (vit_b_16 failed)
+                sharding_ann[0][input_idx] = ShardDim(shard_dim)
                 combination_ann[shard_dim] = functools.partial(CombinationFunc.gather,
                                                                dim=output_idx)
                 shard_dim += 1
@@ -71,7 +71,7 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     input_idx = get_next_non_one(input_shape, input_idx + 1)
                     break
                 elif accum_shape_out > input_shape[input_idx]:
-                    raise RuntimeError("View propagation failed")
+                    raise RuntimeError("View propagation failed, this should be solved by decoupling view ops")
         else:
             # [**, a1, a2, **] -> [**, A, **]
             leftmost_idx = input_idx
@@ -99,7 +99,7 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     input_idx = get_next_non_one(input_shape, i_idx + 1)
                     break
                 elif accum_shape_in > output_shape[output_idx]:
-                    raise RuntimeError("View propagation failed")
+                    raise RuntimeError("View propagation failed, this should be solved by decoupling view ops")
 
     return {'sharding_ann': sharding_ann, 'combination_ann': combination_ann}
 

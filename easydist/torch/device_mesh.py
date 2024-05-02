@@ -73,25 +73,24 @@ def device_mesh_rank(device_mesh, dim):
 
     return rank
 
-# [spmd0, spmd1, pp]
-__with_spmd_device_mesh = None
+__cur_pp_rank = None
 
 @contextmanager
 def spmd_device_mesh(pp_rank=None):
-    global __with_spmd_device_mesh
-    ori_with_spmd_device_mesh = __with_spmd_device_mesh
+    global __cur_pp_rank
+    ori_with_spmd_device_mesh = __cur_pp_rank
     if pp_rank is None and len(TORCH_DEVICE_MESH.mesh.shape) >= 3:
-        __with_spmd_device_mesh = TORCH_DEVICE_MESH.get_coordinate_on_dim(2)
+        __cur_pp_rank = TORCH_DEVICE_MESH.get_coordinate_on_dim(2)
     else:
-        __with_spmd_device_mesh = pp_rank
+        __cur_pp_rank = pp_rank
     try:
         yield
     finally:
-        __with_spmd_device_mesh = ori_with_spmd_device_mesh
+        __cur_pp_rank = ori_with_spmd_device_mesh
 
 def get_device_mesh():
     global TORCH_DEVICE_MESH
-    if __with_spmd_device_mesh is not None:
+    if __cur_pp_rank is not None:
         return __get_spmd_device_mesh(TORCH_DEVICE_MESH)
     return TORCH_DEVICE_MESH
 
@@ -116,12 +115,12 @@ def get_pp_group():
     return TORCH_DEVICE_MESH.get_dim_groups(2)
 
 def __get_spmd_device_mesh(device_mesh):
-    assert __with_spmd_device_mesh is not None 
+    assert __cur_pp_rank is not None 
 
     if device_mesh is None:
         return None
     
-    ranks = device_mesh.mesh[:, :, __with_spmd_device_mesh]
+    ranks = device_mesh.mesh[:, :, __cur_pp_rank]
     spmd_mesh = DeviceMesh(
         device_mesh.device_type, ranks, _init_process_groups=False
     )
