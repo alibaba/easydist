@@ -72,16 +72,6 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     break
                 elif accum_shape_out > input_shape[input_idx]:
                     raise RuntimeError("View propagation failed")
-                    # output_idx = get_next_non_one(output_shape, o_idx + 1)
-                    # accum_shape_in = 1
-                    # while accum_shape_out != accum_shape_in:
-                    #     if accum_shape_in < accum_shape_out and input_idx < len(input_shape):
-                    #         accum_shape_in *= input_shape[input_idx]
-                    #         input_idx = get_next_non_one(input_shape, input_idx + 1)
-                    #     else:
-                    #         accum_shape_out *= output_shape[output_idx]
-                    #         output_idx = get_next_non_one(output_shape, output_idx + 1)
-                    # break
         else:
             # [**, a1, a2, **] -> [**, A, **]
             leftmost_idx = input_idx
@@ -110,16 +100,6 @@ def view_propagation(input_shape, output_shape, world_size=1):
                     break
                 elif accum_shape_in > output_shape[output_idx]:
                     raise RuntimeError("View propagation failed")
-                    # input_idx = get_next_non_one(input_shape, i_idx + 1)
-                    # accum_shape_out = 1
-                    # while accum_shape_out != accum_shape_in:
-                    #     if accum_shape_in < accum_shape_out and input_idx < len(input_shape):
-                    #         accum_shape_in *= input_shape[input_idx]
-                    #         input_idx = get_next_non_one(input_shape, input_idx + 1)
-                    #     else:
-                    #         accum_shape_out *= output_shape[output_idx]
-                    #         output_idx = get_next_non_one(output_shape, output_idx + 1)
-                    # break
 
     return {'sharding_ann': sharding_ann, 'combination_ann': combination_ann}
 

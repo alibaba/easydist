@@ -30,7 +30,7 @@ def ordered_gi_users(node: fx.node):
 
 def save_graphviz_dot(gm, name):
     if mdconfig.log_level <= logging.DEBUG:
-        with open(f"{name}.dot", "w") as f:
+        with open(f"./log/{name}.dot", "w") as f:
             f.write(str(FxGraphDrawer(gm, name).get_dot_graph()))
 
 

@@ -73,13 +73,13 @@ def test_main(args):
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
-    case = GPTCase(num_layers=16, hidden_dim=4096, num_heads=1, seq_size=16)
+    case = GPTCase(num_layers=192, hidden_dim=1024, num_heads=1, seq_size=16)
     module = SequentialGPT(depth=case.num_layers,
                            dim=case.hidden_dim,
                            num_heads=case.num_heads)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
-    annotate_split_points(module, {'block3', 'block7', 'block11'})
+    annotate_split_points(module, {'block47', 'block95', 'block143'})
 
     @easydist_compile(parallel_mode="pp",
                       tracing_mode="fake",
@@ -94,7 +94,7 @@ def test_main(args):
         opt.zero_grad()
         return out
 
-    dataset_size = 10000
+    dataset_size = 1000000000000
     train_dataloader = [
         torch.ones(case.batch_size, case.seq_size, case.hidden_dim)
     ] * (dataset_size // batch_size)
@@ -133,7 +133,7 @@ def test_main(args):
             'max_name_column_width': 55,
             'max_shapes_column_width': 80,
         }
-        with open(f'{schedule_cls.__name__}-profile-{rank}.txt', 'w') as f:
+        with open(f'./log/{schedule_cls.__name__}-profile-{rank}.txt', 'w') as f:
             f.write(prof.key_averages().table(sort_by="cuda_time_total",
                                               top_level_events_only=True,
                                               header='sort by cuda_time_total',

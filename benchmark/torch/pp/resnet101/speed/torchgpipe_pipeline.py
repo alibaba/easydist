@@ -111,7 +111,7 @@ def test_main(args):
             'max_name_column_width': 55,
             'max_shapes_column_width': 80,
         }
-        with open(f'torchgpipe-profile.txt', 'w') as f:
+        with open(f'./log/torchgpipe-profile.txt', 'w') as f:
             f.write(prof.key_averages().table(sort_by="cuda_time_total",
                                               top_level_events_only=True,
                                               header='sort by cuda_time_total',

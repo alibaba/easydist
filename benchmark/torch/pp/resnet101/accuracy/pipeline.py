@@ -104,7 +104,6 @@ def test_main(args):
     train_step(x_batch.to(device), y_batch.to(device), module, opt) # compile
     epochs = 5
     time_sum = 0
-    # with torch.autograd.profiler.profile() as prof:
     for epoch in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
         time_start = time.time()
@@ -124,11 +123,7 @@ def test_main(args):
                 f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
                 f'time: {time.time() - time_start}'
             )
-    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
-        f.write(
-            f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
-        )
-    # print(prof.key_averages().table(sort_by="self_cpu_time_total"))
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
