@@ -92,7 +92,7 @@ def test_main(args):
                  with_stack=True,
                  experimental_config=torch._C._profiler._ExperimentalConfig(
                      verbose=True),
-                     on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/torchgpipe')
+                     on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/res-torchgpipe')
                      ) if do_profile else nullcontext() as prof:
         time_start = time.time()
         torch.cuda.synchronize(in_device)
@@ -111,7 +111,7 @@ def test_main(args):
             'max_name_column_width': 55,
             'max_shapes_column_width': 80,
         }
-        with open(f'./log/torchgpipe-profile.txt', 'w') as f:
+        with open(f'./log/res-torchgpipe-profile.txt', 'w') as f:
             f.write(prof.key_averages().table(sort_by="cuda_time_total",
                                               top_level_events_only=True,
                                               header='sort by cuda_time_total',
@@ -121,8 +121,8 @@ def test_main(args):
                                               top_level_events_only=True,
                                               header='sort by cpu_time_total',
                                               **config))
-        prof.export_stacks(f"torchgpipe-profile-fg.txt",
-                           "self_cuda_time_total")
+        # prof.export_stacks(f"torchgpipe-profile-fg.txt",
+        #                    "self_cuda_time_total")
 
 
 if __name__ == '__main__':

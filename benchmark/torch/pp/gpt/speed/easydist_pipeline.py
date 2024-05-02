@@ -29,7 +29,7 @@ from torch.distributed._tensor import DeviceMesh
 from tqdm import tqdm
 
 from benchmark.bench_case import GPTCase
-from benchmark.torch.model.gpt import GPT, SequentialGPT
+from benchmark.torch.model.gpt import GPT, SequentialLowCommGPT
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
@@ -73,13 +73,15 @@ def test_main(args):
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
-    case = GPTCase(num_layers=192, hidden_dim=1024, num_heads=1, seq_size=16)
-    module = SequentialGPT(depth=case.num_layers,
+    case = GPTCase(num_layers=16, hidden_dim=1024, num_heads=1, seq_size=128, batch_size=batch_size)
+    comm_dim=1
+    module = SequentialLowCommGPT(depth=case.num_layers,
                            dim=case.hidden_dim,
-                           num_heads=case.num_heads)
+                           num_heads=case.num_heads,
+                           comm_dim=comm_dim)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
-    annotate_split_points(module, {'block47', 'block95', 'block143'})
+    annotate_split_points(module, {'block3', 'block7', 'block11'})
 
     @easydist_compile(parallel_mode="pp",
                       tracing_mode="fake",
@@ -94,9 +96,9 @@ def test_main(args):
         opt.zero_grad()
         return out
 
-    dataset_size = 1000000000000
+    dataset_size = 10000
     train_dataloader = [
-        torch.ones(case.batch_size, case.seq_size, case.hidden_dim)
+        torch.ones(batch_size, case.seq_size, comm_dim)
     ] * (dataset_size // batch_size)
 
     x_batch = next(iter(train_dataloader))
@@ -106,7 +108,7 @@ def test_main(args):
                  with_stack=True,
                 #  experimental_config=torch._C._profiler._ExperimentalConfig(
                 #      verbose=True),
-                 on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/{schedule_cls.__name__}-{rank}')
+                 on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/gpt-{schedule_cls.__name__}-{rank}')
                  ) if do_profile else nullcontext() as prof:
         time_start = time.time()
         torch.cuda.synchronize()
@@ -114,6 +116,7 @@ def test_main(args):
             for x_batch in tqdm(
                     train_dataloader,
                     dynamic_ncols=True) if rank == 0 else train_dataloader:
+                x_batch = x_batch.to(device)
                 if x_batch.size(0) != batch_size:  # TODO need to solve this
                     continue
                 _ = train_step(x_batch, module, opt)
@@ -133,7 +136,7 @@ def test_main(args):
             'max_name_column_width': 55,
             'max_shapes_column_width': 80,
         }
-        with open(f'./log/{schedule_cls.__name__}-profile-{rank}.txt', 'w') as f:
+        with open(f'./log/gpt-{schedule_cls.__name__}-profile-{rank}.txt', 'w') as f:
             f.write(prof.key_averages().table(sort_by="cuda_time_total",
                                               top_level_events_only=True,
                                               header='sort by cuda_time_total',
@@ -143,13 +146,13 @@ def test_main(args):
                                               top_level_events_only=True,
                                               header='sort by cpu_time_total',
                                               **config))
-        prof.export_stacks(f"{schedule_cls.__name__}-profile-fg.txt",
-                           "self_cuda_time_total")
+        # prof.export_stacks(f"{schedule_cls.__name__}-profile-fg.txt",
+        #                    "self_cuda_time_total")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--micro-batch-size', type=int, default=128)
-    parser.add_argument('--num-chunks', type=int, default=4)
+    parser.add_argument('--micro-batch-size', type=int, default=32)
+    parser.add_argument('--num-chunks', type=int, default=16)
     parser.add_argument('--schedule',
                         type=str,
                         default='gpipe',
