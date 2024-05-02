@@ -120,7 +120,7 @@ def test_main(args):
         time_sum = time.time() - time_start
         if rank == 0:
             print(f"Finish in {time_sum:.3f} seconds")
-    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
+    with open(f'./log/res-{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
         )

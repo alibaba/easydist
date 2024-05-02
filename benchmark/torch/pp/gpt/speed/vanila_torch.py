@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# python benchmark/torch/pp/gpt/speed/torchgpipe_pipeline.py
+# python benchmark/torch/pp/gpt/speed/vanila_torch.py
 import argparse
 from contextlib import nullcontext
 import os
@@ -25,7 +25,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from torchgpipe import GPipe
 from torchvision import datasets, transforms
 from torch.distributed._tensor import DeviceMesh
 from tqdm import tqdm
@@ -73,14 +72,9 @@ def test_main(args):
     module = SequentialLowCommGPT(depth=case.num_layers,
                            dim=case.hidden_dim,
                            num_heads=case.num_heads,
-                           comm_dim=comm_dim)
+                           comm_dim=comm_dim).to(in_device)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
-    module = cast(torch.nn.Sequential, module)
-    module = GPipe(module, [4, 4, 4, 4],
-                   devices=devices,
-                   chunks=num_chunks,
-                   checkpoint='never')
     def train_step(input, model, opt):
         out = model(input).mean()
         out.backward()
@@ -114,7 +108,7 @@ def test_main(args):
         time_sum = time.time() - time_start
         print(f"Finish in {time_sum:.3f} seconds")
         print(f"Max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.0f}MB")
-    with open(f'./log/gpt-torchgpipe-test.txt', 'a') as f:
+    with open(f'./log/gpt-vanila.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:5.0f}MB\n'
         )
@@ -141,12 +135,8 @@ def test_main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset-size', type=int, default=1000)
-    parser.add_argument('--micro-batch-size', type=int, default=32)
-    parser.add_argument('--num-chunks', type=int, default=16)
-    parser.add_argument('--schedule',
-                        type=str,
-                        default='gpipe',
-                        choices=['gpipe', 'dapple'])
+    parser.add_argument('--micro-batch-size', type=int, default=16)
+    parser.add_argument('--num-chunks', type=int, default=1)
     parser.add_argument('--do-profile', action='store_true', default=False)
     args = parser.parse_args()
     test_main(args)

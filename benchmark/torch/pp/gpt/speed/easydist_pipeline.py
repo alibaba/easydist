@@ -59,6 +59,7 @@ criterion = torch.nn.CrossEntropyLoss()
 
 
 def test_main(args):
+    dataset_size = args.dataset_size
     per_chunk_sz = args.micro_batch_size
     num_chunks = args.num_chunks
     batch_size = per_chunk_sz * num_chunks
@@ -96,7 +97,6 @@ def test_main(args):
         opt.zero_grad()
         return out
 
-    dataset_size = 10000
     train_dataloader = [
         torch.ones(batch_size, case.seq_size, comm_dim)
     ] * (dataset_size // batch_size)
@@ -125,7 +125,7 @@ def test_main(args):
         if rank == 0:
             print(f"Finish in {time_sum:.3f} seconds")
             print(f"Max memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:.0f}MB")
-    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
+    with open(f'./log/gpt-{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
         )
@@ -151,6 +151,7 @@ def test_main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset-size', type=int, default=1000)
     parser.add_argument('--micro-batch-size', type=int, default=32)
     parser.add_argument('--num-chunks', type=int, default=16)
     parser.add_argument('--schedule',
