@@ -19,7 +19,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.fx as fx
@@ -35,7 +35,7 @@ from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz
 from easydist.torch.passes.sharding import all_gather_end, all_gather_start, all_reduce_end, all_reduce_start, all_to_all_end, all_to_all_start, reduce_scatter_end, reduce_scatter_start, scatter_wrapper, reduce_map
 from easydist.utils import rgetattr, rsetattr
 from easydist.torch.utils import _rematerialize_optimizer, to_torch_spmd
-from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params_states, set_step_flag, fw_bw_split_func, before_bw_split_func, step_split_func
+from easydist.torch.experimental.pp.split_utils import list_before_split, list_after_split, set_updated_params_states, set_step_flag, split_func_with_bw, split_func_without_bw, split_func_optimizier_step
 
 from torch.nn.utils import stateless
 
@@ -220,7 +220,7 @@ def _split_on_size_threshold_with_max_stages(
         def wrapped_func(*args, **kwargs):
             ret = target_func(*args, **kwargs)
             ret = _to_tuple(ret)
-            ret = fw_bw_split_func(*ret)
+            ret = split_func_with_bw(*ret)
             return ret[0] if len(ret) == 1 else ret
 
         return wrapped_func
@@ -529,7 +529,7 @@ class CompiledStage:
         state_dict.update(self.named_buffers())
         return state_dict
 
-    def _load_params(self, state_dict):
+    def _load_params(self, state_dict):  # TODO @botbw: better way of doing this
         to_pop = []
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.params_nodes_unflatten[torch_name]
@@ -542,7 +542,7 @@ class CompiledStage:
         for torch_name in to_pop:
             state_dict.pop(torch_name)
 
-    def _load_buffers(self, state_dict):
+    def _load_buffers(self, state_dict):  # TODO @botbw: better way of doing this
         to_pop = []
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.buffers_nodes_unflatten[torch_name]
@@ -555,14 +555,14 @@ class CompiledStage:
         for torch_name in to_pop:
             state_dict.pop(torch_name)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=True):  # TODO @botbw: better way of doing this
         self._load_params(state_dict)
         self._load_buffers(state_dict)
         if strict:
             if len(state_dict) != 0:
                 raise RuntimeError(f"state_dict has unexpected keys {state_dict.keys()}")
 
-    def load_optimizer_state_dict(self, state_dict):
+    def load_optimizer_state_dict(self, state_dict):  # TODO @botbw: better way of doing this
         for torch_name, typ_dict in state_dict.items():
             for typ, tensor in typ_dict.items():
                 node_name = self.compiled_meta.optimstates_nodes_unflatten[torch_name][typ]
@@ -573,7 +573,7 @@ class CompiledStage:
                 self.step_gm.injected_states[StateType.OPTIMSTATES][node_name] = tensor
         # TODO: pop states after loading
 
-    def named_parameters(self):  # TODO @botbw: is it okay to gather one by one?
+    def named_parameters(self):  # TODO @botbw: better way of doing this
         if self.compiled_meta.params_strategies:
             params = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items():
@@ -589,7 +589,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()
             }
 
-    def named_buffers(self):  # TODO @botbw: is it okay to gather one by one?
+    def named_buffers(self):  # TODO @botbw: better way of doing this
         if self.compiled_meta.buffers_strategies:
             buffers = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items():
@@ -605,7 +605,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()
             }
 
-    def optimizer_state_dict(self):  # TODO @botbw: is it okay to gather one by one?
+    def optimizer_state_dict(self):  # TODO @botbw: better way of doing this
         optim_state = defaultdict(dict)
         if self.compiled_meta.optimstates_strategies:
             for name, state in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
@@ -634,9 +634,13 @@ class SplitPatcher(_Patcher):
 
         orig_backward = torch.Tensor.backward
 
-        def backward_wrapper(loss, *args, **kwargs):
-            loss = before_bw_split_func(loss)
-            orig_backward(loss, *args, **kwargs)
+        def backward_wrapper(self, gradient=None, retain_graph: bool=None, create_graph: bool=False, inputs: Optional[Sequence[torch.Tensor]]=None):
+            tensor_list = [self] + (inputs or [])
+            tensor_list = split_func_without_bw(tensor_list)
+            self, inputs = tensor_list[0], tensor_list[1:]
+            if len(inputs) == 0:
+                inputs = None
+            orig_backward(self, gradient, retain_graph, create_graph, inputs)
             set_backward_flag(True)
 
         patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
@@ -667,7 +671,7 @@ class SplitPatcher(_Patcher):
 
                 ctx = {}
                 states = list_before_split(ctx, states)
-                states = step_split_func(states)
+                states = split_func_optimizier_step(states)
                 states = list_after_split(ctx, states)
                 params, split_grads, named_states = pytree.tree_unflatten(states, spec)
 
@@ -841,16 +845,16 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                         kwargs[kwarg_name] = kwarg
 
                 if len(args) != len(node.args) or len(kwargs) != len(node.kwargs):
-                    assert not any(
+                    assert (not any(
                         isinstance(arg, torch.fx.Node) for arg in
-                        args), "This node shall be completed removed since it has no tensor args"
-                    assert not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values(
-                    )), "This node shall be completed removed since it has no tensor kwargs"
+                        args)) and  (not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values(
+                    ))), "This node shall be completed removed since it has no tensor args and kwargs"
                 else:
                     env[node.name] = new_graph.create_node(op='call_function',
                                                            name=node.name,
                                                            target=node.target,
-                                                           args=tuple(args))
+                                                           args=tuple(args),
+                                                           kwargs=kwargs)
         elif node.op == 'output':
             for output in node.args[0]:  # output is a tuple (node.args[0])
                 if output.name in env:
@@ -1083,6 +1087,8 @@ def compile_pipeline(
         return EDGraphModule(submod, SubmodType.STEP, inputs_spec, injected_states, outputs_spec,
                              call_module_users, 'step')
 
+    name_to_stage_idx = {}
+
     # meta data
     compiled_meta = CompiledMeta(
         nstages=nstages,
@@ -1108,7 +1114,7 @@ def compile_pipeline(
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
         output2input_optimstates=output2input_optimstates,
-        node_to_stage_idx=None,  # this need to be filled later
+        node_to_stage_idx=name_to_stage_idx,  # this need to be filled later
         params_strategies=params_strategies,
         buffers_strategies=buffers_strategies,
         optimstates_strategies=optimstates_strategies,
@@ -1190,7 +1196,6 @@ def compile_pipeline(
     g = fx.Graph()
     env = {}
     submod_idx = 0
-    name_to_stage_idx = {}  # TODO @botbw: move this to constructor
     all_states_names_flatten = set(
         pytree.tree_flatten(
             [params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten])[0])

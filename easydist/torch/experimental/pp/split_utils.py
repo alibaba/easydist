@@ -81,7 +81,7 @@ class FWBWSplitFunc(torch.autograd.Function):
         return tuple(torch.ops.easydist.fw_bw_split(grads))
 
 
-def fw_bw_split_func(tensor_list: op_param_type) -> op_ret_type:
+def split_func_with_bw(tensor_list: op_param_type) -> op_ret_type:
     assert not get_backward_flag() or all(
         t.requires_grad for t in tensor_list
     ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
@@ -91,20 +91,21 @@ def fw_bw_split_func(tensor_list: op_param_type) -> op_ret_type:
 class BeforeBWSplitFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, tensor):  # tensors must be passed as args
-        return torch.ops.easydist.fw_bw_split([tensor
-                                               ])[0]  # return must be tensor of tuple of tensors
+    def forward(ctx, *tensor_tuple):  # tensors must be passed as args
+        tensor_list = list(tensor_tuple)  # custom op requires list
+        return tuple(torch.ops.easydist.fw_bw_split(
+            tensor_list))  # return must be tensor of tuple of tensors
 
     @staticmethod
     def backward(ctx, grad):
         return grad  # return must be tensor of tuple of tensors
 
 
-def before_bw_split_func(tensor: torch.Tensor) -> torch.Tensor:
-    assert not get_backward_flag(
-    ) or tensor.requires_grad, "Only split on tensors that need grad, otherwise backward pass won't be tracked"
-    ret = BeforeBWSplitFunc.apply(tensor)
-    return ret
+def split_func_without_bw(tensor_list: op_param_type) -> op_ret_type:
+    assert not get_backward_flag() or all(
+        t.requires_grad for t in tensor_list
+    ), "Only split on tensors that need grad, otherwise backward pass won't be tracked"
+    return BeforeBWSplitFunc.apply(*tensor_list)
 
 
 @torch._custom_ops.custom_op("easydist::step_split")
@@ -138,7 +139,7 @@ class StepSplit(torch.autograd.Function):
         return grads  # return must be tensor of tuple of tensors
 
 
-def step_split_func(tensor_list: op_param_type) -> op_ret_type:
+def split_func_optimizier_step(tensor_list: op_param_type) -> op_ret_type:
     ret = StepSplit.apply(*tensor_list)
     return ret
 
@@ -223,7 +224,7 @@ def split(ret):
     cls_ret = type(ret)
     ctx = {}
     tensor_tuple: Tuple[torch.Tensor] = get_registered_by_mro(_before_split, cls_ret)(ctx, ret)
-    tensor_tuple_after_split: Tuple[torch.Tensor] = fw_bw_split_func(tensor_tuple)
+    tensor_tuple_after_split: Tuple[torch.Tensor] = split_func_with_bw(tensor_tuple)
     ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
 
@@ -278,16 +279,16 @@ def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[tor
 if __name__ == '__main__':
     a = torch.rand(10, 10, requires_grad=True)
     b = torch.rand(3, 10, 10, requires_grad=True)
-    res = fw_bw_split_func([a, b])
+    res = split_func_with_bw([a, b])
     print(res[0].requires_grad, res[1].requires_grad)
     (res[0].mean() + res[1].mean()).backward()
 
     a = torch.rand(10, 10, requires_grad=True)
-    res = before_bw_split_func(a)
+    res = split_func_without_bw(a)
     print(res.requires_grad)
     res.mean().backward()
 
     a = torch.rand(10, 10, requires_grad=True)
-    res = step_split_func([a])[0]
+    res = split_func_optimizier_step([a])[0]
     print(res.requires_grad)
     res.mean().backward()

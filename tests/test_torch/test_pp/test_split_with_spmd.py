@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# torchrun --nproc_per_node=2 tests/test_torch/test_pp/test_split.py
+# torchrun --nproc_per_node=2 tests/test_torch/test_pp/test_split_with_spmd.py
 import logging
 import os
 import random
