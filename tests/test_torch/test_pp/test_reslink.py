@@ -32,9 +32,10 @@ from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
-from easydist.torch.experimental.pp.compile_pipeline import (
-    annotate_split_points, split_into_equal_size)
+from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
+                                                             split_into_equal_size)
 from torch.profiler import profile, ProfilerActivity
+
 
 class Foo(torch.nn.Module):
 
@@ -69,7 +70,6 @@ def seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-
 def test_main(args):
     per_chunk_sz = args.micro_batch_size
     num_chunks = args.num_chunks
@@ -88,15 +88,14 @@ def test_main(args):
     module = Foo().train().to(device)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
-    annotate_split_points(
-        module, {'layer0', 'layer1', 'layer2'})
+    annotate_split_points(module, {'layer0', 'layer1', 'layer2'})
 
     @easydist_compile(parallel_mode="pp",
                       tracing_mode="fake",
                       cuda_graph=False,
                       schedule_cls=schedule_cls,
                       num_chunks=num_chunks,
-                      all_gather_output=False)
+                      return_to_all_stages=False)
     def train_step(input, label, model, opt):
         out = model(input)
         loss = out.mean()
@@ -106,25 +105,26 @@ def test_main(args):
         return out, loss
 
     dataset_size = 10000
-    train_dataloader = [(torch.randn(batch_size, 1024, device=device),
-                         torch.randint(0, 10, (batch_size, ), device=device))
+    train_dataloader = [(torch.randn(
+        batch_size, 1024, device=device), torch.randint(0, 10, (batch_size, ), device=device))
                         ] * (dataset_size // batch_size)
 
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch, y_batch, module, opt)  # compile
     epochs = 1
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 with_stack=True,
-                #  experimental_config=torch._C._profiler._ExperimentalConfig(
-                #      verbose=True),
-                 on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/res-{schedule_cls.__name__}-{rank}')
-                 ) if do_profile else nullcontext() as prof:
+    with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            with_stack=True,
+            #  experimental_config=torch._C._profiler._ExperimentalConfig(
+            #      verbose=True),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                f'./log/res-{schedule_cls.__name__}-{rank}')) if do_profile else nullcontext(
+                ) as prof:
         time_start = time.time()
         torch.cuda.synchronize()
         for _ in range(epochs):
-            for x_batch, y_batch in tqdm(
-                    train_dataloader,
-                    dynamic_ncols=True) if rank == 0 else train_dataloader:
+            for x_batch, y_batch in tqdm(train_dataloader,
+                                         dynamic_ncols=True) if rank == 0 else train_dataloader:
                 if x_batch.size(0) != batch_size:  # TODO need to solve this
                     continue
                 _ = train_step(x_batch, y_batch, module, opt)
@@ -161,10 +161,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--micro-batch-size', type=int, default=128)
     parser.add_argument('--num-chunks', type=int, default=4)
-    parser.add_argument('--schedule',
-                        type=str,
-                        default='gpipe',
-                        choices=['gpipe', 'dapple'])
+    parser.add_argument('--schedule', type=str, default='gpipe', choices=['gpipe', 'dapple'])
     parser.add_argument('--do-profile', action='store_true', default=False)
     args = parser.parse_args()
     test_main(args)

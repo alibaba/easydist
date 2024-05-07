@@ -34,8 +34,8 @@ from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
-from easydist.torch.experimental.pp.compile_pipeline import (
-    annotate_split_points, split_into_equal_size)
+from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
+                                                             split_into_equal_size)
 from torch.profiler import profile, ProfilerActivity
 
 
@@ -74,12 +74,16 @@ def test_main(args):
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
-    case = GPTCase(num_layers=16, hidden_dim=1024, num_heads=1, seq_size=128, batch_size=batch_size)
-    comm_dim=1
+    case = GPTCase(num_layers=16,
+                   hidden_dim=1024,
+                   num_heads=1,
+                   seq_size=128,
+                   batch_size=batch_size)
+    comm_dim = 1
     module = SequentialLowCommGPT(depth=case.num_layers,
-                           dim=case.hidden_dim,
-                           num_heads=case.num_heads,
-                           comm_dim=comm_dim)
+                                  dim=case.hidden_dim,
+                                  num_heads=case.num_heads,
+                                  comm_dim=comm_dim)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
     annotate_split_points(module, {'block3', 'block7', 'block11'})
@@ -98,25 +102,25 @@ def test_main(args):
         opt.zero_grad()
         return out
 
-    train_dataloader = [
-        torch.ones(batch_size, case.seq_size, comm_dim)
-    ] * (dataset_size // batch_size)
+    train_dataloader = [torch.ones(batch_size, case.seq_size, comm_dim)
+                        ] * (dataset_size // batch_size)
 
     x_batch = next(iter(train_dataloader))
     train_step(x_batch, module, opt)  # compile
     epochs = 1
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 with_stack=True,
-                #  experimental_config=torch._C._profiler._ExperimentalConfig(
-                #      verbose=True),
-                 on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/gpt-{schedule_cls.__name__}-{rank}')
-                 ) if do_profile else nullcontext() as prof:
+    with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            with_stack=True,
+            #  experimental_config=torch._C._profiler._ExperimentalConfig(
+            #      verbose=True),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                f'./log/gpt-{schedule_cls.__name__}-{rank}')) if do_profile else nullcontext(
+                ) as prof:
         time_start = time.time()
         torch.cuda.synchronize()
         for _ in range(epochs):
-            for x_batch in tqdm(
-                    train_dataloader,
-                    dynamic_ncols=True) if rank == 0 else train_dataloader:
+            for x_batch in tqdm(train_dataloader,
+                                dynamic_ncols=True) if rank == 0 else train_dataloader:
                 x_batch = x_batch.to(device)
                 if x_batch.size(0) != batch_size:  # TODO need to solve this
                     continue
@@ -150,15 +154,13 @@ def test_main(args):
         # prof.export_stacks(f"{schedule_cls.__name__}-profile-fg.txt",
         #                    "self_cuda_time_total")
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset-size', type=int, default=1000)
     parser.add_argument('--micro-batch-size', type=int, default=32)
     parser.add_argument('--num-chunks', type=int, default=16)
-    parser.add_argument('--schedule',
-                        type=str,
-                        default='gpipe',
-                        choices=['gpipe', 'dapple'])
+    parser.add_argument('--schedule', type=str, default='gpipe', choices=['gpipe', 'dapple'])
     parser.add_argument('--do-profile', action='store_true', default=False)
     args = parser.parse_args()
     test_main(args)

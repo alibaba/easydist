@@ -27,7 +27,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm
 
 
-
 def seed(seed=42):
     # Set seed for PyTorch
     torch.manual_seed(seed)
@@ -64,14 +63,12 @@ def test_main():
     module = resnet101().train().to(device)
     module.fc = torch.nn.Linear(2048, 10).to(device)
 
-
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
     dataset_size = 10000
     batch_size = 128
-    train_dataloader = [
-        (torch.randn(batch_size, 3, 224, 224), torch.randint(0, 10, (batch_size,)))
-    ] * (dataset_size // batch_size)
+    train_dataloader = [(torch.randn(batch_size, 3, 224, 224), torch.randint(
+        0, 10, (batch_size, )))] * (dataset_size // batch_size)
 
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt)
@@ -92,8 +89,8 @@ def test_main():
     print(
         f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
         f'time: {time.time() - time_start}'
-        f'max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024}mb'
-    )
+        f'max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024}mb')
+
 
 if __name__ == '__main__':
     test_main()

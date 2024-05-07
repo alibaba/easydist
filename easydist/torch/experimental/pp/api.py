@@ -11,7 +11,9 @@ from torch.fx.experimental.proxy_tensor import make_fx
 import easydist.config as mdconfig
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (EDGraphModule, SplitPatcher, compile_pipeline, graph_outputs_to_func_outputs)
+from easydist.torch.experimental.pp.compile_pipeline import (EDGraphModule, SplitPatcher,
+                                                             compile_pipeline,
+                                                             graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
@@ -136,13 +138,13 @@ def _compile_pp(func,
 
     with _enable_compile(), SplitPatcher(module, opt):
         traced_stateless_func = make_fx(partial(stateless_func, func),
-                                           tracing_mode=tracing_mode,
-                                           decomposition_table=EASYDIST_DECOMP_TABLE,
-                                           _allow_non_fake_inputs=False)(params, buffers,
-                                                                         named_states,
-                                                                         args_split[0],
-                                                                         kwargs_split[0])
-    assert len(list(traced_stateless_func.named_buffers())) == 0, "Make sure there is no tensor created in the forward function"
+                                        tracing_mode=tracing_mode,
+                                        decomposition_table=EASYDIST_DECOMP_TABLE,
+                                        _allow_non_fake_inputs=False)(params, buffers,
+                                                                      named_states, args_split[0],
+                                                                      kwargs_split[0])
+    assert len(list(traced_stateless_func.named_buffers())
+               ) == 0, "Make sure there is no tensor created in the forward function"
     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func_node_metas = {
         node.name: node.meta
@@ -153,9 +155,10 @@ def _compile_pp(func,
     if local:
         assert num_chunks == 1, "num_chunks should be 1 in local mode"
         compiled_meta, compiled_stages, local_gm, _ = compile_pipeline(traced_stateless_func,
-                                                            local_pp_stage_cnt,
-                                                            stateless_func_args,
-                                                            strict=strict)
+                                                                       local_pp_stage_cnt,
+                                                                       stateless_func_args,
+                                                                       strict=strict)
+
         class EDCompiledFunc:
 
             def __init__(self, graph) -> None:
@@ -167,19 +170,20 @@ def _compile_pp(func,
                 for stage in compiled_stages:
                     returns.update({
                         node_name: val
-                        for node_name, val in stage.outputs.items() if node_name in stage.compiled_meta.returns_nodes_flatten
+                        for node_name, val in stage.outputs.items()
+                        if node_name in stage.compiled_meta.returns_nodes_flatten
                     })
                 ret = graph_outputs_to_func_outputs(stage.compiled_meta, returns, strict=False)[-1]
                 return ret
 
-            
             def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
                 graph(*args, **kwargs)
                 returns = {}
                 for stage in compiled_stages:
                     returns.update({
                         node_name: val
-                        for node_name, val in stage.outputs.items() if node_name in stage.compiled_meta.returns_nodes_flatten
+                        for node_name, val in stage.outputs.items()
+                        if node_name in stage.compiled_meta.returns_nodes_flatten
                     })
                 ret = graph_outputs_to_func_outputs(stage.compiled_meta, returns, strict=False)[-1]
                 return ret
@@ -187,9 +191,9 @@ def _compile_pp(func,
         return EDCompiledFunc(local_gm)
 
     compiled_meta, compiled_stages, local_gm, _ = compile_pipeline(traced_stateless_func,
-                                                                world_size,
-                                                                stateless_func_args,
-                                                                strict=strict)
+                                                                   world_size,
+                                                                   stateless_func_args,
+                                                                   strict=strict)
 
     # materialize stage and move states to device
     device = torch.device(f"cuda:{rank}")
@@ -203,22 +207,20 @@ def _compile_pp(func,
                     gm.injected_states[state_type][name] = state.to(device)
 
     save_graphviz_dot(local_gm, "local_gm")
-    pipe = PipelineStage(
-        schedule_cls=schedule_cls,
-        local_gm=local_gm,
-        compiled_meta=compiled_meta,
-        stage_idx=rank,
-        compiled_stage=compiled_stage,
-        node_metas=traced_stateless_func_node_metas,
-        num_chunks=num_chunks,
-        args_chunk_spec=args_chunk_spec,
-        kwargs_chunk_spec=kwargs_chunk_spec,
-        returns_chunk_spec=outputs_chunk_spec,
-        pp_group=None,
-        device=device,
-        sharded_graph=traced_stateless_func,
-        return_to_all_stages=return_to_all_stages,
-        accumulate_grads_inplace=accumulate_grads_inplace
-    )
+    pipe = PipelineStage(schedule_cls=schedule_cls,
+                         local_gm=local_gm,
+                         compiled_meta=compiled_meta,
+                         stage_idx=rank,
+                         compiled_stage=compiled_stage,
+                         node_metas=traced_stateless_func_node_metas,
+                         num_chunks=num_chunks,
+                         args_chunk_spec=args_chunk_spec,
+                         kwargs_chunk_spec=kwargs_chunk_spec,
+                         returns_chunk_spec=outputs_chunk_spec,
+                         pp_group=None,
+                         device=device,
+                         sharded_graph=traced_stateless_func,
+                         return_to_all_stages=return_to_all_stages,
+                         accumulate_grads_inplace=accumulate_grads_inplace)
 
     return pipe

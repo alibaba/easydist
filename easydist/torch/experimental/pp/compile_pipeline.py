@@ -336,8 +336,8 @@ class CompiledStage:
         self.fw_func_args = set(fw_gm.inputs_spec) - params_and_buffers  # args for self.forward
         self.fw_func_returns = set(
             output for output, users in self.fw_gm.call_module_users.items()
-            if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name))
-        )  # not just used by bw, need to pass to next stage
+            if not (len(users) == 1 and (bw_gm is not None and next(iter(users)) == bw_gm.name)
+                    ))  # not just used by bw, need to pass to next stage
 
         if bw_gm is not None:
             self.bw_gm = bw_gm
@@ -634,7 +634,11 @@ class SplitPatcher(_Patcher):
 
         orig_backward = torch.Tensor.backward
 
-        def backward_wrapper(self, gradient=None, retain_graph: bool=None, create_graph: bool=False, inputs: Optional[Sequence[torch.Tensor]]=None):
+        def backward_wrapper(self,
+                             gradient=None,
+                             retain_graph: bool = None,
+                             create_graph: bool = False,
+                             inputs: Optional[Sequence[torch.Tensor]] = None):
             tensor_list = [self] + (inputs or [])
             tensor_list = split_func_without_bw(tensor_list)
             self, inputs = tensor_list[0], tensor_list[1:]
@@ -845,10 +849,9 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
                         kwargs[kwarg_name] = kwarg
 
                 if len(args) != len(node.args) or len(kwargs) != len(node.kwargs):
-                    assert (not any(
-                        isinstance(arg, torch.fx.Node) for arg in
-                        args)) and  (not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values(
-                    ))), "This node shall be completed removed since it has no tensor args and kwargs"
+                    assert (not any(isinstance(arg, torch.fx.Node) for arg in args)) and (
+                        not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values())
+                    ), "This node shall be completed removed since it has no tensor args and kwargs"
                 else:
                     env[node.name] = new_graph.create_node(op='call_function',
                                                            name=node.name,
@@ -1246,7 +1249,7 @@ def compile_pipeline(
         for stage in compiled_stages:
             outputs.update(stage.outputs)
         return graph_outputs_to_func_outputs(compiled_meta, outputs, strict=True)
-   
+
     g.output(g.call_function(gather_outputs))
 
     def eliminate_dead_node():

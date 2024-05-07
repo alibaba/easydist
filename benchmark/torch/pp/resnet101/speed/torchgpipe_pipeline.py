@@ -81,8 +81,8 @@ def test_main(args):
 
     dataset_size = 10000
     train_dataloader = [
-        (torch.randn(batch_size, 3, 224, 224, device=in_device),
-         torch.randint(0, 10, (batch_size, ), device=out_device))
+        (torch.randn(batch_size, 3, 224, 224,
+                     device=in_device), torch.randint(0, 10, (batch_size, ), device=out_device))
     ] * (dataset_size // batch_size)
 
     x_batch, y_batch = next(iter(train_dataloader))
@@ -90,10 +90,9 @@ def test_main(args):
     epochs = 1
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                  with_stack=True,
-                 experimental_config=torch._C._profiler._ExperimentalConfig(
-                     verbose=True),
-                     on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/res-torchgpipe')
-                     ) if do_profile else nullcontext() as prof:
+                 experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
+                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                     f'./log/res-torchgpipe')) if do_profile else nullcontext() as prof:
         time_start = time.time()
         torch.cuda.synchronize(in_device)
         for epoch in range(epochs):

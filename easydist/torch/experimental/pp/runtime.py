@@ -37,6 +37,7 @@ from easydist.torch.init_helper import materialize_zero
 
 logger = logging.getLogger(__name__)
 
+
 def maybe_batch_isend_irecv(p2p_op_list):
     '''
     note: this might lead to hang when the first collective call in the group
@@ -46,43 +47,41 @@ def maybe_batch_isend_irecv(p2p_op_list):
         return []
     return dist.batch_isend_irecv(p2p_op_list)
 
+
 class Placeholder:
+
     def __init__(self, input_name: str):
         self.input_name = input_name
 
     def __repr__(self):
         return f"{type(self).__class__}({self.input_name})"
 
+
 class StageKwargPlaceholder(Placeholder):
 
     def __init__(self, input_name: str):
         super().__init__(input_name)
 
+
 class RecevPlaceholder(Placeholder):
 
-    def __init__(self, input_name: str, source: int, example_tensor: FakeTensor, device: torch.device):
+    def __init__(self, input_name: str, source: int, example_tensor: FakeTensor,
+                 device: torch.device):
         super().__init__(input_name)
         self.source = source
         self.buffer = materialize_zero(example_tensor, device)
 
+
 class PipelineStage:
 
-    def __init__(self,
-                 schedule_cls: Type['Schedule'],
-                 local_gm: fx.GraphModule,
-                 stage_idx: int,
-                 compiled_meta: CompiledMeta,
-                 compiled_stage: CompiledStage,
-                 node_metas: Dict[str, Dict[str, FakeTensor]],
-                 num_chunks: int,
+    def __init__(self, schedule_cls: Type['Schedule'], local_gm: fx.GraphModule, stage_idx: int,
+                 compiled_meta: CompiledMeta, compiled_stage: CompiledStage,
+                 node_metas: Dict[str, Dict[str, FakeTensor]], num_chunks: int,
                  args_chunk_spec: Optional[Tuple[TensorChunkSpec]],
                  kwargs_chunk_spec: Optional[Dict[str, TensorChunkSpec]],
                  returns_chunk_spec: Optional[Tuple[Union[TensorChunkSpec, CustomReducer]]],
-                 device: torch.device,
-                 pp_group: dist.ProcessGroup,
-                 sharded_graph: fx.GraphModule,
-                 return_to_all_stages: bool,
-                 accumulate_grads_inplace: bool):
+                 device: torch.device, pp_group: dist.ProcessGroup, sharded_graph: fx.GraphModule,
+                 return_to_all_stages: bool, accumulate_grads_inplace: bool):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
@@ -117,7 +116,6 @@ class PipelineStage:
         # post init here (schedule_cls requires PipelineStage initialized)
         self.schedule = schedule_cls(self)
 
-
     def _init_fw_bw_step_nodes(self, local_gm):
         # Find stage forward node in graph
         self.fw_node = None
@@ -143,7 +141,7 @@ class PipelineStage:
                 self.step_node = node
 
     def _init_inputs_nodes_spec(self, compiled_meta: CompiledMeta, args_chunk_spec,
-                               kwargs_chunk_spec):
+                                kwargs_chunk_spec):
         node_val_chunk_spec = {}
         args_nodes_flatten, _ = pytree.tree_flatten(compiled_meta.args_nodes_unflatten)
         args_chunk_spec = args_chunk_spec or [None] * len(
@@ -194,11 +192,15 @@ class PipelineStage:
         self.stage_index_to_group_rank = stage_index_to_pp_rank
 
         # chunk : Dict of kwarg buffers
-        self.fw_kwargs_recv_info = self._create_recv_info(node_metas, self.fw_node, is_forward=True)
+        self.fw_kwargs_recv_info = self._create_recv_info(node_metas,
+                                                          self.fw_node,
+                                                          is_forward=True)
         self.fw_act_send_info = self._create_send_info(self.fw_node, is_forward=True)
 
         if self.bw_node is not None:
-            self.bw_kwargs_recv_info = self._create_recv_info(node_metas, self.bw_node, is_forward=False)
+            self.bw_kwargs_recv_info = self._create_recv_info(node_metas,
+                                                              self.bw_node,
+                                                              is_forward=False)
             self.bw_grad_send_info = self._create_send_info(self.bw_node, is_forward=False)
 
     def _init_batch_isend_irecv(self):
@@ -216,10 +218,12 @@ class PipelineStage:
         '''
         torch.cuda.set_device(self.device)
         succeesor = self.stage_index_to_group_rank[(self.stage_idx + 1) % self.num_stages]
-        succeesor_global = succeesor if self.pp_group is None else dist.get_global_rank(self.pp_group, succeesor)
+        succeesor_global = succeesor if self.pp_group is None else dist.get_global_rank(
+            self.pp_group, succeesor)
         succeesor_recv = torch.zeros(1, device=self.device)
         ancessor = self.stage_index_to_group_rank[(self.stage_idx - 1) % self.num_stages]
-        ancessor_global = ancessor if self.pp_group is None else dist.get_global_rank(self.pp_group, ancessor)
+        ancessor_global = ancessor if self.pp_group is None else dist.get_global_rank(
+            self.pp_group, ancessor)
         ancessor_recv = torch.zeros(1, device=self.device)
         send_tensor = torch.zeros(1, device=self.device) + self.stage_idx
         ops = [
@@ -247,7 +251,8 @@ class PipelineStage:
         if self.accumulate_grads_inplace:
             self.grads = {}
 
-    def _create_send_info(self, node: fx.Node, is_forward: bool) -> Dict[int, List[str]]:  # TODO @botbw: simplify
+    def _create_send_info(self, node: fx.Node,
+                          is_forward: bool) -> Dict[int, List[str]]:  # TODO @botbw: simplify
         to_sort = []
         for user in node.users:
             assert user.target is operator.getitem, "Output must be a dict"
@@ -257,9 +262,11 @@ class PipelineStage:
                 dst_rank = self.node_to_stage_idx[gi_user.name]
                 to_sort.append((dst_rank, out_str))
         if is_forward:
-            to_sort.sort(key=lambda x: (x[0], x[1]))  # send lower to rank first and in alphabetical order
+            to_sort.sort(key=lambda x:
+                         (x[0], x[1]))  # send lower to rank first and in alphabetical order
         else:
-            to_sort.sort(key=lambda x: (-x[0], x[1])) # send higher to rank first and in alphabetical order
+            to_sort.sort(key=lambda x:
+                         (-x[0], x[1]))  # send higher to rank first and in alphabetical order
 
         send_info_by_stage = defaultdict(list)
         for dst_rank, out_str in to_sort:
@@ -267,15 +274,18 @@ class PipelineStage:
 
         return send_info_by_stage
 
-    def _create_send_ops(self, send_info: Dict[int, List[str]], output_dict: Dict[str, torch.Tensor]):
+    def _create_send_ops(self, send_info: Dict[int, List[str]], output_dict: Dict[str,
+                                                                                  torch.Tensor]):
         # Send requests of a chunk
         send_ops_by_dst = defaultdict(list)
         for dst, nodes in send_info.items():
             peer_rank = self.stage_index_to_group_rank[dst]
-            peer_global_rank = peer_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, peer_rank)
+            peer_global_rank = peer_rank if self.pp_group is None else dist.get_global_rank(
+                self.pp_group, peer_rank)
             for node in nodes:
                 val = output_dict[node]
-                send_ops_by_dst[dst].append(dist.P2POp(dist.isend, val, peer_global_rank, self.pp_group))
+                send_ops_by_dst[dst].append(
+                    dist.P2POp(dist.isend, val, peer_global_rank, self.pp_group))
 
         return [send_ops_by_dst[dst] for dst in sorted(send_info.keys())]
 
@@ -292,7 +302,8 @@ class PipelineStage:
                 continue
             example_value = node_metas[node.name]["val"]
             src_rank = self.node_to_stage_idx[node.name]
-            global_src_rank = src_rank if self.pp_group is None else dist.get_global_rank(self.pp_group, src_rank)
+            global_src_rank = src_rank if self.pp_group is None else dist.get_global_rank(
+                self.pp_group, src_rank)
             to_sort.append((global_src_rank, node.name, example_value))
 
         if is_forward:
@@ -309,7 +320,8 @@ class PipelineStage:
                     x[1]))  # args recev with rank 0 (lowest rank)
             else:
                 global_src_rank, name, example_value = x
-                kwargs_recv_info[global_src_rank].append(RecevPlaceholder(name, global_src_rank, example_value, self.device))
+                kwargs_recv_info[global_src_rank].append(
+                    RecevPlaceholder(name, global_src_rank, example_value, self.device))
 
         return kwargs_recv_info
 
@@ -351,16 +363,15 @@ class PipelineStage:
                 req.wait()
         return recv_reqs
 
-
     def forward_compute_one_chunk(self):
         # Collect activations and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.fw_kwargs_recv_info,
-                                                            self.cur_fw_chunk_id)
+                                                     self.cur_fw_chunk_id)
 
         # Compute forward
-        self.cur_fw_send_chunk = self.compiled_stage.forward(self.activations_chunks[self.cur_fw_chunk_id],
-                                                    self.outputs_chunks[self.cur_fw_chunk_id],
-                                                    **composite_kwargs_chunk)
+        self.cur_fw_send_chunk = self.compiled_stage.forward(
+            self.activations_chunks[self.cur_fw_chunk_id],
+            self.outputs_chunks[self.cur_fw_chunk_id], **composite_kwargs_chunk)
         # Update runtime states
         self.cur_fw_chunk_id += 1
 
@@ -386,12 +397,12 @@ class PipelineStage:
     def backward_compute_one_chunk(self):
         # Collect grads and kwargs
         composite_kwargs_chunk = self.collect_kwargs(self.bw_kwargs_recv_info,
-                                                            self.cur_bw_chunk_id)
+                                                     self.cur_bw_chunk_id)
 
         # Compute backward
-        self.cur_bw_send_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
-                                                     self.outputs_chunks[self.cur_bw_chunk_id],
-                                                     **composite_kwargs_chunk)
+        self.cur_bw_send_chunk = self.compiled_stage.backward(
+            self.activations_chunks[self.cur_bw_chunk_id],
+            self.outputs_chunks[self.cur_bw_chunk_id], **composite_kwargs_chunk)
         if self.accumulate_grads_inplace:
             grads_nodes = dict.fromkeys(self.compiled_meta.nones_or_grads_nodes_unflatten.values())
             to_pop = []
@@ -450,7 +461,8 @@ class PipelineStage:
         params_nodes = dict.fromkeys(self.compiled_meta.output_params_nodes_unflatten.values())
         buffers_nodes = dict.fromkeys(self.compiled_meta.output_buffers_nodes_unflatten.values())
         optimstates_nodes = dict.fromkeys(self.compiled_meta.output_optimstates_nodes_flatten)
-        nones_or_grads_nodes = dict.fromkeys(self.compiled_meta.nones_or_grads_nodes_unflatten.values())
+        nones_or_grads_nodes = dict.fromkeys(
+            self.compiled_meta.nones_or_grads_nodes_unflatten.values())
         returns_names_flatten = dict.fromkeys(self.compiled_meta.returns_nodes_flatten)
 
         params, buffers, optimstates, grads, rets = {}, {}, {}, [], []
@@ -479,7 +491,6 @@ class PipelineStage:
             grads = self.grads
         else:
             grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
-
 
         self.outputs_batch.update({**params, **buffers, **optimstates, **grads, **rets})
 
@@ -575,10 +586,11 @@ class PipelineStage:
         else:
             ret = graph_outputs_to_func_outputs(self.compiled_meta,
                                                 self.outputs_batch,
-                                            strict=False)[-1]
+                                                strict=False)[-1]
         return ret
 
-    def run_with_graph(self, graph, *args, **kwargs):  # TODO @botbw: could construct a partial graph here
+    def run_with_graph(self, graph, *args,
+                       **kwargs):  # TODO @botbw: could construct a partial graph here
         return self(*args, **kwargs)
 
 

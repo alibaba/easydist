@@ -27,7 +27,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm
 
 
-
 def seed(seed=42):
     # Set seed for PyTorch
     torch.manual_seed(seed)
@@ -67,18 +66,13 @@ def test_main():
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
-p
+
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    train_data = datasets.CIFAR10('./data',
-                                  train=True,
-                                  download=True,
-                                  transform=transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=batch_size)
+    train_data = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     x_batch, y_batch = next(iter(train_dataloader))
     train_step(x_batch.to(device), y_batch.to(device), module, opt)
     epochs = 5
@@ -97,8 +91,8 @@ p
             loss_sum += loss.mean().item()
         print(
             f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt} '
-            f'time: {time.time() - time_start}'
-        )
+            f'time: {time.time() - time_start}')
+
 
 if __name__ == '__main__':
     test_main()
