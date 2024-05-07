@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+# python benchmark/torch/pp/resnet101/accuracy/vanila_torch.py
 import os
 import random
 import time
@@ -21,7 +22,7 @@ import numpy as np
 import torch
 
 from torchvision import datasets, transforms
-from torchvision.models import resnet101
+from torchvision.models import resnet18
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from tqdm import tqdm
@@ -56,16 +57,15 @@ def train_step(input, label, model, opt):
 
 
 def test_main():
-    seed(42)
+    seed(1)
 
     device = torch.device('cuda')
 
-    module = resnet101().train().to(device)
-    module.fc = torch.nn.Linear(2048, 10).to(device)
+    module = resnet18().train().to(device)
+    module.fc = torch.nn.Linear(module.fc.in_features, 10).to(device)
     batch_size = 1024
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
     transform = transforms.Compose([
         transforms.ToTensor(),

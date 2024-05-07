@@ -74,9 +74,8 @@ def test_main(args):
     _, module = split_into_equal_size(pp_size)(module)
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
-    schedule_cls = ScheduleDAPPLE
 
+    schedule_cls = ScheduleGPipe
     @easydist_compile(parallel_mode="pp",
                       tracing_mode="fake",
                       cuda_graph=False,

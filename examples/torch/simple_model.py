@@ -119,10 +119,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
             model = broadcast_module(model)
             torch.distributed.broadcast(randn_input, src=0)
 
-        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True, momentum=0.9) #, capturable=True)
+        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
 
         model_2 = copy.deepcopy(model)
-        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True, momentum=0.9) #, capturable=True)
+        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)
