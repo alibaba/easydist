@@ -1193,6 +1193,7 @@ def compile_pipeline(
                 compiled_stages.append(compiled_stage)
         current_stateful_fw_bw = None
 
+    # This graph can be used for debugging and visualization
     g = fx.Graph()
     env = {}
     submod_idx = 0
@@ -1240,7 +1241,13 @@ def compile_pipeline(
                 construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx)
             submod_idx += 1
 
-    compiled_meta.node_to_stage_idx = name_to_stage_idx  # TODO @botbw move this to constructor?
+    def gather_outputs():
+        outputs = {}
+        for stage in compiled_stages:
+            outputs.update(stage.outputs)
+        return graph_outputs_to_func_outputs(compiled_meta, outputs, strict=True)
+   
+    g.output(g.call_function(gather_outputs))
 
     def eliminate_dead_node():
         raise RuntimeError("This method should be called since the graph doesn't have output node")
