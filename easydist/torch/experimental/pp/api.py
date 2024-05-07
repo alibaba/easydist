@@ -11,7 +11,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 import easydist.config as mdconfig
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline, graph_outputs_to_func_outputs)
+from easydist.torch.experimental.pp.compile_pipeline import (EDGraphModule, SplitPatcher, compile_pipeline, graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
@@ -55,7 +55,8 @@ def _compile_pp(func,
                 kwargs_chunk_spec=None,
                 outputs_chunk_spec=None,
                 num_chunks=1,
-                all_gather_output=True,
+                return_to_all_stages=True,
+                accumulate_grads_inplace=True,
                 strict=True,
                 local=False,
                 local_pp_stage_cnt=None) -> PipelineStage:
@@ -216,7 +217,8 @@ def _compile_pp(func,
         pp_group=None,
         device=device,
         sharded_graph=traced_stateless_func,
-        all_gather_output=all_gather_output
+        return_to_all_stages=return_to_all_stages,
+        accumulate_grads_inplace=accumulate_grads_inplace
     )
 
     return pipe

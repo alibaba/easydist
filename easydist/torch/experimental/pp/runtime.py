@@ -81,7 +81,8 @@ class PipelineStage:
                  device: torch.device,
                  pp_group: dist.ProcessGroup,
                  sharded_graph: fx.GraphModule,
-                 all_gather_output: bool):
+                 return_to_all_stages: bool,
+                 accumulate_grads_inplace: bool):
         # meta info
         self.name = f'stage_{stage_idx}'
         self._init_fw_bw_step_nodes(local_gm)
@@ -98,8 +99,9 @@ class PipelineStage:
         self.pp_rank = dist.get_rank(pp_group)
         self.num_stages = compiled_meta.nstages
         self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
-        self.return_to_all_stages = all_gather_output
         self.graph = sharded_graph
+        self.return_to_all_stages = return_to_all_stages
+        self.accumulate_grads_inplace = accumulate_grads_inplace
 
         if dist.get_world_size(self.pp_group) > self.num_stages:
             raise RuntimeError(
@@ -242,6 +244,8 @@ class PipelineStage:
         self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.outputs_batch = {}  # Activation send requests of all chunk
+        if self.accumulate_grads_inplace:
+            self.grads = {}
 
     def _create_send_info(self, node: fx.Node, is_forward: bool) -> Dict[int, List[str]]:  # TODO @botbw: simplify
         to_sort = []
@@ -388,6 +392,18 @@ class PipelineStage:
         self.cur_bw_send_chunk = self.compiled_stage.backward(self.activations_chunks[self.cur_bw_chunk_id],
                                                      self.outputs_chunks[self.cur_bw_chunk_id],
                                                      **composite_kwargs_chunk)
+        if self.accumulate_grads_inplace:
+            grads_nodes = dict.fromkeys(self.compiled_meta.nones_or_grads_nodes_unflatten.values())
+            to_pop = []
+            for k, v in self.outputs_chunks[self.cur_bw_chunk_id].items():
+                if k in grads_nodes:
+                    to_pop.append(k)
+                    if k in self.grads:
+                        self.grads[k] += v
+                    else:
+                        self.grads[k] = v
+            for k in to_pop:
+                self.outputs_chunks[self.cur_bw_chunk_id].pop(k)
         # Update runtime states
         self.cur_bw_chunk_id += 1
 
@@ -417,6 +433,8 @@ class PipelineStage:
         for outputs_chunk in self.outputs_chunks:
             outputs_chunk.clear()
         self.outputs_batch.clear()
+        if self.accumulate_grads_inplace:
+            self.grads.clear()
 
     def split_input_kwargs(self, kwargs):
         return split_args_kwargs_into_chunks(
@@ -427,25 +445,27 @@ class PipelineStage:
             self.inputs_nodes_chunk_spec,
         )[1]
 
+    @torch.no_grad
     def merge_output_chunks(self) -> Dict[str, Any]:
-        maybe_updated_params_names_unflatten = self.compiled_meta.output_params_nodes_unflatten
-        maybe_updated_buffers_names_unflatten = self.compiled_meta.output_buffers_nodes_unflatten
-        updated_optimstates_names_unflatten = self.compiled_meta.output_optimstates_nodes_unflatten
-        nones_or_grads_names_unflatten = self.compiled_meta.nones_or_grads_nodes_unflatten
-        returns_names_flatten = self.compiled_meta.returns_nodes_flatten
+        params_nodes = dict.fromkeys(self.compiled_meta.output_params_nodes_unflatten.values())
+        buffers_nodes = dict.fromkeys(self.compiled_meta.output_buffers_nodes_unflatten.values())
+        optimstates_nodes = dict.fromkeys(self.compiled_meta.output_optimstates_nodes_flatten)
+        nones_or_grads_nodes = dict.fromkeys(self.compiled_meta.nones_or_grads_nodes_unflatten.values())
+        returns_names_flatten = dict.fromkeys(self.compiled_meta.returns_nodes_flatten)
 
         params, buffers, optimstates, grads, rets = {}, {}, {}, [], []
         for chunk in self.outputs_chunks:
             grads_chunk, rets_chunk = {}, {node_name: None for node_name in returns_names_flatten}
             for node_name, tensor in chunk.items():
-                if node_name in maybe_updated_params_names_unflatten.values():
+                if node_name in params_nodes:
                     params[node_name] = tensor
-                elif node_name in maybe_updated_buffers_names_unflatten.values():
+                elif node_name in buffers_nodes:
                     buffers[node_name] = tensor
-                elif node_name in updated_optimstates_names_unflatten.values():
+                elif node_name in optimstates_nodes:
                     optimstates[node_name] = tensor
-                elif node_name in nones_or_grads_names_unflatten.values():
-                    grads_chunk[node_name] = tensor
+                elif node_name in nones_or_grads_nodes:
+                    if not self.accumulate_grads_inplace:
+                        grads_chunk[node_name] = tensor
                 elif node_name in returns_names_flatten:
                     rets_chunk[node_name] = tensor
                 else:
@@ -455,9 +475,13 @@ class PipelineStage:
             rets.append(rets_chunk)
 
         rets = merge_chunks(rets, self.returns_nodes_chunk_spec)
-        grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
+        if self.accumulate_grads_inplace:
+            grads = self.grads
+        else:
+            grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
 
-        self.outputs_batch = {**params, **buffers, **optimstates, **grads, **rets}
+
+        self.outputs_batch.update({**params, **buffers, **optimstates, **grads, **rets})
 
         return self.outputs_batch
 

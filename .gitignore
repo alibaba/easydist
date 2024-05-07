@@ -139,6 +139,7 @@ dist/
 build/
 
 # temporary files
+md_compiled
 tmp
 
 # graphviz output files

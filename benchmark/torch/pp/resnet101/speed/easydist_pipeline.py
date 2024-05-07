@@ -84,7 +84,7 @@ def test_main(args):
                       cuda_graph=False,
                       schedule_cls=schedule_cls,
                       num_chunks=num_chunks,
-                      all_gather_output=False)
+                      return_to_all_stages=False)
     def train_step(input, label, model, opt):
         out = model(input)
         loss = criterion(out, label)

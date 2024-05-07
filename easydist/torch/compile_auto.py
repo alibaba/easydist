@@ -210,7 +210,8 @@ def _compile_auto(func,
                   kwargs_chunk_spec=None,
                   outputs_chunk_spec=None,
                   num_chunks=1,
-                  all_gather_output=True,
+                  return_to_all_stages=True,
+                  accumulate_grads_inplace=True,
                   strict=True) -> Union[PipelineStage, Any]:
     args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
                                                              args_chunk_spec, kwargs_chunk_spec)
@@ -482,7 +483,8 @@ def _compile_auto(func,
             pp_group=get_pp_group(),
             device=torch.device(f"cuda:{rank}"),
             sharded_graph=sharded_graph,
-            all_gather_output=all_gather_output
+            return_to_all_stages=return_to_all_stages,
+            accumulate_grads_inplace=accumulate_grads_inplace
         )
         return pipe
 
