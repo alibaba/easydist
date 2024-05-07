@@ -289,7 +289,9 @@ class CompiledMeta:
     output_buffers_nodes_unflatten: Dict[str, str]
     output_optimstates_nodes_unflatten: Dict[str, Dict[str, str]]
     output_optimstates_nodes_flatten: Tuple[str, ...]
-    nones_or_grads_nodes_unflatten: Dict[str, str]
+    input_grads_to_output_grads: Dict[str, str]
+    input_grads_unflatten: Dict[str, str]
+    output_grads_unflatten: Dict[str, str]
     returns_nodes_flatten: Tuple[str, ...]
 
     # output node to input node mapping
@@ -352,17 +354,17 @@ class CompiledStage:
                 full_step_gm.inputs_spec)
             inv_stage_params_inputs = set(self.compiled_meta.inv_params[name]
                                           for name in stage_params_inputs)
-            stage_grad_inputs = set({
-                self.compiled_meta.nones_or_grads_nodes_unflatten[k]
-                for k in inv_stage_params_inputs
-            })
+            stage_grad_inputs = set(
+                {self.compiled_meta.input_grads_unflatten[k]
+                 for k in inv_stage_params_inputs})
             stage_optimstates_inputs, _ = pytree.tree_flatten([
                 self.compiled_meta.optimstates_nodes_unflatten[k] for k in inv_stage_params_inputs
                 if k in self.compiled_meta.optimstates_nodes_unflatten
             ])
             stage_optimstates_inputs = set(stage_optimstates_inputs)
             self.step_gm_args = stage_params_inputs | stage_grad_inputs | stage_optimstates_inputs
-            self.step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_gm_args)
+            self.step_gm = _extract_step_subgraph_from_args(
+                full_step_gm, self.step_gm_args, compiled_meta.input_grads_to_output_grads)
             save_graphviz_dot(self.step_gm.gm, self.fw_gm.name + self.step_gm.name)
 
     @torch.no_grad
@@ -371,10 +373,8 @@ class CompiledStage:
         )) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
 
         if activations_chunk is None or outputs_chunk is None:  # for local run
-            if not hasattr(self, 'activations'):
-                self.activations = {}
-            if not hasattr(self, 'outputs'):
-                self.outputs = {}
+            self.activations = {}
+            self.outputs = {}
             activations_chunk = self.activations
             outputs_chunk = self.outputs
 
@@ -463,7 +463,7 @@ class CompiledStage:
         ), "output_from_gm should have the same length as self.bw_gm.outputs_spec"
 
         for output_name, output in zip(self.bw_gm.outputs_spec, output_from_gm):
-            if output_name in self.compiled_meta.nones_or_grads_nodes_unflatten.values():
+            if output_name in self.compiled_meta.input_grads_unflatten.values():
                 outputs_chunk[output_name] = output
             elif output_name in self.bw_gm.call_module_users:
                 ret[output_name] = output
@@ -488,9 +488,9 @@ class CompiledStage:
                 kwargs[arg_name] = self.step_gm.injected_states[StateType.OPTIMSTATES][arg_name]
             elif arg_name in self.fw_gm.injected_states[StateType.PARAMS]:  # params
                 kwargs[arg_name] = self.fw_gm.injected_states[StateType.PARAMS][arg_name]
-            elif arg_name in self.compiled_meta.nones_or_grads_nodes_unflatten.values(
+            elif arg_name in self.compiled_meta.input_grads_unflatten.values(
             ):  # grads already in outputs
-                kwargs[arg_name] = outputs_batch[arg_name]
+                kwargs[arg_name] = outputs_batch.pop(arg_name)
             else:
                 raise RuntimeError(f"arg {arg_name} not sure where to go")
 
@@ -508,7 +508,7 @@ class CompiledStage:
                 input_node_name = self.compiled_meta.output2input_optimstates[output]
                 self.step_gm.injected_states[StateType.OPTIMSTATES][
                     input_node_name] = ret  # update optimstates in case it's not updated in place.
-            elif output in self.compiled_meta.nones_or_grads_nodes_unflatten.values():
+            elif output in self.compiled_meta.output_grads_unflatten.values():
                 outputs_batch[output] = ret
             else:
                 if self.strict:
@@ -763,7 +763,8 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
     return split, part_idx + 1
 
 
-def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]):
+def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str],
+                                     input_grads_to_output_grads: Dict[str, str]):
     new_graph = fx.Graph()
     env = {}
     outputs = []
@@ -882,7 +883,11 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str]
     for name in to_pop:
         ed_gm.injected_states[StateType.OPTIMSTATES].pop(name)
 
-    output_spec = [node.name for node in outputs]
+    output_spec = [
+        node.name
+        if node.name not in input_grads_to_output_grads else input_grads_to_output_grads[node.name]
+        for node in outputs
+    ]
 
     return EDGraphModule(new_gm, ed_gm.submod_type, inputs_spec, injected_states, output_spec,
                          ed_gm.call_module_users, 'partial_' + ed_gm.name)
@@ -920,9 +925,9 @@ def compile_pipeline(
     # node name of input and output in stateless_func
     params, buffers, optimstates, args, kwargs = stateless_func_args
     params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten, args_nodes_unflatten, kwargs_nodes_unflatten = inputs_nodes_unflatten
-    output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, __nones_or_grads_nodes_unflatten, returns_nodes_unflatten = output_nodes_unflatten
-    _, __nones_or_grads_nodes_unflatten_spec = pytree.tree_flatten(
-        __nones_or_grads_nodes_unflatten)  # don't use
+    output_params_nodes_unflatten, output_buffers_nodes_unflatten, output_optimstates_nodes_unflatten, output_grads_unflatten, returns_nodes_unflatten = output_nodes_unflatten
+    output_grads_flatten, output_grads_spec = pytree.tree_flatten(
+        output_grads_unflatten)  # don't use
     returns_nodes_flatten, _ = pytree.tree_flatten(returns_nodes_unflatten)
     output_optimstates_nodes_flatten, _ = pytree.tree_flatten(output_optimstates_nodes_unflatten)
 
@@ -978,13 +983,19 @@ def compile_pipeline(
     splited_global, part_cnt = split_by(traced_stateless_func,
                                         torch.ops.easydist.step_split.default)
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
-    nones_or_grads_nodes_unflatten = {}
+    input_grads_unflatten = {}
+    input_grads_to_output_grads = {}
     if hasattr(splited_global, 'submod_1'):
         phs = [node for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         num_params = len(params_nodes_unflatten)
-        nones_or_grads_nodes_unflatten = pytree.tree_unflatten(
-            [ph.name for ph in phs[num_params:num_params * 2]],
-            __nones_or_grads_nodes_unflatten_spec)
+        input_grads_unflatten = pytree.tree_unflatten(
+            [ph.name for ph in phs[num_params:num_params * 2]], output_grads_spec)
+        input_grads_to_output_grads = {
+            input_grad: output_grad
+            for input_grad, output_grad in zip([ph.name for ph in phs[num_params:num_params *
+                                                                      2]], output_grads_flatten)
+        }
+
     save_graphviz_dot(splited_global, "splited_global")
     states_used_by = defaultdict(list)
 
@@ -1112,7 +1123,9 @@ def compile_pipeline(
         output_buffers_nodes_unflatten=output_buffers_nodes_unflatten,
         output_optimstates_nodes_unflatten=output_optimstates_nodes_unflatten,
         output_optimstates_nodes_flatten=output_optimstates_nodes_flatten,
-        nones_or_grads_nodes_unflatten=nones_or_grads_nodes_unflatten,
+        input_grads_to_output_grads=input_grads_to_output_grads,
+        input_grads_unflatten=input_grads_unflatten,
+        output_grads_unflatten=output_grads_unflatten,
         returns_nodes_flatten=returns_nodes_flatten,
         output2input_params=output2input_params,
         output2input_buffers=output2input_buffers,
@@ -1247,8 +1260,12 @@ def compile_pipeline(
     def gather_outputs():
         outputs = {}
         for stage in compiled_stages:
+            outputs.update(stage.fw_gm.injected_states[StateType.PARAMS])
+            outputs.update(stage.fw_gm.injected_states[StateType.BUFFERS])
+            if hasattr(stage, 'step_gm'):
+                outputs.update(stage.step_gm.injected_states[StateType.OPTIMSTATES])
             outputs.update(stage.outputs)
-        return graph_outputs_to_func_outputs(compiled_meta, outputs, strict=True)
+        return outputs
 
     g.output(g.call_function(gather_outputs))
 

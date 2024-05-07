@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# torchrun --nproc_per_node 4 tests/test_torch/test_pp/test_reslink/case2.py
+# torchrun --nproc_per_node 4 tests/test_torch/test_pp/test_reslink.py
 import argparse
 from contextlib import nullcontext
 import os

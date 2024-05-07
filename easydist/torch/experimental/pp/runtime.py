@@ -404,7 +404,7 @@ class PipelineStage:
             self.activations_chunks[self.cur_bw_chunk_id],
             self.outputs_chunks[self.cur_bw_chunk_id], **composite_kwargs_chunk)
         if self.accumulate_grads_inplace:
-            grads_nodes = dict.fromkeys(self.compiled_meta.nones_or_grads_nodes_unflatten.values())
+            grads_nodes = dict.fromkeys(self.compiled_meta.input_grads_unflatten.values())
             to_pop = []
             for k, v in self.outputs_chunks[self.cur_bw_chunk_id].items():
                 if k in grads_nodes:
@@ -461,8 +461,7 @@ class PipelineStage:
         params_nodes = dict.fromkeys(self.compiled_meta.output_params_nodes_unflatten.values())
         buffers_nodes = dict.fromkeys(self.compiled_meta.output_buffers_nodes_unflatten.values())
         optimstates_nodes = dict.fromkeys(self.compiled_meta.output_optimstates_nodes_flatten)
-        nones_or_grads_nodes = dict.fromkeys(
-            self.compiled_meta.nones_or_grads_nodes_unflatten.values())
+        input_grads_nodes = dict.fromkeys(self.compiled_meta.input_grads_unflatten.values())
         returns_names_flatten = dict.fromkeys(self.compiled_meta.returns_nodes_flatten)
 
         params, buffers, optimstates, grads, rets = {}, {}, {}, [], []
@@ -475,7 +474,7 @@ class PipelineStage:
                     buffers[node_name] = tensor
                 elif node_name in optimstates_nodes:
                     optimstates[node_name] = tensor
-                elif node_name in nones_or_grads_nodes:
+                elif node_name in input_grads_nodes:
                     if not self.accumulate_grads_inplace:
                         grads_chunk[node_name] = tensor
                 elif node_name in returns_names_flatten:
