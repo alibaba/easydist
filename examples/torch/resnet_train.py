@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/pipeline_parallelism/resnet_train.py
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/resnet_train.py
 import os
 import random
 
@@ -29,7 +29,7 @@ from tqdm import tqdm
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
-from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE
+from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
     split_into_equal_size)
 

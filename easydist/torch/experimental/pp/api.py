@@ -13,7 +13,7 @@ from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, compile_pipeline, graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage, ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import SetParaInitHelper, materialize_zero
@@ -33,7 +33,7 @@ from torch.nn.utils import stateless
 
 import easydist.config as mdconfig
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage, ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states

@@ -38,7 +38,7 @@ import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.PipelineStage import PipelineStage, ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states, set_backward_flag, set_step_flag, set_updated_params_states

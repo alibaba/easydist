@@ -47,7 +47,7 @@ from easydist.torch.experimental.pp.compile_pipeline import (SplitPatcher, annot
                                                              split_into_equal_size)
 from easydist.torch.experimental.pp.microbatch import \
     split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.PipelineStage import ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import ScheduleGPipe
 from easydist.torch.experimental.pp.split_utils import (clear_pp_compile_states,
                                                         get_updated_params_states)
 from easydist.torch.experimental.pp.utils import save_graphviz_dot

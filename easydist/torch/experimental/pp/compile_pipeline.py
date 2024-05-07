@@ -1268,6 +1268,7 @@ def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
         name_to_stage_idx[output] = stage_idx
 
 
+# TODO @botbw: better way of doing this
 def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSPMDStrategy]):
     if src_specs == tgt_specs:
         return tensor

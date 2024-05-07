@@ -31,7 +31,7 @@ from tqdm import tqdm
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
-from easydist.torch.experimental.pp.PipelineStage import ScheduleDAPPLE, ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import (
     annotate_split_points,
     split_into_equal_size)

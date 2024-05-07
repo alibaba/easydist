@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# torchrun --nproc_per_node 4 benchmark/torch/pp/resnet101/speed/easydist_pipeline.py
+# torchrun --nproc_per_node 4 tests/test_torch/test_pp/test_reslink/case2.py
 import argparse
 from contextlib import nullcontext
 import os
@@ -25,7 +25,6 @@ import torch
 import torch.distributed as dist
 
 from torchvision import datasets, transforms
-from resnet import resnet101
 from torch.distributed._tensor import DeviceMesh
 from tqdm import tqdm
 
@@ -36,6 +35,22 @@ from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import (
     annotate_split_points, split_into_equal_size)
 from torch.profiler import profile, ProfilerActivity
+
+class Foo(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.layer0 = torch.nn.Linear(1024, 1024)
+        self.layer1 = torch.nn.Linear(1024, 1024)
+        self.layer2 = torch.nn.Linear(1024, 1024)
+        self.layer3 = torch.nn.Linear(1024, 1)
+
+    def forward(self, x):
+        res = self.layer0(x)
+        x = self.layer1(res)
+        x = self.layer2(x)
+        x = self.layer3(x + res)
+        return x
 
 
 def seed(seed=42):
@@ -54,8 +69,6 @@ def seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-criterion = torch.nn.CrossEntropyLoss()
-
 
 def test_main(args):
     per_chunk_sz = args.micro_batch_size
@@ -72,12 +85,11 @@ def test_main(args):
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
-    module = resnet101().train().to(device)
-    module.fc = torch.nn.Linear(module.fc.in_features, 1000).to(device)
+    module = Foo().train().to(device)
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
     annotate_split_points(
-        module, {'layer1_1_residual', 'layer2_2_relu3', 'layer3_11_bn1'})
+        module, {'layer0', 'layer1', 'layer2'})
 
     @easydist_compile(parallel_mode="pp",
                       tracing_mode="fake",
@@ -87,14 +99,14 @@ def test_main(args):
                       all_gather_output=False)
     def train_step(input, label, model, opt):
         out = model(input)
-        loss = criterion(out, label)
+        loss = out.mean()
         loss.backward()
         opt.step()
         opt.zero_grad()
         return out, loss
 
     dataset_size = 10000
-    train_dataloader = [(torch.randn(batch_size, 3, 224, 224, device=device),
+    train_dataloader = [(torch.randn(batch_size, 1024, device=device),
                          torch.randint(0, 10, (batch_size, ), device=device))
                         ] * (dataset_size // batch_size)
 
@@ -120,7 +132,7 @@ def test_main(args):
         time_sum = time.time() - time_start
         if rank == 0:
             print(f"Finish in {time_sum:.3f} seconds")
-    with open(f'./log/res-{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
+    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
         )
