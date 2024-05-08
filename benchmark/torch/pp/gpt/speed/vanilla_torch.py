@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# python benchmark/torch/pp/gpt/speed/vanila_torch.py
+# python benchmark/torch/pp/gpt/speed/vanilla_torch.py
 import argparse
 from contextlib import nullcontext
 import os
@@ -110,7 +110,7 @@ def test_main(args):
         time_sum = time.time() - time_start
         print(f"Finish in {time_sum:.3f} seconds")
         print(f"Max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.0f}MB")
-    with open(f'./log/gpt-vanila.txt', 'a') as f:
+    with open(f'./log/gpt-vanilla.txt', 'a') as f:
         f.write(
             f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:5.0f}MB\n'
         )

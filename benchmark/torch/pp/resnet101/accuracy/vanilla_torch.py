@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# python benchmark/torch/pp/resnet101/accuracy/vanila_torch.py
+# python benchmark/torch/pp/resnet101/accuracy/vanilla_torch.py
 import os
 import random
 import time

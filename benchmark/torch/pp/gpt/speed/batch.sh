@@ -12,7 +12,7 @@ for ((i=1 ; i <= 16 ; i += 1)); do
 done
 
 for ((i=1 ; i <= 16 ; i += 1)); do
-    python benchmark/torch/pp/gpt/speed/vanila_torch.py --micro-batch-size $i --num-chunks 1
+    python benchmark/torch/pp/gpt/speed/vanilla_torch.py --micro-batch-size $i --num-chunks 1
 done
 
 
@@ -33,7 +33,7 @@ done
 python benchmark/torch/pp/gpt/speed/torchgpipe_pipeline.py --dataset-size 5000 --micro-batch-size 16 --num-chunks 34
 
 for ((i=1; i <= 256 ; i *= 2)); do
-    python benchmark/torch/pp/gpt/speed/vanila_torch.py --dataset-size 5000 --micro-batch-size 16 --num-chunks $i
+    python benchmark/torch/pp/gpt/speed/vanilla_torch.py --dataset-size 5000 --micro-batch-size 16 --num-chunks $i
 done
 
 
