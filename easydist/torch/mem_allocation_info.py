@@ -95,9 +95,10 @@ class NodeMemInfo:
         self.temp_vars.append(temp_var)
 
     def __str__(self) -> str:
-        mem_info_str = ""
+        mem_info_str = "outs: "
         for out_var in self.out_vars:
             mem_info_str += str(out_var) + "\n"
+        mem_info_str += "temps: "
         for temp_var in self.temp_vars:
             mem_info_str += str(temp_var) + "\n"
         return mem_info_str

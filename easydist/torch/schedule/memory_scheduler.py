@@ -14,24 +14,37 @@
 
 import numpy as np
 import logging
+import torch
+from collections import defaultdict
+from typing import Callable, Set
 
 import easydist.config as mdconfig
+from easydist.torch.schedule.schedule_result import ScheduleResult
 
 logger = logging.getLogger(__name__)
+
+
+_funcs_served_by_back_allocator: Set[Callable] = {
+    torch.ops.aten.sum.dim_IntList
+}
 
 class MemoryScheduler:
     def __init__(
         self,
         fx_module,      # torch.fx.GraphModule
         graph_mem_info, # GraphMemInfo
+        op_streams,
         align_scale
     ):
         self.fx_module = fx_module
         self.graph_mem_info = graph_mem_info
+        self.nodes_by_back_allocator = set()
 
         self.nodes_to_schedule = []
         self.args = []
         self.outputs = []
+        self.op_streams = op_streams
+        self.schedule_result = None
 
         for node in fx_module.graph.nodes:
             if node.op == 'placeholder' or node.op == 'get_attr':
@@ -40,6 +53,10 @@ class MemoryScheduler:
                 self.outputs.append(node)
             else:
                 self.nodes_to_schedule.append(node)
+                assert node.name in op_streams, f"node {node.name} misses stream id"
+
+                if node.target in _funcs_served_by_back_allocator:
+                    self.nodes_by_back_allocator.add(node)
 
         self.node_set = set(self.nodes_to_schedule)
 
@@ -59,22 +76,20 @@ class MemoryScheduler:
         logger.info(f"gcd of memory sizes: {self.gcd}")
 
     def gen_mem_addresses(self):
-        pre_scheded_nodes = None
         if not mdconfig.enable_reschedule:
-            pre_scheded_nodes = {}
-            step = 0
+            self.schedule_result = ScheduleResult()
             for node in self.fx_module.graph.nodes:
                 if (
                     node.op != 'output' and
                     node.op != 'placeholder' and
                     node.op != 'get_attr'
                 ):
-                    pre_scheded_nodes[node] = step
-                    step += 1
+                    phy_stream_id = self.op_streams[node.name]
+                    self.schedule_result.schedule_node_at_end(node, phy_stream_id)
 
-        required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations = \
-                                      self.create_min_mem_plan(
-                                          pre_scheded_nodes=pre_scheded_nodes)
+        #print(f"node schedule result:\n{str(self.schedule_result)}")
+        required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes = \
+                                                      self.create_min_mem_plan()
 
-        return (required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, mem_locations)
+        return (required_memory, temp_memory, schedules, ordered_schedules, mem_alloc_info, inter_op_mems, back_alloced_nodes)
 

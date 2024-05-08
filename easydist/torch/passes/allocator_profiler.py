@@ -14,8 +14,6 @@
 
 from typing import Any, List, Dict, Tuple
 import logging
-
-import __main__
 import torch.utils._pytree as pytree
 import torch
 from torch.fx.graph_module import GraphModule
@@ -25,9 +23,14 @@ from torch.fx._compatibility import compatibility
 
 from easydist.torch.utils import EDNodeType
 from easydist.torch.init_helper import materialize_random
-from easydist.torch.utils import to_meta
+from easydist.torch.utils import to_meta, extract_tensor_meta_info
 from easydist.torch.mem_allocation_info import GraphMemInfo
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
+from profiling_allocator import _set_cur_op_name, _activate_stream_tracer, \
+                                _inactivate_stream_tracer, _enter_op_core, \
+                                _leave_op_core, _set_start_recording, \
+                                _set_mem_size, _set_temp_mem_size, _set_raw_mem_allocs, \
+                                _get_allocator_profiling_info
 
 __all__ = ['AllocatorProfiler']
 logger = logging.getLogger(__name__)
@@ -134,7 +137,7 @@ class ModuleProfilingInfo:
                 for out_idx, out_addr_size in enumerate(node_profiling_info.output_addr_size):
                     if out_addr_size[0] == addr_size[0]:
                         alloc_size = addr_size[1]
-                        #print(f"add out var: alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
+                        #print(f"[{node_name}:{out_idx}] alloc_idx: {alloc_idx}, addr_size: {addr_size}")
                         node_mem_info.add_out_var(
                                           out_idx, alloc_size, False,
                                           alloc_index=alloc_idx)
@@ -147,7 +150,7 @@ class ModuleProfilingInfo:
 
                 if not alloc_for_out:
                     alloc_size = addr_size[1]
-                    #print(f"add temp var: alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
+                    #print(f"[temp var] {node_name}, alloc_idx: {alloc_idx}, addr_size: ({addr_size})")
                     node_mem_info.add_temp_var(alloc_size, alloc_idx)
                     if alloc_size==0:
                         logger.info(f"The allocated temp buffer size of tensor {node_name} is zero")
@@ -160,6 +163,7 @@ class ModuleProfilingInfo:
                             output_size = out_addr_size[1]
                             arg_index = in_info.arg_idx
                             tensor_index = in_info.tensor_idx
+                            #print(f"[{node_name}:{out_idx}] arg_index: {arg_index}, tensor_index: {tensor_index}, offset: ({out_addr_size[0]-in_info.addr}:{output_size})")
                             node_mem_info.add_out_var(
                                               out_idx, output_size, True,
                                               arg_index=arg_index,
@@ -173,7 +177,7 @@ class ModuleProfilingInfo:
 
                     assert is_ref, f"rank {self.rank}, {node_name}:{out_idx} is neither allocated nor a reference"
 
-            #print(f"node_mem_info:\n{str(node_mem_info)}")
+            #print(f"[{node_name}] node_mem_info:\n{str(node_mem_info)}")
         #print(str_info)
         return graph_mem_info
 
@@ -238,15 +242,17 @@ class AllocatorProfiler(Interpreter):
         else:
             qualified_name = _get_qualified_name(n.target)
 
+        # set op_name which will be read in profiling allocator
+        _set_cur_op_name(n.name)
         # create dict to store addresses for this node
         node_profiling_info = NodeProfilingInfo(n.name)
         node_profiling_info.set_qualified_name(qualified_name)
-
         with self._set_current_node(n):
             # tell profiling_allocator stop recording
-            __main__.start_recording = False
+            _set_start_recording(False)
 
-            inputs_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'], n.args)
+            _activate_stream_tracer()
+            inputs_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'] if 'val' in nd.meta else nd, n.args)
             materialized_inputs = pytree.tree_map_only(torch.Tensor, materialize_random, inputs_signature)
 
             # record input addresses
@@ -259,23 +265,30 @@ class AllocatorProfiler(Interpreter):
                         node_profiling_info.record_input_tensor_info(flat_input,
                                                                   arg_index,
                                                                   tensor_index)
+                        #meta_info = extract_tensor_meta_info(flat_input)
+                        #print(f"input for node: {n.name}\n{meta_info}")
+
                         tensor_index += 1
                     elif type(flat_input) in constant_types:
                         continue
                     else:
                         assert False, f'Unexpected input: {type(flat_input)}, {flat_input}'
 
-            # set op_name for profiling_allocator.so
-            __main__.op_name = n.name
-
             # tell profiling_allocator to start profiling
-            __main__.start_recording = True
+            _set_start_recording(True)
 
             if n.op == "placeholder":
                 out_signature = pytree.tree_map_only(torch.fx.Node, lambda nd: nd.meta['val'], n)
                 output = pytree.tree_map_only(torch.Tensor, materialize_random, out_signature)
             else:
+                _enter_op_core()
                 output = getattr(self, n.op)(n.target, materialized_inputs, n.kwargs)
+                #if isinstance(output, torch.Tensor):
+                #    meta_info = extract_tensor_meta_info(output)
+                #    print(f"out for node: {n.name}\n{meta_info}")
+
+                _leave_op_core()
+            _inactivate_stream_tracer()
 
             # flatten to handle possible tuples
             flat_outputs, _ = pytree.tree_flatten(output)
@@ -297,7 +310,7 @@ class AllocatorProfiler(Interpreter):
     def create_graph_mem_info(self) -> GraphMemInfo:
         # process info from our profiling allocator
         # data format from allocator: (node_name, ptr_address)
-        for allocator_info in __main__.allocator_profiling_info:
+        for allocator_info in _get_allocator_profiling_info():
             node_name, *info = allocator_info
             node_info = self.profiling_info.get_node_profiling_info(node_name)
             node_info.record_alloc_info(info)
@@ -307,9 +320,9 @@ class AllocatorProfiler(Interpreter):
         return graph_mem_info
 
     def load_memory_plan(self, graph_mem_plan: GraphMemPlan):
-        __main__.raw_mem_allocs = graph_mem_plan.raw_mem_allocs
-        __main__.mem_size = graph_mem_plan.mem_size
-        __main__.temp_mem_size = graph_mem_plan.temp_mem_size
-        logger.info(f"load_memory_plan: mem_size: {__main__.mem_size}, temp_mem_size: {__main__.temp_mem_size}")
+        _set_raw_mem_allocs(graph_mem_plan.raw_mem_allocs)
+        _set_mem_size(graph_mem_plan.mem_size)
+        _set_temp_mem_size(graph_mem_plan.temp_mem_size)
+        logger.info(f"load_memory_plan: mem_size: {graph_mem_plan.mem_size}, temp_mem_size: {graph_mem_plan.temp_mem_size}")
 
 

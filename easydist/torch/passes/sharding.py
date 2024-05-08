@@ -539,8 +539,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
             node.ed_info.node_type = EDNodeType.AUXILIARY
         elif node.op == 'call_function':
             # create meta for custom function
-            if node.target in CUSTOM_FUNCS:
-                node.meta = create_meta_from_node(node)
+            # if node.target in CUSTOM_FUNCS:
+            node.meta = create_meta_from_node(node)
             # annotate node type
             if node.target in COMM_FUNCS:
                 node.ed_info.node_type = EDNodeType.COMMUNICATION

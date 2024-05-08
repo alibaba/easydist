@@ -7,7 +7,7 @@ import torch
 import intervaltree
 
 import easydist.config as mdconfig
-from easydist.torch.schedule.lifetime_info import LifetimeInfo, OverlapType
+from easydist.torch.schedule.lifetime_info import UnscheduledLifetimeInfo, OverlapType
 from easydist.torch.schedule.memory_scheduler import MemoryScheduler
 
 from mip import (
@@ -33,13 +33,14 @@ class ILPMemoryScheduler(MemoryScheduler):
         self,
         fx_module,      # torch.fx.GraphModule
         graph_mem_info, # GraphMemInfo
+        op_streams,
         align_scale=4,
         timeout_s=None,
         rel_stop=0.01,
         abs_stop=8,
         one_step_one_op=True
     ):
-        super().__init__(fx_module, graph_mem_info, align_scale)
+        super().__init__(fx_module, graph_mem_info, op_streams, align_scale)
 
         self.timeout = timeout_s
         self.rel_stop = rel_stop
@@ -65,10 +66,11 @@ class ILPMemoryScheduler(MemoryScheduler):
     def build_ilp_model(
         self,
         mem_limit=sys.maxsize,
-        pre_scheded_nodes=None,
     ):
-
-        lifetime_info = LifetimeInfo(self.fx_module.graph,
+        pre_scheded_nodes=None
+        log_stream_id = 0
+        lifetime_info = UnscheduledLifetimeInfo(
+                                     self.fx_module.graph,
                                      self.nodes_to_schedule,
                                      self.graph_mem_info,
                                      pre_scheded_nodes,
@@ -494,9 +496,9 @@ class ILPMemoryScheduler(MemoryScheduler):
 
         return model, addresses, create_vars, preserve_vars, peak_mem_usage
 
-    def create_min_mem_plan(self, pre_scheded_nodes=None):
+    def create_min_mem_plan(self):
         model, addresses, create_vars, preserve_vars, peak_mem_usage = \
-                       self.build_ilp_model(pre_scheded_nodes=pre_scheded_nodes)
+                       self.build_ilp_model()
 
         model.write("./tmp/addr_gen.lp")
 
