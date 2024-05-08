@@ -14,9 +14,11 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <cuda_runtime_api.h>
 
 #include "stream_tracer.h"
 #include "profiling_allocator.h"
+#include "effective_cuda_allocator.h"
 
 namespace py = pybind11;
 
@@ -53,6 +55,53 @@ PYBIND11_MODULE(profiling_allocator, m) {
 #endif
         .def_readwrite("op_streams", &StreamTraceData::op_streams_)
         .def_readwrite("op_extra_streams", &StreamTraceData::op_extra_streams_);
+
+    py::class_<
+        c10::cuda::CUDACachingAllocator::CUDAAllocator,
+        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>>(
+        m, "_cuda_CUDAAllocator");
+
+    m.def(
+        "_cuda_changeCurrentAllocator",
+        [](std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+               allocator) {
+          torch::cuda::CUDAPluggableAllocator::changeCurrentAllocator(allocator);
+        });
+
+    py::class_<
+        torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
+        c10::cuda::CUDACachingAllocator::CUDAAllocator,
+        std::shared_ptr<
+            torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>>(
+        m, "_CUDAPluggableAllocator")
+        .def(
+            "set_init_fn",
+            [](torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator& self,
+               uint64_t func_ptr) {
+              using FuncType = void(int);
+              std::function<FuncType> func =
+                  reinterpret_cast<FuncType*>(func_ptr);
+              self.set_init_fn(func);
+            });
+
+    py::class_<
+        torch::cuda::CUDAPluggableAllocator::EffectiveCUDAAllocator,
+        torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
+        std::shared_ptr<
+            torch::cuda::CUDAPluggableAllocator::EffectiveCUDAAllocator>>(
+            m, "_EffectiveCUDAAllocator");
+
+    m.def("_cuda_customEffectiveAllocator", [](uint64_t malloc_ptr, uint64_t free_ptr) {
+        using MallocFuncType = void*(size_t, int, cudaStream_t);
+        using FreeFuncType = void(void*, size_t, int, cudaStream_t);
+        std::function<MallocFuncType> malloc_fn =
+            reinterpret_cast<MallocFuncType*>(malloc_ptr);
+        std::function<FreeFuncType> free_fn =
+            reinterpret_cast<FreeFuncType*>(free_ptr);
+
+        return torch::cuda::CUDAPluggableAllocator::createCustomEffectiveAllocator(
+            malloc_fn, free_fn);
+    });
 }
 
 

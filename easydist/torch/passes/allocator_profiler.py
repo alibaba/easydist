@@ -26,7 +26,7 @@ from easydist.torch.init_helper import materialize_random
 from easydist.torch.utils import to_meta, extract_tensor_meta_info
 from easydist.torch.mem_allocation_info import GraphMemInfo
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
-from profiling_allocator import _set_cur_op_name, _activate_stream_tracer, \
+from easydist.torch._C.profiling_allocator import _set_cur_op_name, _activate_stream_tracer, \
                                 _inactivate_stream_tracer, _enter_op_core, \
                                 _leave_op_core, _set_start_recording, \
                                 _set_mem_size, _set_temp_mem_size, _set_raw_mem_allocs, \

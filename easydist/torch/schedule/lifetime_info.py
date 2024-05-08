@@ -659,12 +659,12 @@ class ScheduledLifetimeInfo(LifetimeInfo):
                         anchor_pos = self.anchors_between_streams[user][sid]
                         assert anchor_pos > 0
                         if user not in self.extended_schedule_maps:
-                            self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
-                            #self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
+                            #self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
+                            self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
                         elif self.extended_schedule_maps[sid][user] < (anchor_pos - 1):
                             #print(f"update anchor position for {node} due to user {user}")
-                            self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
-                            #self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
+                            #self.extended_schedule_maps[sid][user] = last_pos        # Lansong(TODO): safe but more memory usage
+                            self.extended_schedule_maps[sid][user] = anchor_pos - 1  # Lansong(TODO): aggressive version, a bug to be fixed, uncomment it later
 
         # debug
         #for sid in range(self.schedule_result.num_streams):

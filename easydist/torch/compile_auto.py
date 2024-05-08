@@ -60,7 +60,7 @@ from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer,
 from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
-from profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode, _set_cur_op_name
+from easydist.torch._C.profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode, _set_cur_op_name
 # for pickle dump opt_strategy
 import sys
 

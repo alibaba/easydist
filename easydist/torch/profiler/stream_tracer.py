@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import torch
-from profiling_allocator import _prepare_stream_tracer, _enable_stream_tracer, \
+from easydist.torch._C.profiling_allocator import _prepare_stream_tracer, _enable_stream_tracer, \
                                 _disable_stream_tracer, _get_stream_trace_data
 
 __all__ = [

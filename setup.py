@@ -53,21 +53,24 @@ cupti_include_path = '/usr/local/cuda/extras/CUPTI/include'
 cupti_lib_path = '/usr/local/cuda/extras/CUPTI/lib64'
 torch_lib_path = site.getsitepackages()[0] + '/torch/lib'
 
-profiling_allocator = setuptools.Extension('profiling_allocator',
+profiling_allocator = setuptools.Extension('easydist.torch._C.profiling_allocator',
                     sources = [
                       'csrc/profiling_allocator/profiling_allocator.cpp',
                       'csrc/profiling_allocator/stream_tracer.cpp',
                       'csrc/profiling_allocator/cupti_callback_api.cpp',
-                      'csrc/profiling_allocator/python_tracer_init.cpp',],
+                      'csrc/profiling_allocator/python_tracer_init.cpp',
+                      'csrc/profiling_allocator/effective_cuda_allocator.cpp',],
                     include_dirs=[
                       python_include_path,
                       cuda_include_path,
                       torch_include_path,
                       pybind11_include_path,
                       cupti_include_path],
-                    libraries = ['cupti', 'c10_cuda'],
+                    libraries = ['cupti', 'c10', 'c10_cuda', 'torch_python'],
                     library_dirs=[cupti_lib_path, torch_lib_path],
-                    extra_compile_args=['-fPIC', '--shared', '--std=c++17'])
+                    extra_compile_args=[
+                      '-fPIC', '--shared', '-std=c++17',
+                      '-DUSE_CUDA=1', '-D_GLIBCXX_USE_CXX11_ABI=0'])
 
 
 setuptools.setup(
