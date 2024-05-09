@@ -12,26 +12,30 @@
 # limitations under the License.
 # ==============================================================================
 
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/resnet_train.py
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/bert_train.py
 import os
 import random
 
-import numpy as np
+from tqdm import tqdm
 
+import numpy as np
 import torch
 import torch.distributed as dist
-
-from torchvision import datasets, transforms
-from torchvision.models import resnet18
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torch.distributed._tensor import DeviceMesh
-from tqdm import tqdm
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import get_pp_size, set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
+    annotate_split_points,
     split_into_equal_size)
+
+from torchtext.datasets import IMDB, AG_NEWS
+
+from transformers import BertForSequenceClassification, BertTokenizer
 
 
 def seed(seed=42):
@@ -50,29 +54,12 @@ def seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-criterion = torch.nn.CrossEntropyLoss()
-
-
-@easydist_compile(tracing_mode="fake",
-                  cuda_graph=False,
-                  schedule_cls=ScheduleDAPPLE,
-                  num_chunks=4)
-def train_step(input, label, model, opt):
-    opt.zero_grad()
-    out = model(input)
-    loss = criterion(out, label)
-    loss.backward()
-    opt.step()
-    return out, loss
-
-
-def test_main():
+def train_bert():
     seed(42)
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
 
     set_device_mesh(
@@ -81,66 +68,76 @@ def test_main():
 
     device = torch.device('cuda')
 
-    module = resnet18().train().to(device)
-    module.fc = torch.nn.Linear(512, 10).to(device)
-    pp_size = get_pp_size()
-    _, module = split_into_equal_size(pp_size)(module)
+    @easydist_compile(tracing_mode="fake",
+                  cuda_graph=False,
+                  schedule_cls=ScheduleDAPPLE,
+                  num_chunks=4)
+    def train_step(model, input_ids, attn_mask, labels, opt):
+        outputs = model(input_ids, attention_mask=attn_mask)
+        loss = F.cross_entropy(outputs.logits, labels)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        return outputs.logits, loss
 
-    opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
-    # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+
+    model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=10).train().to(device)
+    annotate_split_points(model, {
+        'bert.encoder.layer.4'
+    })
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    def tokenize(x):
+        encodings =  tokenizer(x, return_tensors='pt', padding="max_length", max_length=128, truncation=True)
+        return encodings['input_ids'].to(device), encodings['attention_mask'].to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, foreach=True, capturable=True)
 
     batch_size = 64
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
-    ])
-    train_data = datasets.CIFAR10('./data',
-                                  train=True,
-                                  download=True,
-                                  transform=transform)
-    valid_data = datasets.CIFAR10('./data', train=False, transform=transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=batch_size)
-    valid_dataloader = torch.utils.data.DataLoader(valid_data,
-                                                   batch_size=batch_size)
 
-    def validation(module, valid_dataloader, epoch, state_dict):
+    def get_iters():
+        return iter(DataLoader(AG_NEWS(split="train"), batch_size=batch_size, shuffle=True)),\
+              iter(DataLoader(AG_NEWS(split="test"), batch_size=batch_size, shuffle=True))
+
+    def test(module, valid_dataloader, epoch, state_dict):
         module.load_state_dict(state_dict)
-        module.to(rank)
         module.eval()
+        module.to(device)
         correct_cnt = 0
         all_cnt = 0
-        for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
-            x_batch = x_batch.to(f'cuda:{rank}')
-            y_batch = y_batch.to(f'cuda:{rank}')
-            out = module(x_batch)
+        for y_batch, x_batch in (tqdm(valid_dataloader, dynamic_ncols=True)):
+            y_batch = y_batch.to(device)
+            input_ids, attn_mask = tokenize(x_batch)
+            out = module(input_ids, attention_mask=attn_mask).logits
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch).sum()
             all_cnt += len(y_batch)
         print(f'epoch {epoch} valid accuracy: {correct_cnt / all_cnt}')
 
     epochs = 5
+    train_iter, test_iter = get_iters()
     for epoch in range(epochs):
-        all_cnt, correct_cnt, loss_sum = 0, 0, 0
-        for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True) if rank == 0
-                                    else train_dataloader):
-            x_batch = x_batch.to(device)
+        all_cnt = 0
+        correct_cnt = 0 
+        loss_sum = 0
+        for y_batch, x_batch in (tqdm(train_iter, dynamic_ncols=True)
+                                 if rank == 0 else train_iter):
+            input_ids, attn_mask = tokenize(x_batch)
             y_batch = y_batch.to(device)
-            out, loss = train_step(x_batch, y_batch, module, opt)
+            ret = train_step(model, input_ids, attn_mask, y_batch, optimizer)
+            out, loss = ret
             all_cnt += len(out)
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
-            loss_sum += loss.mean().item()
+            loss_sum += loss.sum()
         state_dict_list = train_step.compiled_func.state_dict(world_rank=0)
         if rank == 0:
-            print(
-                f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
-            )
+            print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
             state_dict = {}
             for st in state_dict_list:
                 state_dict.update(st)
-            validation(module, valid_dataloader, epoch, state_dict)
+            test(model, test_iter, epoch, state_dict)
+        train_iter, test_iter = get_iters()
+
 
     print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")
     cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -152,8 +149,8 @@ def test_main():
         state_dict = {}
         for st in state_dict_list:
             state_dict.update(st)
-        torch.save(state_dict, os.path.join(ckpt_dir, 'resnet.pth'))
+        torch.save(state_dict, os.path.join(ckpt_dir, 'bert.pth'))
 
 
 if __name__ == '__main__':
-    test_main()
+    train_bert()
