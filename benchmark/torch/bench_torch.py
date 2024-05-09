@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from benchmark.torch.model import GPT, GATLayer, wresnet50
 from benchmark.bench_case import GPTCase, ResNetCase, GATCase
 
+torch.manual_seed(0)
 
 def get_gpt_case():
     case = GPTCase()

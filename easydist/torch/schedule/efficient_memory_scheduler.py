@@ -24,6 +24,7 @@ import easydist.config as mdconfig
 
 from easydist.torch.schedule.lifetime_info import ScheduledLifetimeInfo
 from easydist.torch.schedule.memory_scheduler import MemoryScheduler
+from easydist.torch.cuda.scheduled_graph_drawer import ScheduledFxGraphDrawer
 
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,16 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
     def create_min_mem_plan(self):
         lifetime_info = self.build_lifetime()
+
+        if mdconfig.dump_fx_graph:
+            drawer = ScheduledFxGraphDrawer(self.fx_module, "scheduled_graph",
+                                            self.schedule_result, lifetime_info,
+                                            ignore_getattr=True)
+            dot_graphs = drawer.get_all_dot_graphs()
+            for name, dot_graph in dot_graphs.items():
+                dot_graph.write_svg(f"./tmp/{name}.svg")
+                dot_graph.write_pdf(f"./tmp/{name}.pdf")
+                dot_graph.write_raw(f"./tmp/{name}.txt")
 
         inter_op_mems = {}
         for node in self.nodes_to_schedule:

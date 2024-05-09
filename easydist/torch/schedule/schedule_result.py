@@ -59,7 +59,7 @@ class ScheduleResult:
         return self.node_idx_maps[stream_id]
 
     def get_schedule(self, node: torch.fx.Node):
-        assert node in self.global_node_schedules
+        assert node in self.global_node_schedules, f"node {node} is missed in schedule map"
         return self.global_node_schedules[node]
 
     def get_log_stream_id(self, node: torch.fx.Node):
