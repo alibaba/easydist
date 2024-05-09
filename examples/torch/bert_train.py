@@ -62,13 +62,11 @@ def train_bert():
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
 
-    set_device_mesh(
-        DeviceMesh("cuda", [[[0, 2], [1, 3]]],
-                   mesh_dim_names=["spmd0", "spmd1", "pp"]))
-
     device = torch.device('cuda')
 
-    @easydist_compile(tracing_mode="fake",
+    @easydist_compile(
+                  parallel_mode='pp',
+                  tracing_mode="fake",
                   cuda_graph=False,
                   schedule_cls=ScheduleDAPPLE,
                   num_chunks=4)
@@ -83,7 +81,9 @@ def train_bert():
 
     model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=10).train().to(device)
     annotate_split_points(model, {
-        'bert.encoder.layer.4'
+        'bert.embeddings',
+        'bert.encoder.layer.4',
+        'bert.encoder.layer.8'
     })
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     def tokenize(x):
