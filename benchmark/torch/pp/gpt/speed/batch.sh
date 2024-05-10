@@ -1,4 +1,4 @@
-threshold microbatch size
+# threshold microbatch size
 for ((i=1 ; i <= 16 ; i += 1)); do
     torchrun --nproc_per_node 4 benchmark/torch/pp/gpt/speed/easydist_pipeline.py --micro-batch-size $i --num-chunks 1 --schedule gpipe
 done
@@ -16,7 +16,7 @@ for ((i=1 ; i <= 16 ; i += 1)); do
 done
 
 
-num chunks
+# num chunks
 for ((i=1; i <= 32 ; i *= 2)); do
     torchrun --nproc_per_node 4 benchmark/torch/pp/gpt/speed/easydist_pipeline.py --dataset-size 5000 --micro-batch-size 16 --num-chunks $i --schedule gpipe
 done
