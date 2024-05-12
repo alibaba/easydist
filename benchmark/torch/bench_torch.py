@@ -175,7 +175,6 @@ def main():
     spmd0, spmd1 = args.spmd0, args.spmd1
 
     # setup easydist
-    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda")
 
     # setup distributed
