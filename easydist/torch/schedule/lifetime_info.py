@@ -16,12 +16,18 @@ import sys
 import logging
 import torch
 import queue
+import intervaltree
 from enum import Enum
 from typing import Tuple, Set
 from collections import defaultdict
 
 from easydist.torch.schedule.schedule_result import ScheduleResult
+import easydist.config as mdconfig
 
+
+mem_owner_tracer = None
+if mdconfig.enable_memory_opt and mdconfig.enable_runtime_trace:
+    mem_owner_tracer = intervaltree.IntervalTree()
 
 logger = logging.getLogger(__name__)
 

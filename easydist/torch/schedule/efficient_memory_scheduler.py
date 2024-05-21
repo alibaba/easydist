@@ -145,18 +145,18 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
             assert min_max_addr < sys.maxsize and len(min_max_ten_groups) > 0
             max_duration = 0
-            fixed_ten_group = None
+            selected_ten_group = None
             for min_ten_group in min_max_ten_groups:
                 lb, ub = buf_makespans[min_ten_group]
                 duration = ub - lb + 1
                 if max_duration < duration:
                     max_duration = duration
-                    fixed_ten_group = min_ten_group
+                    selected_ten_group = min_ten_group
 
-            assert fixed_ten_group
-            lb, ub = buf_makespans[fixed_ten_group]
-            scaled_size = (fixed_ten_group.src_tensor_size + self.gcd - 1) // self.gcd
-            #print(f"scaled_size: {scaled_size}, source tensor size: {fixed_ten_group.src_tensor_size}")
+            assert selected_ten_group
+            lb, ub = buf_makespans[selected_ten_group]
+            scaled_size = (selected_ten_group.src_tensor_size + self.gcd - 1) // self.gcd
+            #print(f"scaled_size: {scaled_size}, source tensor size: {selected_ten_group.src_tensor_size}")
 
             # update intervals
             mem_used.remove_envelop(lb, ub+1)
@@ -173,8 +173,8 @@ class EfficientMemoryScheduler(MemoryScheduler):
 
             mem_used[lb:ub+1] = (min_max_addr, min_max_addr + scaled_size)
 
-            group_addresses[fixed_ten_group] = (scaled_mem_start+min_max_addr, scaled_size)
-            tensor_groups.remove(fixed_ten_group)
+            group_addresses[selected_ten_group] = (scaled_mem_start+min_max_addr, scaled_size)
+            tensor_groups.remove(selected_ten_group)
 
         # 2. generate memory address for temp allocation inside an op
         max_temp_addr = 0
