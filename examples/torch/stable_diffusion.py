@@ -1,3 +1,4 @@
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/stable_diffusion.py
 import copy
 import functools
 import logging
@@ -10,6 +11,8 @@ from diffusers import EulerDiscreteScheduler, StableDiffusionPipeline
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
+from easydist.torch.device_mesh import set_device_mesh
+from torch.distributed._tensor import DeviceMesh
 
 pytree._register_pytree_node(
     diffusers.models.unet_2d_condition.UNet2DConditionOutput, lambda x: ([x.sample], None),
@@ -22,8 +25,12 @@ def main():
 
     torch.distributed.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
     torch.manual_seed(42)
+
+    mesh = torch.arange(world_size).reshape(1, -1)
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1"]))
 
     model_id = "stabilityai/stable-diffusion-2"
 

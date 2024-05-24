@@ -22,7 +22,6 @@ from easydist.utils import rsetattr, rgetattr
 from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
 
-from .passes.sharding import get_device_mesh
 
 ABSTRACT_DTYPE = {
     torch.float64: "float64",

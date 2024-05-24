@@ -27,7 +27,6 @@ from torch.profiler import record_function
 from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
 
-from easydist.torch.device_mesh import get_device_mesh, get_spmd_rank
 from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage,
                                                              graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer,
@@ -495,48 +494,40 @@ class PipelineStage:
 
         return self.outputs_batch
 
-    def load_state_dict(self, state_dict):
-        self.compiled_stage.load_state_dict(state_dict)
-
-    def optimizer_state_dict(self, world_rank=None):
-        if world_rank is None:
+    def optimstate_dict(self, all_gather=False):
+        if all_gather:
+            return self._all_gather_optimstate_dict()
+        else:
             return self.compiled_stage.optimizer_state_dict()
-        else:
-            return self._gather_optimizer_state_dict(world_rank)
 
-    def state_dict(self, world_rank=None):
-        if world_rank is None:
+    def state_dict(self, all_gather=False):
+        if all_gather:
+            return self._all_gather_state_dict()
+        else:
             return self.compiled_stage.state_dict()
-        else:
-            return self._gather_state_dict(world_rank)
 
-    def load_optimizer_state_dict(self, state_dict):
-        self.compiled_stage.load_optimizer_state_dict(state_dict)
+    def load_state_dict(self, state_dict, strict=True):
+        self.compiled_stage.load_state_dict(state_dict, strict=strict)
 
-    def _gather_state_dict(self, world_rank):
+    def load_optimizer_state_dict(self, state_dict, strict=True):
+        self.compiled_stage.load_optimizer_state_dict(state_dict, strict=strict)
+
+    def _all_gather_state_dict(self):
         state_dicts = [None for _ in range(self.num_stages)]
-        state_dict = self.compiled_stage.state_dict()  # gather spmd0, spmd1
-        device_mesh = get_device_mesh()
-        spmd0, spmd1 = get_spmd_rank()
-        if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
-            dist.gather_object(state_dict,
-                               state_dicts if device_mesh.get_rank() == world_rank else None,
-                               dst=world_rank,
-                               group=self.pp_group)
-        return state_dicts
+        state_dict = self.compiled_stage.state_dict()  # gather spmd
+        dist.all_gather_object(state_dicts,
+                            state_dict,
+                            group=self.pp_group)
+        return reduce(lambda a, b: {**a, **b}, state_dicts)
 
-    def _gather_optimizer_state_dict(self, world_rank):
+    def _all_gather_optimstate_dict(self):
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
-        device_mesh = get_device_mesh()
-        spmd0, spmd1 = get_spmd_rank()
-        if (spmd0, spmd1) == (device_mesh.mesh == world_rank).nonzero(as_tuple=True)[:2]:
-            dist.gather_object(
-                optimizer_state_dict,
-                optimizer_state_dicts if device_mesh.get_rank() == world_rank else None,
-                dst=world_rank,
-                group=self.pp_group)
-        return optimizer_state_dicts
+        dist.all_gather_object(
+            optimizer_state_dicts,
+            optimizer_state_dict,
+            group=self.pp_group)
+        return reduce(lambda a, b: {**a, **b}, optimizer_state_dicts)
 
     def _all_gather_returns(self):
         returns_all_gather = [None for _ in range(self.num_stages)]

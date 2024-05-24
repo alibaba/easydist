@@ -24,7 +24,7 @@ import torch.utils._pytree as pytree
 from torch.distributed._tensor import DeviceMesh
 
 import easydist.config as mdconfig
-from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
+from easydist.torch.device_mesh import (get_device_mesh, set_device_mesh)
 from easydist.torch.compile_auto import _compile_auto
 from easydist.torch.compile_dp import _compile_dp
 from easydist.torch.experimental.pp.api import _compile_pp
@@ -107,14 +107,15 @@ class CompiledFuncWrapper:
 
         input_signature = self.register_input_signature(*args, **kwargs)
 
+        # local_pp is for testing and debugging
         if 'local_pp_stage_cnt' in self.compile_kwargs:
             # for running pp in single node (debug)
             world_size = self.compile_kwargs['local_pp_stage_cnt']
         else:
             world_size = torch.distributed.get_world_size()
-        need_compile = world_size >= 2
-        if get_device_mesh() is not None:
-            need_compile = device_mesh_world_size() >= 2
+
+        mesh = get_device_mesh()
+        need_compile = mesh.size() >= 2
 
         # override need_compile with forced_compile env var
         if mdconfig.forced_compile:

@@ -22,6 +22,7 @@ from typing import cast
 
 import torch.distributed
 
+from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.api import easydist_compile
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 
@@ -31,6 +32,7 @@ import torch
 import torch.utils._pytree as pytree
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
+from torch.distributed._tensor import DeviceMesh
 
 from torch.nn.utils import stateless
 from torch._subclasses.fake_tensor import FakeTensor
@@ -242,7 +244,9 @@ def test_main(module, split_ann, rand_input_gen_method, train_step_func):
 if __name__ == '__main__':
     torch.distributed.init_process_group(backend="nccl")
     torch.cuda.set_device(rank)
-    # test split_into_equal_size
+    set_device_mesh(DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=['pp']))
+    
+    # models need to be determined here (no dropout)
     test_main(Foo(), {
         'norm'
     }, gen_rand_input_foo, train_step)

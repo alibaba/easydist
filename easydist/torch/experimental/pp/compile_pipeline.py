@@ -28,7 +28,7 @@ from torch.fx._symbolic_trace import _Patcher
 from torch.distributed._tensor import mesh_resources
 
 from easydist.metashard.metair import SPMD, VarSPMDStrategy
-from easydist.torch.device_mesh import get_device_mesh, spmd_device_mesh
+from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
 from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, set_backward_flag, split
 from easydist.torch.experimental.pp.utils import ordered_gi_users, save_graphviz_dot, _to_tuple
@@ -562,7 +562,7 @@ class CompiledStage:
             if len(state_dict) != 0:
                 raise RuntimeError(f"state_dict has unexpected keys {state_dict.keys()}")
 
-    def load_optimizer_state_dict(self, state_dict):  # TODO @botbw: better way of doing this
+    def load_optimizer_state_dict(self, state_dict, strict=True):  # TODO @botbw: better way of doing this
         for torch_name, typ_dict in state_dict.items():
             for typ, tensor in typ_dict.items():
                 node_name = self.compiled_meta.optimstates_nodes_unflatten[torch_name][typ]
@@ -1147,7 +1147,7 @@ def compile_pipeline(
                 fw_or_fwbw_gm, part_cnt = split_by(
                     submod, torch.ops.easydist.fw_bw_split.default)  # split the module
                 save_graphviz_dot(fw_or_fwbw_gm, f"fw_or_fwbw_gm")
-                assert part_cnt == nstages * 2 if is_backward_called else nstages, "part_cnt should be nstages * 2 if backward is called"
+                assert part_cnt == nstages * 2 if is_backward_called else nstages, f"part_cnt should be nstages * 2 if backward is called, found {part_cnt=} {nstages=}"
                 stateful_fw_bw = []
                 submod_idx = 0
                 for n in fw_or_fwbw_gm.graph.nodes:  # for each submod in  fw_or_fwbw_gm
@@ -1305,49 +1305,48 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSP
     if src_specs == tgt_specs:
         return tensor
 
-    with spmd_device_mesh():
-        sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
-        device_mesh = get_device_mesh()
-        result = tensor
-        for i, (current, target) in sorted_placements:
-            my_coordinate = device_mesh.get_coordinate()
-            num_chunks = device_mesh.size(dim=i)
+    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
+    device_mesh = get_device_mesh('spmd')
+    result = tensor
+    for i, (current, target) in sorted_placements:
+        my_coordinate = device_mesh.get_coordinate()
+        num_chunks = device_mesh.size(dim=i)
 
-            if current == target:
-                continue
+        if current == target:
+            continue
 
-            if target.is_shard():
-                if current.is_replicate():
-                    result = scatter_wrapper(result, num_chunks, target.dim, my_coordinate[i])
-                elif current.is_shard():
-                    # all_to_all
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
+        if target.is_shard():
+            if current.is_replicate():
+                result = scatter_wrapper(result, num_chunks, target.dim, my_coordinate[i])
+            elif current.is_shard():
+                # all_to_all
+                submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                ranks = submesh.mesh.flatten().tolist()
 
-                    result = all_to_all_start(result, current.dim, target.dim, num_chunks,
-                                              my_coordinate[i], ranks)
-                    result = all_to_all_end(result, current.dim, target.dim, num_chunks,
+                result = all_to_all_start(result, current.dim, target.dim, num_chunks,
                                             my_coordinate[i], ranks)
-                elif current.is_partial():
-                    # reduce_scatter
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
-                    reduceOp = reduce_map[current.args["ops"]]
-                    # make sure contiguous
-                    result = reduce_scatter_start(result, reduceOp, target.dim, ranks)
-                    result = reduce_scatter_end(result, reduceOp, target.dim, ranks)
-            elif target.is_replicate():
-                if current.is_shard():
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
-                    # make sure contiguous
-                    result = all_gather_start(result, current.dim, ranks)
-                    result = all_gather_end(result, current.dim, ranks)
-                elif current.is_partial():
-                    # insert all_reduce here
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
-                    reduceOp = reduce_map[current.args["ops"]]
-                    result = all_reduce_start(result, reduceOp, ranks)
-                    result = all_reduce_end(result, reduceOp, ranks)
+                result = all_to_all_end(result, current.dim, target.dim, num_chunks,
+                                        my_coordinate[i], ranks)
+            elif current.is_partial():
+                # reduce_scatter
+                submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                ranks = submesh.mesh.flatten().tolist()
+                reduceOp = reduce_map[current.args["ops"]]
+                # make sure contiguous
+                result = reduce_scatter_start(result, reduceOp, target.dim, ranks)
+                result = reduce_scatter_end(result, reduceOp, target.dim, ranks)
+        elif target.is_replicate():
+            if current.is_shard():
+                submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                ranks = submesh.mesh.flatten().tolist()
+                # make sure contiguous
+                result = all_gather_start(result, current.dim, ranks)
+                result = all_gather_end(result, current.dim, ranks)
+            elif current.is_partial():
+                # insert all_reduce here
+                submesh = mesh_resources.create_child_mesh(device_mesh, i)
+                ranks = submesh.mesh.flatten().tolist()
+                reduceOp = reduce_map[current.args["ops"]]
+                result = all_reduce_start(result, reduceOp, ranks)
+                result = all_reduce_end(result, reduceOp, ranks)
     return result

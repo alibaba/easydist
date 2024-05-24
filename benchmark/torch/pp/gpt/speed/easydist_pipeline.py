@@ -32,7 +32,7 @@ from benchmark.bench_case import GPTCase
 from benchmark.torch.model.gpt import GPT, SequentialLowCommGPT
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
-from easydist.torch.device_mesh import get_pp_size, set_device_mesh
+from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
                                                              split_into_equal_size)
@@ -73,6 +73,8 @@ def test_main(args):
     pp_size = int(os.environ["WORLD_SIZE"])
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
+    
+    set_device_mesh(DeviceMesh('cuda', torch.arange(pp_size), mesh_dim_names=['pp']))
 
     case = GPTCase(num_layers=16,
                    hidden_dim=1024,

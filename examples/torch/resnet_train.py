@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
-from easydist.torch.device_mesh import get_pp_size, set_device_mesh
+from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
     split_into_equal_size)
@@ -78,12 +78,12 @@ def test_main():
     set_device_mesh(
         DeviceMesh("cuda", [[[0, 2], [1, 3]]],
                    mesh_dim_names=["spmd0", "spmd1", "pp"]))
-
+    mesh = get_device_mesh()
     device = torch.device('cuda')
 
     module = resnet18().train().to(device)
     module.fc = torch.nn.Linear(512, 10).to(device)
-    pp_size = get_pp_size()
+    pp_size = mesh['pp'].size()
     _, module = split_into_equal_size(pp_size)(module)
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
@@ -127,19 +127,18 @@ def test_main():
                                     else train_dataloader):
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
+            if x_batch.size(0) != batch_size:  # TODO need to solve this
+                continue
             out, loss = train_step(x_batch, y_batch, module, opt)
             all_cnt += len(out)
             preds = out.argmax(-1)
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
             loss_sum += loss.mean().item()
-        state_dict_list = train_step.compiled_func.state_dict(world_rank=0)
+        state_dict = train_step.compiled_func.state_dict(all_gather=True)
         if rank == 0:
             print(
                 f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}'
             )
-            state_dict = {}
-            for st in state_dict_list:
-                state_dict.update(st)
             validation(module, valid_dataloader, epoch, state_dict)
 
     print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")

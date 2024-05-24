@@ -8,7 +8,6 @@ from torch._subclasses.fake_tensor import FakeTensor
 from torch.nn.utils import stateless
 from torch.fx.experimental.proxy_tensor import make_fx
 
-import easydist.config as mdconfig
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (EDGraphModule, SplitPatcher,
@@ -18,11 +17,10 @@ from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chu
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.init_helper import SetParaInitHelper, materialize_zero
+from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 from easydist.utils import rgetattr, rsetattr
 
-import logging
 from functools import partial
 from typing import Any, cast
 from contextlib import nullcontext
@@ -39,9 +37,7 @@ from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
-from easydist.torch.init_helper import (SetParaInitHelper, materialize_zero)
-from easydist.torch.passes import (fix_embedding, sharding_transform)
-from easydist.torch.device_mesh import get_device_mesh
+from easydist.torch.init_helper import (SetParaInitHelper)
 from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer)
 from easydist.utils import rgetattr, rsetattr
 

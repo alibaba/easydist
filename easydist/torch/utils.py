@@ -103,12 +103,12 @@ class EDInfo:
         if self.strategy is None:
             return shared_meta
 
-        device_mesh = get_device_mesh()
+        spmd_mesh = get_device_mesh('spmd')
 
         if isinstance(shared_meta['val'], torch.Tensor):
             global_out_shape = shared_meta['val'].shape
             shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(0)]
-            local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
+            local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
             shared_meta['val'] = torch.ops.aten.new_empty.default(shared_meta['val'],
                                                                   local_out_shape)
             if 'tensor_meta' in shared_meta:
@@ -121,7 +121,7 @@ class EDInfo:
                     continue
                 global_out_shape = shared_meta['val'][idx].shape
                 shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(idx)]
-                local_out_shape = compute_local_shape(list(global_out_shape), device_mesh,
+                local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh,
                                                       shard_out)
                 shared_meta['val'][idx] = torch.ops.aten.new_empty.default(
                     shared_meta['val'][idx], local_out_shape)

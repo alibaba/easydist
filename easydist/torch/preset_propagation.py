@@ -20,8 +20,7 @@ from torch.fx.node import _get_qualified_name
 from easydist.metashard import view_propagation
 from easydist.metashard.annotation import ShardAnnotation, ShardDim
 from easydist.metashard.combination import CombinationFunc, ReduceOp
-
-from .device_mesh import device_mesh_world_size
+from easydist.torch.device_mesh import get_device_mesh
 
 aten = torch.ops.aten
 
@@ -66,7 +65,7 @@ def meta_spmd_placeholder(args, kwargs):
     input_shape = args.shape
     output_shape = args.shape
 
-    view_ann = view_propagation(input_shape, output_shape, world_size=device_mesh_world_size())
+    view_ann = view_propagation(input_shape, output_shape, world_size=get_device_mesh('spmd').size())
     return view_ann['sharding_ann'], view_ann['combination_ann']
 
 VIEW_OPS = [
@@ -78,7 +77,7 @@ def meta_spmd_view(args, kwargs):
     input_shape = args[0].shape
     output_shape = list(args[1])
 
-    view_ann = view_propagation(input_shape, output_shape, world_size=device_mesh_world_size())
+    view_ann = view_propagation(input_shape, output_shape, world_size=get_device_mesh('spmd').size())
     return view_ann['sharding_ann'], view_ann['combination_ann']
 
 
@@ -86,7 +85,7 @@ def meta_spmd_view(args, kwargs):
 def meta_spmd_expand(args, kwargs):
     input_shape = args[0].shape
     output_shape = list(args[1])
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(input_shape)])
     shard_idx = 1
@@ -107,7 +106,7 @@ def meta_spmd_reshape(args, kwargs):
     output_shape = list(args[1])
     stride = list(args[2])
 
-    view_ann = view_propagation(input_shape, output_shape, world_size=device_mesh_world_size())
+    view_ann = view_propagation(input_shape, output_shape, world_size=get_device_mesh('spmd').size())
     return view_ann['sharding_ann'], view_ann['combination_ann']
 
 
@@ -174,7 +173,7 @@ def meta_create_op(args, kwargs):
 
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim() for _ in tensor_shape]])
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     for dim_idx, dim_shape in enumerate(tensor_shape):
         if world_size <= dim_shape:
@@ -194,7 +193,7 @@ def meta_cat(args, kwargs):
     sharding_ann = [ShardDim.get_noshard_dim() for _ in tensor_shape]
     combine_ann = {}
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     for idx in range(len(tensor_shape)):
         if world_size <= tensor_shape[idx] and idx != dim:
@@ -216,7 +215,7 @@ def meta_log_softmax_backward_data(args, kwargs):
     sharding_ann = [ShardDim.get_noshard_dim() for _ in tensor_shape]
     combine_ann = {}
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     for idx in range(len(tensor_shape)):
         if world_size <= tensor_shape[idx] and idx != dim:
@@ -240,7 +239,7 @@ def meta_mm(args, kwargs):
     shard_idx = 1
     combine_ann = {}
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     if world_size <= shape_n:
         sharding_ann[0][0] = ShardDim(shard_idx)
@@ -273,7 +272,7 @@ def meta_bmm(args, kwargs):
     shard_idx = 1
     combine_ann = {}
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     if world_size <= shape_b:
         sharding_ann[0][0] = ShardDim(shard_idx)
@@ -304,7 +303,7 @@ def meta_bmm(args, kwargs):
 def meta_empty_like(args, kwargs):
     tensor_shape = args[0].shape
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(tensor_shape)])
     shard_idx = 1
@@ -322,7 +321,7 @@ def meta_empty_like(args, kwargs):
 def meta_empty_like(args, kwargs):
     tensor_shape = args[0].shape
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
 
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim() for _ in range(len(tensor_shape))]
                                     for _ in range(2)])
@@ -342,7 +341,7 @@ def meta_empty_like(args, kwargs):
 def meta_group_norm(args, kwargs):
     tensor_shape, w_shape, b_shape = args[0].shape, args[1].shape, args[2].shape
 
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(tensor_shape),
                                     [ShardDim.get_noshard_dim()] * len(w_shape),
                                     [ShardDim.get_noshard_dim()] * len(b_shape)])
@@ -364,7 +363,7 @@ def meta_group_norm(args, kwargs):
 @register_meta_spmd(aten.mean.default)
 def meta_mean(args, kwargs):
     tensor_shape = args[0].shape
-    world_size = device_mesh_world_size()
+    world_size = get_device_mesh('spmd').size()
     sharding_ann = ShardAnnotation([[ShardDim.get_noshard_dim()] * len(tensor_shape)])
 
     shard_idx = 1

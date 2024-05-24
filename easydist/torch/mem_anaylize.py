@@ -19,8 +19,9 @@ from typing import Dict, List
 import torch
 from torch.fx.node import Node, _get_qualified_name, map_arg
 
+from easydist.torch.device_mesh import get_device_mesh
+
 from .bridge import to_torch_spmd
-from .device_mesh import device_mesh_world_size
 
 DTYPE_BYTE = {
     torch.float32: 4,
@@ -110,7 +111,8 @@ def mem_anaylize(fx_graph: torch.fx.GraphModule, tensor_shape_info, opt_strategy
 
     f = open("mem_info.txt", "w")
 
-    world_size = device_mesh_world_size()
+    device_mesh = get_device_mesh()
+    world_size = device_mesh.size()
 
     input_strategy = _get_input_strategy(fx_graph, opt_strategy)
 

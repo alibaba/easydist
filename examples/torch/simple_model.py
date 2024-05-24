@@ -1,3 +1,4 @@
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/simple_model.py
 import argparse
 import copy
 import logging
@@ -108,9 +109,6 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
-        annotate_split_points(model, {
-            "norm"
-        })
 
         randn_input = torch.randn(1024, 1024)
 
@@ -119,10 +117,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
             model = broadcast_module(model)
             torch.distributed.broadcast(randn_input, src=0)
 
-        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
+        opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
 
         model_2 = copy.deepcopy(model)
-        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True, momentum=0.9, capturable=True)
+        opt_2 = torch.optim.Adam(model_2.parameters(), lr=0.001, foreach=True, capturable=True)
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)
@@ -177,15 +175,11 @@ def main():
 
     torch.distributed.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    
-    set_device_mesh(DeviceMesh("cuda", [
-        [
-            [0, 2],
-            [1, 3]
-        ]
-    ], mesh_dim_names=["spmd0", "spmd1", "pp"]))
+    mesh = torch.arange(world_size).reshape(1, -1)
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,
