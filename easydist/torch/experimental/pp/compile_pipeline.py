@@ -1217,7 +1217,7 @@ def compile_pipeline(
         pytree.tree_flatten(
             [params_nodes_unflatten, buffers_nodes_unflatten, optimstates_nodes_unflatten])[0])
 
-    # construct a local_gm TODO @botbw: simplify this
+    # construct a local_gm
     for node in fw_or_fwbw_gm.graph.nodes:
         if node.op == 'placeholder':
             if node.name not in all_states_names_flatten:  # args that are not states
