@@ -74,7 +74,7 @@ def test_main(args):
     per_chunk_sz = args.micro_batch_size
     num_chunks = args.num_chunks
     batch_size = per_chunk_sz * num_chunks
-    schedule_cls = args.schedule == 'gpipe' and ScheduleGPipe or ScheduleDAPPLE
+    schedule_cls = ScheduleGPipe if args.schedule == 'gpipe' else ScheduleDAPPLE
     do_profile = args.do_profile
     seed(42)
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
