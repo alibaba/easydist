@@ -477,38 +477,37 @@ def _compile_auto(func,
 
     rpc.shutdown()
 
-    with spmd_device_mesh():
-        if mdconfig.use_dtensor:
-            sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
-        else:
-            sharded_gm = sharding_transform(traced_graph, opt_strategy, state_io_map)
-            if mdconfig.enable_tile_comm:
-                sharded_gm = runtime_prof(sharded_gm, tiling_prof=True)
-                sharded_gm = tile_comm(sharded_gm)
+    if mdconfig.use_dtensor:
+        sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
+    else:
+        sharded_gm = sharding_transform(traced_graph, opt_strategy, state_io_map)
+        if mdconfig.enable_tile_comm:
+            sharded_gm = runtime_prof(sharded_gm, tiling_prof=True)
+            sharded_gm = tile_comm(sharded_gm)
 
-        save_graphviz_dot(sharded_gm, f'sharded_graph_raw_{rank}')
-        sharded_gm = fix_embedding(sharded_gm, recover=True)
+    save_graphviz_dot(sharded_gm, f'sharded_graph_raw_{rank}')
+    sharded_gm = fix_embedding(sharded_gm, recover=True)
 
-        if not mdconfig.use_dtensor:
-            if schedule_cls is None and mdconfig.comm_optimization is True:
-                sharded_gm = runtime_prof(sharded_gm)
-                sharded_gm = comm_optimize(sharded_gm, 'rcpsp', grouping=True, mem_restrain=False)
+    if not mdconfig.use_dtensor:
+        if schedule_cls is None and mdconfig.comm_optimization is True:
+            sharded_gm = runtime_prof(sharded_gm)
+            sharded_gm = comm_optimize(sharded_gm, 'rcpsp', grouping=True, mem_restrain=False)
 
-            # override pytorch dtensor propagate rules to optimize dispater behavior
-            if mdconfig.override_dtensor_rule is True:
-                sharded_gm = rule_override_by_graph(sharded_gm, opt_strategy, shape_info)
+        # override pytorch dtensor propagate rules to optimize dispater behavior
+        if mdconfig.override_dtensor_rule is True:
+            sharded_gm = rule_override_by_graph(sharded_gm, opt_strategy, shape_info)
 
 
-        if mdconfig.log_level <= logging.DEBUG:
-            sharded_gm.print_readable()
+    if mdconfig.log_level <= logging.DEBUG:
+        sharded_gm.print_readable()
 
-        if mdconfig.dump_fx_graph:
-            print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
-            drawer = FxGraphDrawer(sharded_gm, "shard_fx", ignore_getattr=True)
-            dot_graphs = drawer.get_all_dot_graphs()
-            for name, dot_graph in dot_graphs.items():
-                dot_graph.write_jpg(f"./tmp/{name}.jpg")
-                dot_graph.write_raw(f"./tmp/{name}.txt")
+    if mdconfig.dump_fx_graph:
+        print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
+        drawer = FxGraphDrawer(sharded_gm, "shard_fx", ignore_getattr=True)
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_raw(f"./tmp/{name}.txt")
 
     spmd_mesh = get_device_mesh('spmd')
     device = mdconfig.easydist_device
