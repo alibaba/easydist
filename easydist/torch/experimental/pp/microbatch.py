@@ -44,9 +44,7 @@ DEFAULT_CHUNK_DIM = 0
 class TensorChunkSpec:
 
     def __init__(self, split_dim):
-        self.split_dim = split_dim
-
-    split_dim: int
+        self.split_dim: int = split_dim
 
     def __repr__(self):
         return f"{self.__class__.__module__}.{self.__class__.__name__}({self.split_dim})"
