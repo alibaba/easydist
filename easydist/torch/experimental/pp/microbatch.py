@@ -185,12 +185,12 @@ def split_args_kwargs_into_chunks(
     # 1. Use pytree.tree_flatten to flatten each arg and its spec into nto a 1d array of values.
     #    To use a running example: suppose our inputs look like
     #
-    #       args = ([A, [B, C]], D) args_spec = ([None, [None, TensorChunkSpec]], None)
+    #       args = ([A, [B, C]], D) args_chunk_spec = ([None, [None, TensorChunkSpec]], None)
     #       (kwargs not shown but it's a similar process)
     #
     #    Then for this step we would end up with
     #
-    #       args = ([A, B, C], D) args_spec = ([None, None, TensorChunkSpec], None)
+    #       args = ([A, B, C], D) args_chunk_spec = ([None, None, TensorChunkSpec], None)
     #
     # 2. Shard or replicate the arguments subject to the policy in the spec. Suppose chunks = 2
     #
@@ -266,7 +266,7 @@ def merge_chunks(chunks, chunk_spec):
     #           ([A, [B, C_1]], D),
     #           ([A, [B, C_2]], D),
     #       ]
-    #       args_spec = ([None, [None, TensorChunkSpec]], None)
+    #       chunk_spec = ([None, [None, TensorChunkSpec]], None)
     #
     # 1. Flatten the chunks according to the chunk_spec
     #
