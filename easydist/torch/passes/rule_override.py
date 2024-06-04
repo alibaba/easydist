@@ -60,7 +60,7 @@ def rule_override_by_graph(fx_module: torch.fx.GraphModule, opt_strategy, shape_
         def operator_rule(op_schema: OpSchema) -> OutputSharding:
             current_cnt, lim = graph_cnt[op_name]
 
-            mesh = get_device_mesh()
+            mesh = get_device_mesh('spmd')
             dtensor_specs = []
             tot_kwargs = graph_rules[op_name][current_cnt]
 

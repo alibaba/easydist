@@ -17,7 +17,7 @@ ALL_PLATFORM = ["torch", "jax", "tvm"]
 
 class MockDeviceMesh:
 
-    def __init(self):
+    def __init__(self):
         pass
 
 

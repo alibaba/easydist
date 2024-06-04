@@ -54,16 +54,14 @@ def get_shape_info(node_output):
 
 def transform_ddp(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # (TODO) only support _fused_adam here
-    device_mesh = get_device_mesh()
-    assert "dp" in device_mesh.mesh_dim_names
-    device_mesh = device_mesh["dp"]
+    dp_mesh = get_device_mesh('dp')
     for node in traced_graph.graph.nodes:
         if node.target == torch.ops.aten._fused_adam.default:
             grad_nodes = node.args[1]
             synced_node = []
             for grad_node in grad_nodes:
                 with traced_graph.graph.inserting_before(node):
-                    ranks = device_mesh.mesh.flatten().tolist()
+                    ranks = dp_mesh.mesh.flatten().tolist()
                     reduceOp = "avg"
                     all_reduce_start_node = traced_graph.graph.call_function(all_reduce_start,
                                                                              args=(grad_node,
@@ -83,12 +81,10 @@ def transform_ddp(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> torch.fx.GraphModule:
     # (TODO) only support _fused_adam here
-    device_mesh = get_device_mesh()
-    assert "dp" in device_mesh.mesh_dim_names
-    device_mesh = device_mesh["dp"]
+    dp_mesh = get_device_mesh('dp')
 
-    dp_rank = device_mesh.get_coordinate()[0]
-    dp_size = device_mesh.size(0)
+    dp_rank = dp_mesh.get_coordinate()[0]
+    dp_size = dp_mesh.size(0)
 
     opt_state_nodes = []
 
@@ -100,7 +96,7 @@ def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> tor
                 for para_node in node.args[0]:
                     param_nodes_map[para_node.name] = para_node
 
-        ranks = device_mesh.mesh.flatten().tolist()
+        ranks = dp_mesh.mesh.flatten().tolist()
         for node in traced_graph.graph.nodes:
             if node.op == 'call_function':
                 # only insert all-gather for the backward and forward
@@ -144,7 +140,7 @@ def transform_fsdp(traced_graph: torch.fx.GraphModule, shard_param: bool) -> tor
 
                 node.update_arg(0, scattered_nodes)
 
-            ranks = device_mesh.mesh.flatten().tolist()
+            ranks = dp_mesh.mesh.flatten().tolist()
 
             # reduce_scatter the gradient
             grad_nodes = node.args[1]

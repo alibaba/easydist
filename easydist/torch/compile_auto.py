@@ -18,7 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial
-from typing import Any, cast, Set
+from typing import Any, Union, cast, Set
 from contextlib import nullcontext
 
 import numpy
@@ -38,13 +38,19 @@ import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
+from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
+from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states, set_backward_flag, set_step_flag, set_updated_params_states
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
-from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias,
+from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias, decouple_view,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
                                    sharding_transform, sharding_transform_dtensor,
                                    AllocatorProfiler, ModuleProfilingInfo)
-from easydist.torch.device_mesh import get_device_mesh, set_device_mesh
+from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
+from easydist.torch.passes.fix_node_order import fix_node_order
 from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
@@ -69,6 +75,7 @@ mem_sol = None
 mem_addr_rdy_cond = threading.Condition()
 
 def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
+    fx_module = decouple_view(fx_module)
     fx_module = fix_meta_device(fx_module)
     fx_module = fix_embedding(fx_module)
     fx_module = fix_addmm_bias(fx_module)
@@ -118,11 +125,10 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             rich.print(meta_graph)
 
         # (3) construct AutoFlowSolver and run ILP
-        device_mesh = get_device_mesh()
-        device_mesh_shape = (device_mesh.size(0), device_mesh.size(1))
+        spmd_mesh = get_device_mesh('spmd')
 
         total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-        solver = AutoFlowSolver(device_mesh_shape, total_memery=total_memery)
+        solver = AutoFlowSolver(spmd_mesh.mesh.shape, total_memery=total_memery)
 
         if mdconfig.enable_graph_coarsen:
             logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
@@ -331,7 +337,23 @@ def memory_opt(gm: torch.fx.GraphModule):
     #print(f"python codes\n{gm.code}")
 
 
-def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs):
+def _compile_auto(func,
+                  tracing_mode,
+                  init_helper,
+                  input_signature,
+                  args,
+                  kwargs,
+                  schedule_cls=None,
+                  args_chunk_spec=None,
+                  kwargs_chunk_spec=None,
+                  outputs_chunk_spec=None,
+                  num_chunks=1,
+                  return_to_all_stages=True,
+                  accumulate_grads_inplace=True,
+                  strict=True) -> Union[PipelineStage, Any]:
+    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                             args_chunk_spec, kwargs_chunk_spec)
+    args, kwargs = args_split[0], kwargs_split[0]
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -373,16 +395,17 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
                 if 'step' in named_states[n]:
                     named_states[n]['step'] -= 1
 
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+    flat_named_states, _ = pytree.tree_flatten(named_states)
 
     # fix for sgd withtout momentum
     if all(state is None for state in flat_named_states):
         named_states = {}
-        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+        flat_named_states, _ = pytree.tree_flatten(named_states)
 
     state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
 
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        clear_pp_compile_states()
         with stateless._reparametrize_module(
                 cast(torch.nn.Module, module), {
                     **params,
@@ -390,11 +413,12 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
                 }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
                     opt, named_states, params) if opt else nullcontext():
             ret = func(*args, **kwargs)
-
+        if (tup := get_updated_params_states()) != (None, None):
+            params, named_states = tup
         grads = {k: v.grad for k, v in params.items()}
         return params, buffers, named_states, grads, ret
 
-    with _enable_compile():
+    with _enable_compile(), SplitPatcher(module, opt) if schedule_cls else nullcontext():
         traced_graph = make_fx(partial(stateless_func, func),
                                tracing_mode=tracing_mode,
                                decomposition_table=EASYDIST_DECOMP_TABLE,
@@ -404,6 +428,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()
+
+    save_graphviz_dot(traced_graph, 'traced_graph')
 
     if mdconfig.dump_fx_graph:
         print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
@@ -459,10 +485,11 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
             sharded_gm = runtime_prof(sharded_gm, tiling_prof=True)
             sharded_gm = tile_comm(sharded_gm)
 
+    save_graphviz_dot(sharded_gm, f'sharded_graph_raw_{rank}')
     sharded_gm = fix_embedding(sharded_gm, recover=True)
 
     if not mdconfig.use_dtensor:
-        if mdconfig.comm_optimization is True:
+        if schedule_cls is None and mdconfig.comm_optimization is True:
             sharded_gm = runtime_prof(sharded_gm)
             sharded_gm = comm_optimize(sharded_gm, 'rcpsp', grouping=True, mem_restrain=False)
 
@@ -481,18 +508,8 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
         for name, dot_graph in dot_graphs.items():
             dot_graph.write_jpg(f"./tmp/{name}.jpg")
             dot_graph.write_raw(f"./tmp/{name}.txt")
-        print(f"sharded_gm._code: {sharded_gm._code}")
 
-    # do not use mock device after get sharded_gm
-    device_mesh = get_device_mesh()
-    if isinstance(device_mesh, TorchMockDeviceMesh):
-        if device_mesh.debug_only:
-            mesh_shape = numpy.array(range(world_size)).reshape(1, -1).tolist()
-        else:
-            mesh_shape = device_mesh.shape
-        mesh = DeviceMesh("cuda", mesh_shape)
-        set_device_mesh(mesh)
-
+    spmd_mesh = get_device_mesh('spmd')
     device = mdconfig.easydist_device
 
     # keep fake params, buffers, named_states
@@ -512,17 +529,17 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     buffers_strategy = args_strategy[len(params):len(params) + len(buffers)]
 
     if mdconfig.use_contiguous_buffer:
-        contiguous_buf = init_contiguous_buf(params, params_strategy, device_mesh)
+        contiguous_buf = init_contiguous_buf(params, params_strategy, spmd_mesh)
 
     index = 0
     for idx, param_name in enumerate(params):
         materialize_fn = init_helper.get_materialize_fn()
         materialize_fn = partial(materialize_fn,
-                                 param_buf_key=param_name,
-                                 materialization_device=device)
+                                param_buf_key=param_name,
+                                materialization_device=device)
         params[param_name] = sharded_tensor(params[param_name],
                                             params_strategy[idx],
-                                            get_device_mesh(),
+                                            spmd_mesh,
                                             materialize_fn=materialize_fn)
 
         size = params[param_name]._local_tensor.numel()
@@ -540,12 +557,12 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     for idx, buffer_name in enumerate(buffers):
         materialize_fn = init_helper.get_materialize_fn()
         materialize_fn = partial(materialize_fn,
-                                 param_buf_key=buffer_name,
-                                 materialization_device=device)
+                                param_buf_key=buffer_name,
+                                materialization_device=device)
         buffers[buffer_name] = sharded_tensor(buffers[buffer_name],
-                                              buffers_strategy[idx],
-                                              get_device_mesh(),
-                                              materialize_fn=materialize_fn)
+                                            buffers_strategy[idx],
+                                            spmd_mesh,
+                                            materialize_fn=materialize_fn)
         if not mdconfig.use_dtensor:
             buffers[buffer_name] = buffers[buffer_name]._local_tensor
 
@@ -556,15 +573,51 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
     for i in range(len(flat_named_states)):
         if isinstance(flat_named_states[i], torch.Tensor):
             flat_named_states[i] = sharded_tensor(flat_named_states[i],
-                                                  args_strategy[state_tensor_num],
-                                                  get_device_mesh(),
-                                                  materialize_fn=materialize_fn)
+                                                args_strategy[state_tensor_num],
+                                                spmd_mesh,
+                                                materialize_fn=materialize_fn)
             if not mdconfig.use_dtensor:
                 flat_named_states[i] = flat_named_states[i]._local_tensor
 
             state_tensor_num += 1
 
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
+
+    if schedule_cls is not None:
+        pp_mesh = get_device_mesh('pp')
+        pp_rank, pp_size = pp_mesh.get_coordinate()[0], pp_mesh.size()
+        traced_graph_node_metas = {
+            node.name: node.meta
+            for node in traced_graph.graph.nodes
+        }
+        sharded_gm = fix_node_order(sharded_gm)
+        stateless_func_args = (params, buffers, named_states, args, kwargs)
+        save_graphviz_dot(sharded_gm, 'sharded_graph')
+        pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
+            sharded_gm,
+            pp_size,
+            stateless_func_args,
+            phs_stragegies=args_strategy,
+            strict=strict)
+        save_graphviz_dot(pp_local_gm, f'pp_local_gm')
+        pipe = PipelineStage(
+            schedule_cls=schedule_cls,
+            local_gm=pp_local_gm,
+            compiled_meta=pp_compiled_meta,
+            stage_idx=pp_rank,
+            compiled_stage=pp_compiled_stages[pp_rank],
+            node_metas=traced_graph_node_metas,
+            num_chunks=num_chunks,
+            args_chunk_spec=args_chunk_spec,
+            kwargs_chunk_spec=kwargs_chunk_spec,
+            returns_chunk_spec=outputs_chunk_spec,
+            pp_group=pp_mesh.get_dim_groups()[0],
+            device=torch.device(f"cuda:{rank}"),
+            sharded_graph=sharded_gm,
+            return_to_all_stages=return_to_all_stages,
+            accumulate_grads_inplace=accumulate_grads_inplace
+        )
+        return pipe
 
     if mdconfig.enable_memory_opt:
         memory_opt(sharded_gm)
@@ -590,7 +643,7 @@ def _compile_auto(func, tracing_mode, init_helper, input_signature, args, kwargs
                 if isinstance(flatten_args[i], torch.Tensor):
                     flatten_args[i] = sharded_tensor(flatten_args[i].detach(),
                                                      args_strategy[args_strategy_idx],
-                                                     get_device_mesh(),
+                                                     spmd_mesh,
                                                      materialize_fn=materialize_fn)
                     if not mdconfig.use_dtensor:
                         flatten_args[i] = flatten_args[i]._local_tensor

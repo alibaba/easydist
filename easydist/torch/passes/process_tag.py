@@ -35,13 +35,11 @@ def tag_impl(input: torch.Tensor, tag: str) -> torch.Tensor:
 
 def process_tag(traced_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
-    device_mesh = get_device_mesh()
+    tp_mesh = get_device_mesh('tp')
 
     for node in traced_graph.graph.nodes:
         if node.target == torch.ops.easydist.tag.default:
             if node.args[1] == "allreduce[sum]":
-                assert "tp" in device_mesh.mesh_dim_names
-                tp_mesh = device_mesh["tp"]
                 reduceOp = "sum"
                 ranks = tp_mesh.mesh.flatten().tolist()
                 with traced_graph.graph.inserting_before(node):

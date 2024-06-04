@@ -13,67 +13,137 @@
 # ==============================================================================
 
 import logging
-import functools
-import operator
 
-import numpy
-import torch
-from torch.distributed._tensor import DeviceMesh
+from copy import deepcopy
+from typing import Dict, Optional, Sequence, Union
+
+from requests import get
+from torch.distributed._tensor import DeviceMesh, mesh_resources
 
 from easydist.metashard import metair
 from easydist.utils.testing import TorchMockDeviceMesh
 
 logger = logging.getLogger(__name__)
 
-TORCH_DEVICE_MESH = None
+class NDDeviceMesh(DeviceMesh):
+    _device_mesh: DeviceMesh
+    _binding: Dict[str, Sequence[str]]
 
+    def __init__(self, torch_mesh: DeviceMesh):
+        self._device_mesh = torch_mesh
+        self._binding = {}
+        if self._device_mesh.mesh_dim_names is None:
+            raise RuntimeError("mesh_dim_names is required")
+    
+    def __check_valid_names(self, dim_names: Sequence[str]):
+        for name in dim_names:
+            if name not in self._device_mesh.mesh_dim_names:
+                raise ValueError(f"Invalid dim name: {name}")
 
-def set_device_mesh(device_mesh):
-    global TORCH_DEVICE_MESH
-    TORCH_DEVICE_MESH = device_mesh
+    def __map_binding(self, dim_names: Union[str, Sequence[str]]) -> Sequence[str]:
+        if isinstance(dim_names, str):
+            dim_names = [dim_names]
+        
+        if len(dim_names) == 1:
+            name = dim_names[0]
+            if name in self._binding:
+                return self._binding[name]
 
-    if device_mesh.size(0) == 1:
+        self.__check_valid_names(dim_names)
+
+        return dim_names
+
+    def __get_dims(self, dim_names: Sequence[str]) -> Sequence[int]:
+        return [self._device_mesh.mesh_dim_names.index(name) for name in dim_names]
+
+    def __getitem__(self, names: Union[str, Sequence[str]]) -> 'NDDeviceMesh':
+        names = self.__map_binding(names)
+        # self coordinates
+        coord_cp = deepcopy(self._device_mesh.get_coordinate())
+        target_dims = self.__get_dims(names)
+        for dim in target_dims:
+            coord_cp[dim] = slice(None)
+        submesh_mesh = self._device_mesh.mesh[coord_cp]
+
+        submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_process_groups=False)
+        submesh._dim_group_infos = [self._device_mesh._dim_group_infos[i] for i in target_dims]
+        mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
+
+        return NDDeviceMesh(submesh)
+
+    @property
+    def device_mesh(self) -> DeviceMesh:
+        return self._device_mesh
+
+    def __getattr__(self, name: str):
+        return getattr(self._device_mesh, name)
+
+    def __repr__(self) -> str:
+        return f"NDDeviceMesh({self._device_mesh})"
+
+    def bind(self, name: str, names: Sequence[str]):
+        self.__check_valid_names(names)
+        assert name not in self._binding, f"Name {name} is already bound"
+        self._binding[name] = names
+
+def __bind_spmd(mesh: NDDeviceMesh):
+    names = []
+    for name in mesh.mesh_dim_names:
+        if "spmd" in name:
+            names.append(name)
+    if len(names) > 0:
+        mesh.bind("spmd", names)
+
+__DEFAULT_BINDINGS = [
+    __bind_spmd
+]
+
+__GLOBAL_ND_DEVICEMESH: Optional[NDDeviceMesh] = None
+
+def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
+    global __GLOBAL_ND_DEVICEMESH
+    __GLOBAL_ND_DEVICEMESH = NDDeviceMesh(torch_mesh)
+
+    if default_binding:
+        for bind_func in __DEFAULT_BINDINGS:
+            bind_func(__GLOBAL_ND_DEVICEMESH)
+
+    if "spmd0" in torch_mesh.mesh_dim_names and torch_mesh['spmd0'].size() == 1:
         metair.DEVICE_MESH_1D = 0
-    elif device_mesh.size(1) == 1:
+    elif "spmd1" in torch_mesh.mesh_dim_names and torch_mesh['spmd1'].size() == 1:
         metair.DEVICE_MESH_1D = 1
 
-    logger.info(f"set_device_mesh: {device_mesh}")
+    logger.info(f"set_device_mesh: {torch_mesh}")
 
+def get_device_mesh(*dim_names) -> NDDeviceMesh:
+    assert __GLOBAL_ND_DEVICEMESH is not None, "device mesh is not set"
+    if len(dim_names) > 0:
+        return __GLOBAL_ND_DEVICEMESH[dim_names]
+    return __GLOBAL_ND_DEVICEMESH
 
-def get_device_mesh():
-    global TORCH_DEVICE_MESH
-    return TORCH_DEVICE_MESH
+if __name__ == "__main__":
+    import os
+    rank = int(os.environ.get("RANK"))
 
+    set_device_mesh(DeviceMesh("cpu", [
+        [
+            [0, 1], # spmd1 ->
+            [2, 3]
+        ],
+        [
+            [4, 5],
+            [6, 7]
+        ]
+    ], mesh_dim_names=["pp", "spmd0", "spmd1"]))
 
-def device_mesh_world_size(device_mesh=None):
-    if device_mesh is None:
-        device_mesh = get_device_mesh()
+    mesh = get_device_mesh()
 
-    if device_mesh is None:
-        return None
+    if rank == 5:
+        print(mesh['spmd0', 'spmd1'])
+        print(mesh['spmd0', 'spmd1'].get_coordinate())
+        print(mesh['spmd1'])
+        print(mesh['pp'])
+        print(mesh['pp'].get_coordinate())
+        print(mesh['spmd'])
+        print(get_device_mesh('spmd'))
 
-    if isinstance(device_mesh, TorchMockDeviceMesh):
-        device_mesh_shape = get_device_mesh().shape
-    elif isinstance(device_mesh, DeviceMesh):
-        device_mesh_shape = tuple(get_device_mesh().mesh.shape)
-
-    return functools.reduce(operator.mul, device_mesh_shape)
-
-
-def device_mesh_rank(device_mesh, dim):
-    if device_mesh is None:
-        device_mesh = get_device_mesh()
-
-    if isinstance(device_mesh, TorchMockDeviceMesh):
-        global_rank = torch.distributed.distributed_c10d.get_rank()
-        device_mesh_shape = get_device_mesh().shape
-        world_size = functools.reduce(operator.mul, device_mesh_shape)
-        rank_coords = (numpy.arange(world_size).reshape(
-            *device_mesh_shape) == global_rank).nonzero()
-        rank = rank_coords[dim].item()
-    elif isinstance(device_mesh, DeviceMesh):
-        rank = device_mesh.get_coordinate_on_dim(dim)
-    else:
-        raise RuntimeError("DeviceMesh not support or not initialize")
-
-    return rank

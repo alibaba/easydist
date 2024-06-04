@@ -137,3 +137,25 @@ dmypy.json
 # setup
 dist/
 build/
+
+# temporary files
+md_compiled
+tmp
+
+# graphviz output files
+*.dot
+
+# cached datasets
+data
+
+# pt files
+*.pt
+
+# txt files
+*.txt
+
+# svg files
+*.svg
+
+# log folder
+log

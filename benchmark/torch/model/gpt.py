@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -158,3 +159,49 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+    
+class LowCommGPTLayer(GPTLayer):
+    def __init__(self,
+                 dim: int,
+                 num_heads: int,
+                 comm_dim: int = 1,
+                 mlp_ratio: int = 4,
+                 attention_dropout: float = 0.,
+                 dropout: float = 0.,
+                 dtype: torch.dtype = None):
+        super().__init__(dim, num_heads, mlp_ratio, attention_dropout, dropout, dtype)
+        self.decompress = nn.Linear(comm_dim, dim)
+        self.compress = nn.Linear(dim, comm_dim)
+
+    def forward(self, x):
+        x = self.decompress(x)
+        x = super().forward(x)
+        x = self.compress(x)
+        return x
+
+class SequentialLowCommGPT(nn.Sequential):
+    def __init__(self,
+                 depth: int,
+                 dim: int,
+                 num_heads: int,
+                 comm_dim: int = 1,
+                 mlp_ratio: int = 4,
+                 attention_dropout: float = 0.,
+                 dropout: float = 0.,
+                 dtype: torch.dtype = None):
+        super().__init__(OrderedDict(
+            [
+                (f'block{i}', LowCommGPTLayer(
+                    dim=dim,
+                    num_heads=num_heads,
+                    comm_dim=comm_dim,
+                    mlp_ratio=mlp_ratio,
+                    attention_dropout=attention_dropout,
+                    dropout=dropout,
+                    dtype=dtype,
+                )) for i in range(depth)
+            ]
+        ))
+
+    def forward(self, x):
+        return super().forward(x)

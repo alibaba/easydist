@@ -100,18 +100,3 @@ if "2.1.0" in torch.__version__:
     assert not hasattr(DTensorSpec, "local_shape")
     setattr(DTensorSpec, "local_shape", property(local_shape))
 
-    # Continue：fix: AttributeError: 'DeviceMesh' object has no attribute 'get_coordinate_on_dim'
-    from torch.distributed._tensor.device_mesh import DeviceMesh
-    from typing import Optional
-
-    # Borrow from https://github.com/pytorch/pytorch/blob/e9ebda29d87ce0916ab08c06ab26fd3766a870e5/torch/distributed/_tensor/device_mesh.py#L294C1-L299C81
-    # which was removed in 2.1.0
-    def get_coordinate_on_dim(self, dim: int) -> Optional[int]:
-        """
-        Return the relative index of this rank relative to a given
-        dimension of the mesh. If this rank is not part of the mesh, return None.
-        """
-        return self._coordinate_on_dim[dim] if self._coordinate_on_dim else None
-
-    assert not hasattr(DeviceMesh, "get_coordinate_on_dim")
-    setattr(DeviceMesh, "get_coordinate_on_dim", get_coordinate_on_dim)

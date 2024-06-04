@@ -28,7 +28,7 @@ from easydist.metashard import MetaOp
 from easydist.torch.utils import to_meta
 import easydist.config as mdconfig
 from .preset_propagation import preset_meta_spmd
-from .device_mesh import device_mesh_world_size
+from .device_mesh import get_device_mesh
 
 logger = logging.getLogger(__name__)
 
@@ -311,7 +311,7 @@ class EDTorchShardingAnn(Interpreter):
             return pytree.tree_unflatten(flat_args, args_specs)
 
         args, kwargs = materialize_args_kwargs(args_meta, kwargs_meta)
-        shard_size = max(2, device_mesh_world_size())
+        shard_size = max(2, get_device_mesh('spmd').size())
         meta_op = MetaOp(func=target,
                          input_args=(args, kwargs),
                          shard_size=shard_size,
