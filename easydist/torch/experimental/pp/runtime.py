@@ -71,7 +71,41 @@ class RecevPlaceholder(Placeholder):
         self.buffer = materialize_zero(example_tensor, device)
 
 
-class PipelineStage:
+class RuntimeMixin(ABC):
+    @abstractmethod
+    def forward_send_one_chunk(self) -> List[dist.Work]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def forward_compute_one_chunk(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def backward_compute_one_chunk(self) -> None:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def backward_send_one_chunk(self) -> List[dist.Work]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def merge_output_chunks(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def step(self) -> None:
+        raise NotImplementedError
+
+
+class PipelineStage(RuntimeMixin):
 
     def __init__(self, schedule_cls: Type['Schedule'], local_gm: fx.GraphModule, stage_idx: int,
                  compiled_meta: CompiledMeta, compiled_stage: CompiledStage,
@@ -274,7 +308,7 @@ class PipelineStage:
         return send_info_by_stage
 
     def _create_send_ops(self, send_info: Dict[int, List[str]], output_dict: Dict[str,
-                                                                                  torch.Tensor]):
+                                                                                  torch.Tensor]) -> List[List[dist.Work]]:
         # Send requests of a chunk
         send_ops_by_dst = defaultdict(list)
         for dst, nodes in send_info.items():
@@ -324,7 +358,7 @@ class PipelineStage:
 
         return kwargs_recv_info
 
-    def _create_recv_ops(self, recv_info: Dict[int, List[Placeholder]]):
+    def _create_recv_ops(self, recv_info: Dict[int, List[Placeholder]]) -> List[List[dist.Work]]:
         recv_ops_by_src = []
         for src, ph_list in recv_info.items():
             rec_ops = []
@@ -569,8 +603,6 @@ class PipelineStage:
 
         self.schedule()
 
-        logger.debug(f"[{self.pp_rank}] All sends finished")
-
         if self.return_to_all_stages:
             ret = self._all_gather_returns()
         else:
@@ -591,19 +623,55 @@ def print_tensor_dict(chunk, di):
 
 
 # TODO @botbw: refactor to mixin
-class Schedule(ABC):
+class Schedule(RuntimeMixin):
 
     def __init__(self, pipeline_stage: PipelineStage):
         assert isinstance(pipeline_stage, PipelineStage)
         self.pipeline_stage = pipeline_stage
 
+    @property
+    def num_chunks(self):
+        return self.pipeline_stage.num_chunks
+
+    @property
+    def fw_node(self):
+        return self.pipeline_stage.fw_node
+
+    @property
+    def bw_node(self):
+        return self.pipeline_stage.bw_node
+
+    @property
+    def step_node(self):
+        return self.pipeline_stage.step_node
+
     @abstractmethod
     def __call__(self) -> None:
         raise NotImplementedError
 
-    def __getattr__(self, name):
-        return getattr(self.pipeline_stage, name)
+    def forward_send_one_chunk(self) -> List[dist.Work]:
+        return self.pipeline_stage.forward_send_one_chunk()
+    
+    def forward_compute_one_chunk(self):
+        return self.pipeline_stage.forward_compute_one_chunk()
+    
+    def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
+        return self.pipeline_stage.forward_recv_one_chunk(wait=wait)
+    
+    def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
+        return self.pipeline_stage.backward_recv_one_chunk(wait=wait)
+    
+    def backward_compute_one_chunk(self):
+        return self.pipeline_stage.backward_compute_one_chunk()
+    
+    def backward_send_one_chunk(self) -> List[dist.Work]:
+        return self.pipeline_stage.backward_send_one_chunk()
 
+    def merge_output_chunks(self) -> Dict[str, Any]:
+        return self.pipeline_stage.merge_output_chunks()
+    
+    def step(self):
+        return self.pipeline_stage.step()
 
 class ScheduleGPipe(Schedule):
 
