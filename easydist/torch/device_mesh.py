@@ -116,7 +116,9 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
     logger.info(f"set_device_mesh: {torch_mesh}")
 
 def get_device_mesh(*dim_names) -> NDDeviceMesh:
-    assert __GLOBAL_ND_DEVICEMESH is not None, "device mesh is not set"
+    if __GLOBAL_ND_DEVICEMESH is None:
+        raise RuntimeError("Device mesh hasn't been set, please set a Torch device mesh first.")
+
     if len(dim_names) > 0:
         return __GLOBAL_ND_DEVICEMESH[dim_names]
     return __GLOBAL_ND_DEVICEMESH
