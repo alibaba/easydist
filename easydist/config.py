@@ -67,7 +67,7 @@ coarsen_level = int(os.environ.get("COARSEN_LEVEL", "0"))
 
 # Master address and port
 master_addr = os.environ.get("MASTER_ADDR", "localhost")
-master_port = int(_get_env_or_raise("MASTER_PORT"))
+master_port = int(os.environ.get("MASTER_PORT", 12888))
 
 # PyTorch
 

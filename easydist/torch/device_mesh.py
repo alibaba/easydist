@@ -17,11 +17,15 @@ import logging
 from copy import deepcopy
 from typing import Dict, Optional, Sequence, Union
 
-from requests import get
-from torch.distributed._tensor import DeviceMesh, mesh_resources
+import torch
+from torch.distributed._tensor import DeviceMesh
+
+if torch.__version__ >= (2, 3):
+    from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
+else:
+    from torch.distributed._tensor import mesh_resources
 
 from easydist.metashard import metair
-from easydist.utils.testing import TorchMockDeviceMesh
 
 logger = logging.getLogger(__name__)
 
