@@ -76,7 +76,7 @@ class PipeSplitWrapper(torch.nn.Module):
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
-def annotate_split_points(mod: torch.nn.Module, spec: set[str]):
+def annotate_split_points(mod: torch.nn.Module, spec: Set[str]):
     # TODO: make this implementation out-of-place?
     for qualname in iter(spec):
         atoms = qualname.split(".")
@@ -312,7 +312,7 @@ class CompiledMeta:
 class EDGraphModule:
     gm: torch.fx.GraphModule
     submod_type: SubmodType
-    inputs_spec: set[str]
+    inputs_spec: Set[str]
     injected_states: Dict[StateType, Dict[str, torch.Tensor]]
     outputs_spec: List[str]
     call_module_users: Dict[str, Set[str]]
@@ -763,7 +763,7 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
     return split, part_idx + 1
 
 
-def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: set[str],
+def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: Set[str],
                                      input_grads_to_output_grads: Dict[str, str]):
     new_graph = fx.Graph()
     env = {}
