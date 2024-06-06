@@ -25,7 +25,11 @@ import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
-from torch.distributed._tensor import mesh_resources
+
+if torch.__version__ >= (2, 3):
+    from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
+else:
+    from torch.distributed._tensor import mesh_resources
 
 from easydist.metashard.metair import SPMD, VarSPMDStrategy
 from easydist.torch.device_mesh import get_device_mesh

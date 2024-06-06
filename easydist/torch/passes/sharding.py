@@ -19,12 +19,16 @@ from typing import List
 import torch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor import DTensor, Replicate
-from torch.distributed._tensor import mesh_resources
 from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
+
+if torch.__version__ >= (2, 3):
+    from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
+else:
+    from torch.distributed._tensor import mesh_resources
 
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS

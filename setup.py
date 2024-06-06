@@ -91,5 +91,10 @@ setuptools.setup(
             "flax",
         ]
     },
+    entry_points = {
+        'console_scripts': [
+            'tfield-server = easydist.torch.tensorfield.server:main'
+        ]
+    },
     ext_modules=[profiling_allocator]
 )
