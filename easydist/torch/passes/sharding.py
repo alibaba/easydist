@@ -25,11 +25,6 @@ from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
 
-if torch.__version__ >= (2, 3):
-    from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
-else:
-    from torch.distributed._tensor import mesh_resources
-
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
 from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
@@ -294,9 +289,17 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
     spmd_mesh = get_device_mesh('spmd')
 
+    spmd_axis_namelist = get_device_mesh()._binding['spmd']
+    if len(spmd_axis_namelist) != 2:
+        raise NotImplementedError("only support DeviceMesh with 2D SPMD axis (`spmd1` and `spmd2`)")
+
     for i, (current, target) in sorted_placements:
         my_coordinate = spmd_mesh.get_coordinate()
-        num_chunks = spmd_mesh.size(dim=i)
+        num_chunks = spmd_mesh.size(mesh_dim=i)
+
+        spmd_axis_name = spmd_axis_namelist[i]
+        submesh = get_device_mesh(spmd_axis_name)
+        ranks = submesh.mesh.flatten().tolist()
 
         if current == target:
             continue
@@ -319,8 +322,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_shard():
                 # all_to_all
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(spmd_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     all_to_all_start_node = fx_module.graph.call_function(
                         all_to_all_start,
                         args=(var_, current.args["dim"], target.args["dim"], num_chunks,
@@ -340,8 +341,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_partial():
                 # reduce_scatter
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(spmd_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
                     reduce_scatter_start_node = fx_module.graph.call_function(
@@ -363,8 +362,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             if current.is_shard():
                 # insert all_gather here
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(spmd_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     # make sure contiguous
                     all_gather_start_node = fx_module.graph.call_function(
                         all_gather_start, args=(var_, current.args["dim"], ranks))
@@ -381,8 +378,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_partial():
                 # insert all_reduce here
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(spmd_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     all_reduce_start_node = fx_module.graph.call_function(all_reduce_start,
                                                                           args=(var_, reduceOp,

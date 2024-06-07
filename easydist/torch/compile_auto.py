@@ -766,10 +766,6 @@ def _compile_auto(func,
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-            if isinstance(local_out, torch.Tensor):
-                print(f"local_out: {local_out}")
-                #meta_info = extract_tensor_meta_info(local_out)
-                #print(meta_info)
 
             return local_out
 

@@ -26,11 +26,6 @@ import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
 
-if torch.__version__ >= (2, 3):
-    from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
-else:
-    from torch.distributed._tensor import mesh_resources
-
 from easydist.metashard.metair import SPMD, VarSPMDStrategy
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
@@ -1312,6 +1307,11 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSP
     sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
     device_mesh = get_device_mesh('spmd')
     result = tensor
+
+    spmd_axis_namelist = get_device_mesh()._binding['spmd']
+    if len(spmd_axis_namelist) != 2:
+        raise NotImplementedError("only support DeviceMesh with 2D SPMD axis (`spmd1` and `spmd2`)")
+
     for i, (current, target) in sorted_placements:
         my_coordinate = device_mesh.get_coordinate()
         num_chunks = device_mesh.size(dim=i)
@@ -1319,37 +1319,31 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSP
         if current == target:
             continue
 
+        submesh = get_device_mesh(spmd_axis_namelist[i])
+        ranks = submesh.mesh.flatten().tolist()
+
         if target.is_shard():
             if current.is_replicate():
                 result = scatter_wrapper(result, num_chunks, target.dim, my_coordinate[i])
             elif current.is_shard():
                 # all_to_all
-                submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                ranks = submesh.mesh.flatten().tolist()
-
                 result = all_to_all_start(result, current.dim, target.dim, num_chunks,
                                             my_coordinate[i], ranks)
                 result = all_to_all_end(result, current.dim, target.dim, num_chunks,
                                         my_coordinate[i], ranks)
             elif current.is_partial():
                 # reduce_scatter
-                submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                ranks = submesh.mesh.flatten().tolist()
                 reduceOp = reduce_map[current.args["ops"]]
                 # make sure contiguous
                 result = reduce_scatter_start(result, reduceOp, target.dim, ranks)
                 result = reduce_scatter_end(result, reduceOp, target.dim, ranks)
         elif target.is_replicate():
             if current.is_shard():
-                submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                ranks = submesh.mesh.flatten().tolist()
                 # make sure contiguous
                 result = all_gather_start(result, current.dim, ranks)
                 result = all_gather_end(result, current.dim, ranks)
             elif current.is_partial():
                 # insert all_reduce here
-                submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                ranks = submesh.mesh.flatten().tolist()
                 reduceOp = reduce_map[current.args["ops"]]
                 result = all_reduce_start(result, reduceOp, ranks)
                 result = all_reduce_end(result, reduceOp, ranks)
