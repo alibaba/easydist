@@ -131,8 +131,8 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
         # (3) construct AutoFlowSolver and run ILP
         spmd_mesh = get_device_mesh('spmd')
 
-        total_memery = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-        solver = AutoFlowSolver(spmd_mesh.mesh.shape, total_memery=total_memery)
+        total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        solver = AutoFlowSolver(spmd_mesh.shape, total_memery=total_memory)
 
         if mdconfig.enable_graph_coarsen:
             logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
