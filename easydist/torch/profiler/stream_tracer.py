@@ -13,8 +13,7 @@
 # ==============================================================================
 
 import torch
-from easydist.torch._C.profiling_allocator import _prepare_stream_tracer, _enable_stream_tracer, \
-                                _disable_stream_tracer, _get_stream_trace_data
+from easydist.torch.meta_allocator import profiling_allocator
 
 __all__ = [
     "StreamTracer",
@@ -43,20 +42,20 @@ class StreamTracer():
 
     def prepare_trace(self):
         self.entered = True
-        _prepare_stream_tracer()
+        profiling_allocator._prepare_stream_tracer()
 
     def start_trace(self):
         self.entered = True
-        _enable_stream_tracer()
+        profiling_allocator._enable_stream_tracer()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not self.enabled:
             return
         torch.cuda.synchronize()
-        _disable_stream_tracer()
+        profiling_allocator._disable_stream_tracer()
         return False
 
     def get_stream_trace_data(self):
-        return _get_stream_trace_data()
+        return profiling_allocator._get_stream_trace_data()
 
 
