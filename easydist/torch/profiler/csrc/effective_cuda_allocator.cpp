@@ -82,8 +82,8 @@ void* EffectiveCUDAAllocator::malloc(
   return r;
 }
 
-c10::DataPtr EffectiveCUDAAllocator::allocate(size_t size) const {
-  int device;
+c10::DataPtr EffectiveCUDAAllocator::allocate(size_t size) {
+  c10::DeviceIndex device;
   C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device);
   void* r =

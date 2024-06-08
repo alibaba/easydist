@@ -24,7 +24,7 @@ from .passes.sharding import sharding_transform
 from .device_mesh import set_device_mesh, get_device_mesh
 from .sharding_interpreter import EDTorchShardingAnn
 from .spmd_prop_rule import *
-from easydist.torch.init_meta_allocator import init_meta_allocator
+from easydist.torch.cuda.mem_allocator import init_meta_allocator
 
 # disable with torch <= 2.0.1
 if hasattr(config, "use_fake_tensor"):
@@ -40,8 +40,11 @@ def easydist_setup_torch(device, allow_tf32):
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     torch.backends.cudnn.allow_tf32 = allow_tf32
 
-    # this env var used for cuda graph
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+    # NCCL_ASYNC_ERROR_HANDLING is deprecated, use TORCH_NCCL_ASYNC_ERROR_HANDLING from torch 2.2.0
+    if torch.__version__ <= (2, 2):
+        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+    else:
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
 
     # this env var enforces the order of kernel execution on GPU as the kernel queuing order from host.
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"

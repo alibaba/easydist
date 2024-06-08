@@ -146,7 +146,7 @@ def init_tensorfield_allocator(device_index=None):
 
     tensorfield_dir = os.path.dirname(os.path.abspath(__file__))
     tensorfield = load(name="tensorfield",
-                       sources=[os.path.join(tensorfield_dir, "csrc/allocator_interface.cc")],
+                       sources=[os.path.join(tensorfield_dir, "csrc/allocator_interface.cpp")],
                        with_cuda=True)
 
     logger.info("tensorfield allocator cpp extension loaded.")

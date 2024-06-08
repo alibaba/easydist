@@ -14,13 +14,12 @@
 
 import ctypes
 
-from easydist.torch._C.profiling_allocator import _cuda_changeCurrentAllocator, \
-                                                  _cuda_customEffectiveAllocator, \
-                                                  _cuda_CUDAAllocator
+import easydist
+from easydist.torch.meta_allocator import profiling_allocator
 
 
 class _CUDAAllocator:
-    def __init__(self, allocator: _cuda_CUDAAllocator):
+    def __init__(self, allocator):
         self._allocator = allocator
 
     def allocator(self):
@@ -34,10 +33,28 @@ class EffectiveCUDAAllocator(_CUDAAllocator):
         free_fn = ctypes.cast(getattr(allocator, free_fn_name), ctypes.c_void_p).value
         assert alloc_fn is not None
         assert free_fn is not None
-        self._allocator = _cuda_customEffectiveAllocator(alloc_fn, free_fn)
+        self._allocator = profiling_allocator._cuda_customEffectiveAllocator(alloc_fn, free_fn)
 
 
 def change_current_allocator(allocator: _CUDAAllocator) -> None:
-    _cuda_changeCurrentAllocator(allocator.allocator())
+    profiling_allocator._cuda_changeCurrentAllocator(allocator.allocator())
 
+def init_meta_allocator():
+    if not easydist.config.enable_memory_opt:
+        return
+    swap_to_profiling_allocator()
+
+def swap_to_profiling_allocator():
+    # swap from caching allocator to profiling allocator
+
+    profiling_allocator._compile_if_needed()
+
+    path_to_profiling_allocator = profiling_allocator.module.__file__
+    raw_allocator = ctypes.CDLL(path_to_profiling_allocator)
+    init_fn = ctypes.cast(getattr(raw_allocator, 'init_fn'), ctypes.c_void_p).value
+    new_alloc = EffectiveCUDAAllocator(
+        path_to_profiling_allocator, 'meta_malloc', 'meta_free')
+    profiling_allocator._save_back_allocator()
+    change_current_allocator(new_alloc)
+    new_alloc.allocator().set_init_fn(init_fn)
 

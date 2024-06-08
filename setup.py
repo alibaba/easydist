@@ -14,7 +14,6 @@
 
 import os
 import setuptools
-import sysconfig
 from importlib.machinery import SourceFileLoader
 
 version = (
@@ -44,35 +43,6 @@ def get_long_description():
         long_description = fh.read()
     return long_description
 
-python_include_path = sysconfig.get_path('include')
-cuda_include_path = '/usr/local/cuda/include'
-import site
-pybind11_include_path = site.getsitepackages()[0] + '/pybind11/include'
-torch_include_path = site.getsitepackages()[0] + '/torch/include'
-cupti_include_path = '/usr/local/cuda/extras/CUPTI/include'
-cupti_lib_path = '/usr/local/cuda/extras/CUPTI/lib64'
-torch_lib_path = site.getsitepackages()[0] + '/torch/lib'
-
-profiling_allocator = setuptools.Extension('easydist.torch._C.profiling_allocator',
-                    sources = [
-                      'csrc/profiling_allocator/profiling_allocator.cpp',
-                      'csrc/profiling_allocator/stream_tracer.cpp',
-                      'csrc/profiling_allocator/cupti_callback_api.cpp',
-                      'csrc/profiling_allocator/python_tracer_init.cpp',
-                      'csrc/profiling_allocator/effective_cuda_allocator.cpp',],
-                    include_dirs=[
-                      python_include_path,
-                      cuda_include_path,
-                      torch_include_path,
-                      pybind11_include_path,
-                      cupti_include_path],
-                    libraries = ['cupti', 'c10', 'c10_cuda', 'torch_python'],
-                    library_dirs=[cupti_lib_path, torch_lib_path],
-                    extra_compile_args=[
-                      '-fPIC', '--shared', '-std=c++17',
-                      '-DUSE_CUDA=1', '-D_GLIBCXX_USE_CXX11_ABI=0'])
-
-
 setuptools.setup(
     name="pai-easydist",
     version=version,
@@ -83,6 +53,7 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/alibaba/easydist",
     packages=setuptools.find_packages(),
+    include_package_data=True,
     install_requires=get_core_requirements(),
     extras_require={
         "torch": [
@@ -98,6 +69,5 @@ setuptools.setup(
         'console_scripts': [
             'tfield-server = easydist.torch.tensorfield.server:main'
         ]
-    },
-    ext_modules=[profiling_allocator]
+    }
 )

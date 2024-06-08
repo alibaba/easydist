@@ -62,7 +62,7 @@ from easydist.utils import rgetattr, rsetattr
 from easydist.utils.testing import TorchMockDeviceMesh
 from easydist.torch.mem_allocation_info import OutVar
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
-from easydist.torch._C.profiling_allocator import _set_allocator_mode, _set_customized_flag, AllocatorMode, _set_cur_op_name
+from easydist.torch.meta_allocator import profiling_allocator
 from easydist.torch.schedule.lifetime_info import mem_owner_tracer
 
 # for pickle dump opt_strategy
@@ -204,12 +204,12 @@ def fetch_mem_sol():
 
 @torch.fx.has_side_effect
 def start_customized_allocator():
-    _set_customized_flag(True)
+    profiling_allocator._set_customized_flag(True)
     return None
 
 @torch.fx.has_side_effect
 def stop_customized_allocator():
-    _set_customized_flag(False)
+    profiling_allocator._set_customized_flag(False)
     return None
 
 def insert_customized_allocator_flag(
@@ -252,7 +252,7 @@ def insert_customized_allocator_flag(
 @torch.fx.has_side_effect
 def op_mem_checker(op_name: str, args, arg_mem_owner, new_mem_owner):
     assert mem_owner_tracer != None
-    _set_cur_op_name(op_name)
+    profiling_allocator._set_cur_op_name(op_name)
     print(f"cur node: {op_name}")
     for arg, arg_name in args:
         if isinstance(arg, torch.Tensor):
@@ -342,7 +342,7 @@ def memory_opt(gm: torch.fx.GraphModule):
         logging.info("profiling fx module's memory...")
 
     # setting allocator to profiling mode
-    _set_allocator_mode(AllocatorMode.PROFILE)
+    profiling_allocator._set_allocator_mode(profiling_allocator.AllocatorMode.PROFILE)
 
     # save all profiling information in this dict
     profiling_info = ModuleProfilingInfo(rank)
@@ -754,7 +754,7 @@ def _compile_auto(func,
 
             # run the sharded_gm
             if mdconfig.enable_memory_opt:
-                _set_allocator_mode(AllocatorMode.RUNTIME)
+                profiling_allocator._set_allocator_mode(profiling_allocator.AllocatorMode.RUNTIME)
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)
             else:
@@ -766,10 +766,6 @@ def _compile_auto(func,
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
-            if isinstance(local_out, torch.Tensor):
-                print(f"local_out: {local_out}")
-                #meta_info = extract_tensor_meta_info(local_out)
-                #print(meta_info)
 
             return local_out
 

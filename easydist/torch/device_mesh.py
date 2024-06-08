@@ -69,7 +69,10 @@ class NDDeviceMesh(DeviceMesh):
             coord_cp[dim] = slice(None)
         submesh_mesh = self._device_mesh.mesh[coord_cp]
 
-        submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_process_groups=False)
+        if torch.__version__ >= (2, 3):
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names)
+        else:
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_process_groups=False)
         submesh._dim_group_infos = [self._device_mesh._dim_group_infos[i] for i in target_dims]
         mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
 
@@ -78,6 +81,10 @@ class NDDeviceMesh(DeviceMesh):
     @property
     def device_mesh(self) -> DeviceMesh:
         return self._device_mesh
+
+    # DeviceMesh.size(dim: Optional[int]) ->  DeviceMesh.size(mesh_dim: Optional[int]) since torch 2.2.0
+    def size(self, mesh_dim: Optional[int] = None) -> int:
+        return self._device_mesh.size(mesh_dim)
 
     def __getattr__(self, name: str):
         return getattr(self._device_mesh, name)

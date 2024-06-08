@@ -37,7 +37,7 @@ struct EffectiveCUDAAllocator : public CUDAPluggableAllocator {
 
   void* malloc(size_t size, int device, cudaStream_t stream);
 
-  c10::DataPtr allocate(size_t size) const override;
+  c10::DataPtr allocate(size_t size) override;
   virtual void raw_delete(void* ptr) override;
 
   bool enable_runtime_trace_ = false;                   // debug only

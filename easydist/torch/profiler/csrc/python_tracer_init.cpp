@@ -56,10 +56,10 @@ PYBIND11_MODULE(profiling_allocator, m) {
         .def_readwrite("op_streams", &StreamTraceData::op_streams_)
         .def_readwrite("op_extra_streams", &StreamTraceData::op_extra_streams_);
 
-    py::class_<
-        c10::cuda::CUDACachingAllocator::CUDAAllocator,
-        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>>(
-        m, "_cuda_CUDAAllocator");
+    // py::class_<
+    //     c10::cuda::CUDACachingAllocator::CUDAAllocator,
+    //     std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>>(
+    //     m, "_cuda_CUDAAllocator");
 
     m.def(
         "_cuda_changeCurrentAllocator",
@@ -68,21 +68,21 @@ PYBIND11_MODULE(profiling_allocator, m) {
           torch::cuda::CUDAPluggableAllocator::changeCurrentAllocator(allocator);
         });
 
-    py::class_<
-        torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
-        c10::cuda::CUDACachingAllocator::CUDAAllocator,
-        std::shared_ptr<
-            torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>>(
-        m, "_CUDAPluggableAllocator")
-        .def(
-            "set_init_fn",
-            [](torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator& self,
-               uint64_t func_ptr) {
-              using FuncType = void(int);
-              std::function<FuncType> func =
-                  reinterpret_cast<FuncType*>(func_ptr);
-              self.set_init_fn(func);
-            });
+    // py::class_<
+    //     torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
+    //     c10::cuda::CUDACachingAllocator::CUDAAllocator,
+    //     std::shared_ptr<
+    //         torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>>(
+    //     m, "_CUDAPluggableAllocator")
+    //     .def(
+    //         "set_init_fn",
+    //         [](torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator& self,
+    //            uint64_t func_ptr) {
+    //           using FuncType = void(int);
+    //           std::function<FuncType> func =
+    //               reinterpret_cast<FuncType*>(func_ptr);
+    //           self.set_init_fn(func);
+    //         });
 
     py::class_<
         torch::cuda::CUDAPluggableAllocator::EffectiveCUDAAllocator,
