@@ -90,8 +90,12 @@ class NDDeviceMesh(DeviceMesh):
         return self._device_mesh
 
     # DeviceMesh.size(dim: Optional[int]) ->  DeviceMesh.size(mesh_dim: Optional[int]) since torch 2.2.0
-    def size(self, mesh_dim: Optional[int] = None) -> int:
-        return self._device_mesh.size(mesh_dim)
+    if torch.__version__ < (2, 2):
+        def size(self, dim: Optional[int] = None) -> int:
+            return self._device_mesh.size(dim)
+    else:
+        def size(self, mesh_dim: Optional[int] = None) -> int:
+            return self._device_mesh.size(mesh_dim)
 
     def __getattr__(self, name: str):
         return getattr(self._device_mesh, name)

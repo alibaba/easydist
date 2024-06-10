@@ -37,7 +37,11 @@ struct EffectiveCUDAAllocator : public CUDAPluggableAllocator {
 
   void* malloc(size_t size, int device, cudaStream_t stream);
 
+#if TORCH_VERSION_MAJOR>=2 && TORCH_VERSION_MINOR>=2
   c10::DataPtr allocate(size_t size) override;
+#else
+  c10::DataPtr allocate(size_t size) const override;
+#endif
   virtual void raw_delete(void* ptr) override;
 
   bool enable_runtime_trace_ = false;                   // debug only

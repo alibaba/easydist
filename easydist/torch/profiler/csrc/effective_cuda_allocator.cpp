@@ -82,8 +82,13 @@ void* EffectiveCUDAAllocator::malloc(
   return r;
 }
 
+#if TORCH_VERSION_MAJOR>=2 && TORCH_VERSION_MINOR>=2
 c10::DataPtr EffectiveCUDAAllocator::allocate(size_t size) {
   c10::DeviceIndex device;
+#else
+c10::DataPtr EffectiveCUDAAllocator::allocate(size_t size) const {
+  int device;
+#endif
   C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device);
   void* r =
