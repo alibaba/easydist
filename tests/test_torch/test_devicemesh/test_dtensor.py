@@ -35,4 +35,7 @@ if __name__ == "__main__":
     my_dtensor = my_dtensor.redistribute(spmd_mesh, [Shard(1), Shard(2)])
     assert my_dtensor._local_tensor.shape == (100000, 44, 39)
 
+    my_dtensor = my_dtensor.redistribute(spmd_mesh, [Shard(0), Shard(0)])
+    assert my_dtensor._local_tensor.shape == (25000, 88, 78)
+
     print("Passed!")
