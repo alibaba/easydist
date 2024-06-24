@@ -32,18 +32,17 @@ class Foo(torch.nn.Module):
 
     def __init__(self, enable_checkpoint=False):
         super().__init__()
-        self.enable_checkpoint = enable_checkpoint
-        self.norm = torch.nn.LayerNorm(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
+        self.conv1 = torch.nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = torch.nn.Conv2d(32, 16, 3, padding=1)
+        self.linear = torch.nn.Linear(16 * 30 * 30, 10)
 
     def forward(self, x):
-        x = self.norm(x)
-        if self.enable_checkpoint:
-            x = checkpoint(self.linear, x, preserve_rng_state=False)
-        else:
-            x = self.linear(x)
-        return x.relu()
-
+        assert x.shape[-2:] == (30, 30)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = x.view(-1, 16 * 30 * 30)
+        x = self.linear(x)
+        return x
 
 def inference_example(fake_init=True, cpu_init_helper=False):
 
@@ -59,7 +58,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo()
-        randn_input = torch.randn(1024, 1024)
+        randn_input = torch.randn(16, 3, 30, 30)
 
         if not fake_init:
             # broadcast the parameter and input
@@ -69,7 +68,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch_out = inference_step.original_func(model, randn_input)
 
     if fake_init:
-        randn_input = torch.randn(1024, 1024).cuda()
+        randn_input = torch.randn(16, 3, 30, 30).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
@@ -110,7 +109,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
 
-        randn_input = torch.randn(1024, 1024)
+        randn_input = torch.randn(16, 3, 30, 30)
 
         if not fake_init:
             # broadcast the parameter and input
@@ -127,7 +126,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
 
     # need real input for compiled func
     if fake_init:
-        randn_input = torch.randn(1024, 1024).cuda()
+        randn_input = torch.randn(16, 3, 30, 30).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:

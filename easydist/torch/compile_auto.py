@@ -558,7 +558,13 @@ def _compile_auto(func,
     rank = torch.distributed.get_rank()
 
     # Lansong(TODO) Currently send strategy by rpc. But broadcast way is more efficient.
-    rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size)
+    master_address = os.environ["MASTER_ADDR"]
+    master_port = os.environ["MASTER_PORT"]
+    rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size,rpc_backend_options=rpc.TensorPipeRpcBackendOptions(
+            init_method=f"tcp://{master_address}:{master_port}",
+            _transports=["uv", "shm"],
+            _channels=["basic"]
+    ))
     if rank == 0:
         shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map = easydist_shard(
             traced_graph, state_tensor_num, input_signature, params, buffers, named_states, args,

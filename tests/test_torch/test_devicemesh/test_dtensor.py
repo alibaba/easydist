@@ -16,13 +16,20 @@ if __name__ == "__main__":
     dim_names = ["spmd0", "spmd1", "pp"]
     size = [2, 2, 1]
     matrix = torch.arange(world_size).reshape(size)
-    
-    set_device_mesh(DeviceMesh("cuda", matrix, mesh_dim_names=dim_names))
 
-    big_tensor = torch.randn(100000, 88, 78)
+    set_device_mesh(DeviceMesh("cuda", matrix, mesh_dim_names=dim_names))
 
     spmd_mesh = get_device_mesh('spmd')
 
+    big_tensor = torch.ones(3, 4)
+    my_dtensor = distribute_tensor(big_tensor, spmd_mesh, [Replicate(), Replicate()])
+
+    big_tensor2 = torch.ones(4, 3)
+    my_dtensor2 = distribute_tensor(big_tensor2, spmd_mesh, [Shard(0), Replicate()])
+
+    ans = my_dtensor @ my_dtensor2
+    print(ans.shape, ans._local_tensor.shape, ans._spec)
+    exit()
     my_dtensor = distribute_tensor(big_tensor, spmd_mesh, [Shard(0), Replicate()])
     assert my_dtensor._local_tensor.shape == (50000, 88, 78)
     
