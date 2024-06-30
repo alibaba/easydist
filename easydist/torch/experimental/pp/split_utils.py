@@ -13,7 +13,7 @@
 # ==============================================================================
 
 from contextlib import nullcontext
-from typing import List, Union, Tuple, Any, Dict, Callable, Sequence, Optional, cast
+from typing import List, Union, Tuple, Any, Sequence, Optional, cast
 
 import torch
 import torch._custom_ops
@@ -22,6 +22,8 @@ from easydist.torch.utils import _rematerialize_optimizer
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
 from torch.nn.utils import stateless
+from easydist.torch.split_utils import _before_split, _after_split
+
 '''
 The valid parameters types are: 
 dict_keys([
@@ -191,32 +193,6 @@ def clear_pp_compile_states():
     set_backward_flag(False)
     set_updated_params_states(None, None)
     set_step_flag(False)
-
-
-_before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
-_after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
-
-
-def before_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _before_split, f"split function for {cls} already registered"
-            _before_split[cls] = func
-        return func
-
-    return _register
-
-
-def after_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _after_split, f"split function for {cls} already registered"
-            _after_split[cls] = func
-        return func
-
-    return _register
 
 
 def get_registered_by_mro(registered, cls_begin: type) -> type:
