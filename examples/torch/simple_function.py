@@ -10,7 +10,6 @@ from easydist.torch.api import easydist_compile, set_device_mesh
 
 
 def main():
-    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
     torch.distributed.init_process_group(backend="nccl")
@@ -21,15 +20,14 @@ def main():
     device_mesh = DeviceMesh('cuda', torch.arange(world_size).reshape(-1, 1), mesh_dim_names=['spmd0', 'spmd1'])
     set_device_mesh(device_mesh)
 
-    randn_x = torch.randn(10, 10, requires_grad=True).cuda()
-    randn_y = torch.randn(10, 10, requires_grad=True).cuda()
+    randn_x = torch.randn(8, 32, 16).cuda()
+    randn_y = torch.randn(8, 16, 64).cuda()
     torch.distributed.broadcast(randn_x, src=0)
     torch.distributed.broadcast(randn_y, src=0)
 
     @easydist_compile(cuda_graph=False)
     def foo_func(x, y):
-        tanh = torch.tanh(x)
-        return torch.mm(torch.exp(tanh), y) + tanh
+        return x @ y
 
     torch_out = foo_func.original_func(randn_x, randn_y)
     md_out = foo_func(randn_x, randn_y)

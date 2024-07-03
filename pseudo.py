@@ -315,9 +315,6 @@ def searchNDSolution(solutions_1d: List[Tuple[TensorAnn, CombSeq, DeviceAnn]]) -
             flatten_comb_seq = _add_comb_seq(flatten_comb_seq, comb_seq)
             cur_device_dim += 1
 
-        if rank == 0:
-            print(f"{flatten_args_ann=} {flatten_comb_seq=}")
-
         flatten_dev_ann = [getDevAnn(comb_func, gather_dim= comb_func.keywords['gather_dim'] if 'gather_dim' in comb_func.keywords else None) for comb_func in flatten_comb_seq]
 
         return flatten_args_ann, flatten_comb_seq, flatten_dev_ann
@@ -429,7 +426,50 @@ def seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def demo():
+    from easydist.metashard.annotation import ShardDim, ShardAnnotation
+    tensor1 = torch.rand(32, 16, 8)
+    tensor2 = torch.rand(32, 8, 64)
+
+    batch_matmul_shard_ann = ShardAnnotation([
+        [ShardDim(1), ShardDim(2), ShardDim(3)],
+        [ShardDim(1), ShardDim(3), ShardDim(4)]
+    ])
+
+    def expand_shard_ann(shard_ann: ShardAnnotation):
+        max_shard_idx = max(
+            dim.shard_dim_id for shard_dim_list in shard_ann.annotation for dim in shard_dim_list 
+        )
+        ans = []
+
+        for shard_idx in range(max_shard_idx + 1):
+            shard = []
+            for shard_dim_list in shard_ann.annotation:
+                shard_ann_list = []
+                for dim_ann in shard_dim_list:
+                    if dim_ann.shard_dim_id == shard_idx:
+                        shard_ann_list.append(TensorDimAnn([0]))
+                    else:
+                        shard_ann_list.append(TensorDimAnn())
+                shard.append(shard_ann_list)
+            ans.append(shard)
+        return ans
+    
+    ann_1d_expanded = expand_shard_ann(batch_matmul_shard_ann)
+    ans_1d = search1DSolution(torch.matmul, [tensor1, tensor2], ann_1d_expanded)
+    ans = searchNDSolution(ans_1d)
+
+    if rank == 0:
+        for ann in ann_1d_expanded:
+            print(f"{ann=}")
+
+        for args_ann, comb_seq, output_ann in ans:
+            print(f"{args_ann=}, {output_ann=}")
+
+
 if __name__ == '__main__':
     seed()
-    test_matmul()
+    # test_matmul()
     # test_conv()
+    demo()
