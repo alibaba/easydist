@@ -17,8 +17,8 @@ from typing import List, Union, Tuple, Any, Dict, Callable
 import torch
 
 
-_before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
-_after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
+_before_split: Dict[type, Callable[[Any], List[torch.Tensor]]] = {}
+_after_split: Dict[type, Callable[[List[torch.Tensor]], Any]] = {}
 
 def before_split_register(*classes):
 
@@ -43,8 +43,8 @@ def after_split_register(*classes):
 
 
 @before_split_register(torch.Tensor)
-def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
-    return tuple([input])
+def tensor_before_split(ctx: dict, input: torch.Tensor) -> List[torch.Tensor]:
+    return [input]
 
 
 @after_split_register(torch.Tensor)
@@ -53,7 +53,7 @@ def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
 
 
 @before_split_register(list)
-def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
+def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> List[torch.Tensor]:
     ctx['is_tensor'] = []
     ctx['non_tensor_vals'] = []
     tup = []
@@ -64,7 +64,7 @@ def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple
         else:
             ctx['non_tensor_vals'].append(x)
 
-    return tuple(tup)
+    return tup
 
 
 @after_split_register(list)
@@ -80,7 +80,7 @@ def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch
 
 
 @before_split_register(tuple)
-def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
+def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> List[torch.Tensor]:
     return list_before_split(ctx, list(input))
 
 

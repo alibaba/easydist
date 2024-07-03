@@ -17,6 +17,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from easydist.torch.scope_marker import scope_marker
+
+marker_aux_vars = []
+
 class ImageTextNet(nn.Module):
     def __init__(self, input_size_image, input_size_text, hidden_size, output_size):
         super(ImageTextNet, self).__init__()
@@ -29,18 +33,18 @@ class ImageTextNet(nn.Module):
         # combined feature
         self.fc_combined = nn.Linear(hidden_size * 2, output_size)
         
-    def forward(self, x_image, x_text):
+    def forward(self, image, text):
         # combine features
-        combined_features = self.combine_feat(x_image, x_text)
+        combined_features = self.combine_feat(image, text)
         
         output = self.fc_combined(combined_features)
         
         return output
 
-    # Lansong(TODO): mark this function as scope in traced graph
-    def combine_feat(self, x_image, x_text):
-        out_image = torch.relu(self.fc_image(x_image))
-        out_text = torch.relu(self.fc_text(x_text))
+    @scope_marker(marker_aux_vars)
+    def combine_feat(self, image, text):
+        out_image = torch.relu(self.fc_image(image))
+        out_text = torch.relu(self.fc_text(text))
         
         # combine features
         combined_features = torch.cat((out_image, out_text), dim=1)
@@ -52,15 +56,15 @@ model = ImageTextNet(input_size_image=100, input_size_text=50, hidden_size=64, o
 # random inputs
 x_image = torch.randn(32, 100)  # batch_size=32, image_feat_dim=100
 x_text = torch.randn(32, 50)    # batch_size=32, text_feat_dim=50
-y = torch.randn(32, 10)         # label_dim=10
+y_target = torch.randn(32, 10)         # label_dim=10
 
 # loss and optimizer
 criterion = nn.MSELoss()
 optimizer = optim.SGD(model.parameters(), lr=0.01)
 
-def train_step(mage, text, target):
-    output = model(x_image, x_text)
-    loss = criterion(output, y)
+def train_step(image, text, target):
+    output = model(image, text)
+    loss = criterion(output, target)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -69,26 +73,34 @@ def train_step(mage, text, target):
 
 print("run origin model")
 for epoch in range(100):
-    loss = train_step(x_image, x_text, y)
+    loss = train_step(x_image, x_text, y_target)
 
     if (epoch+1) % 10 == 0:
         print(f'Epoch [{epoch+1}/{100}], Loss: {loss.item():.4f}')
 
 
 def forward_backward_pass(image, text, target):
-    output = model(x_image, x_text)
-    loss = criterion(output, y)
-    optimizer.zero_grad()
-    loss.backward()
-    return output, loss
+    output = model(image, text)
+    loss = criterion(output, target)
+    params = list(model.parameters())
+    params = params + marker_aux_vars
+    grads = torch.autograd.grad(loss, params, allow_unused=True)
+
+    return output, loss, grads
 
 
-traced_graph = make_fx(forward_backward_pass)(x_image, x_text, y)
+traced_graph = make_fx(forward_backward_pass)(x_image, x_text, y_target)
+
+print(traced_graph)
+
+for node in traced_graph.graph.nodes:
+    print(f"Node: {node.name}, Op: {node.op}, Target: {node.target}, Args: {node.args}")
 
 # training loop
 print("\nrun traced graph")
 for epoch in range(100):
-    _, loss = traced_graph(x_image, x_text, y)
+    with torch.no_grad():
+        _, loss, _ = traced_graph(x_image, x_text, y_target)
     optimizer.step()
 
     if (epoch+1) % 10 == 0:
