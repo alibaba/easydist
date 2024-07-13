@@ -1,4 +1,4 @@
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/simple_model.py
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 8 examples/torch/simple_model.py --mode train
 import argparse
 import copy
 import logging
@@ -32,17 +32,18 @@ class Foo(torch.nn.Module):
 
     def __init__(self, enable_checkpoint=False):
         super().__init__()
-        self.conv1 = torch.nn.Conv2d(3, 32, 3, padding=1)
-        self.conv2 = torch.nn.Conv2d(32, 16, 3, padding=1)
-        self.linear = torch.nn.Linear(16 * 30 * 30, 10)
+        self.enable_checkpoint = enable_checkpoint
+        self.norm = torch.nn.LayerNorm(1024)
+        self.linear = torch.nn.Linear(1024, 1024)
 
     def forward(self, x):
-        assert x.shape[-2:] == (30, 30)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = x.view(-1, 16 * 30 * 30)
-        x = self.linear(x)
+        x = self.norm(x)
+        if self.enable_checkpoint:
+            x = checkpoint(self.linear, x, preserve_rng_state=False)
+        else:
+            x = self.linear(x)
         return x
+
 
 def inference_example(fake_init=True, cpu_init_helper=False):
 
@@ -58,7 +59,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo()
-        randn_input = torch.randn(16, 3, 30, 30)
+        randn_input = torch.randn(1024, 1024)
 
         if not fake_init:
             # broadcast the parameter and input
@@ -68,7 +69,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch_out = inference_step.original_func(model, randn_input)
 
     if fake_init:
-        randn_input = torch.randn(16, 3, 30, 30).cuda()
+        randn_input = torch.randn(1024, 1024).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
@@ -99,7 +100,6 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
         out.backward()
         opt.step()
         opt.zero_grad(True)
-
         return out
 
     fake_mode = FakeTensorMode()
@@ -109,24 +109,24 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
         model = Foo(enable_checkpoint)
 
-        randn_input = torch.randn(16, 3, 30, 30)
+        randn_input = torch.randn(1024, 1024)
 
         if not fake_init:
             # broadcast the parameter and input
             model = broadcast_module(model)
             torch.distributed.broadcast(randn_input, src=0)
 
-        opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
+        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True)
 
         model_2 = copy.deepcopy(model)
-        opt_2 = torch.optim.Adam(model_2.parameters(), lr=0.001, foreach=True, capturable=True)
+        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True)
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)
 
     # need real input for compiled func
     if fake_init:
-        randn_input = torch.randn(16, 3, 30, 30).cuda()
+        randn_input = torch.randn(1024, 1024).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
@@ -134,7 +134,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
         module = broadcast_module(module)
         train_step.register_cpu_module(copy.deepcopy(module).to("cuda"))
 
-        opt = torch.optim.Adam(module.parameters(), lr=0.001, foreach=True, capturable=True)
+        opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
         torch_step_1_result = train_step.original_func(randn_input, module, opt)
         torch_step_2_result = train_step.original_func(randn_input, module, opt)
@@ -169,7 +169,6 @@ def main():
     args = parser.parse_args()
 
     # setting up easydist and torch.distributed
-    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
     torch.distributed.init_process_group(backend="nccl")
@@ -177,8 +176,8 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    mesh = torch.arange(world_size).reshape(1, -1)
-    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1"]))
+    mesh = torch.arange(world_size).reshape(4)
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,

@@ -55,34 +55,30 @@ def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
 
     resharding_cost = 0
 
-    s1_in, s2_in = strategy_in[0], strategy_in[1]
-    s1_out, s2_out = strategy_out[0], strategy_out[1]
+    assert len(device_mesh) == len(strategy_in) == len(strategy_out), f"{device_mesh}, {strategy_in}, {strategy_out}"
+    n_devices_total = n_devices_shard_total = 1
 
-    if device_mesh[0] > 1:
-        message_size = var_size
-        if s2_in.is_shard():
-            message_size /= device_mesh[1]
-        if s1_in.is_shard():
-            if s1_out.is_shard():
-                if s1_in.args != s1_out.args:
-                    resharding_cost += all_to_all(message_size, device_mesh[0])
-            else:
-                resharding_cost += all_gather(message_size, device_mesh[0])
-        elif s1_in.is_partial():
-            resharding_cost += all_reduce(message_size, device_mesh[0])
+    for n_devices_on_dim, s_in in zip(device_mesh, strategy_in):
+        if s_in.is_shard():
+            n_devices_shard_total *= n_devices_on_dim
+        n_devices_total *= n_devices_on_dim
 
-    if device_mesh[1] > 1:
+    for n_devices_on_dim, s_in, s_out in zip(
+        device_mesh, strategy_in, strategy_out
+    ):
         message_size = var_size
-        if s1_in.is_shard():
-            message_size /= device_mesh[0]
-        if s2_in.is_shard():
-            if s2_out.is_shard():
-                if s2_in.args != s2_out.args:
-                    resharding_cost += all_to_all(message_size, device_mesh[1])
+        n_devices_shard_other = n_devices_shard_total
+        if s_in.is_shard():
+            n_devices_shard_other /= n_devices_on_dim
+        message_size /= n_devices_shard_other
+        if s_in.is_shard():
+            if s_out.is_shard():
+                if s_in.args != s_out.args:
+                    resharding_cost += all_to_all(message_size, n_devices_on_dim)
             else:
-                resharding_cost += all_gather(message_size, device_mesh[1])
-        elif s2_in.is_partial():
-            resharding_cost += all_reduce(message_size, device_mesh[1])
+                resharding_cost += all_gather(message_size, n_devices_on_dim)
+        elif s_in.is_partial():
+            resharding_cost += all_reduce(message_size, n_devices_on_dim)
 
     return resharding_cost
 
@@ -93,15 +89,13 @@ def calculate_memory_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
 
     memory_cost = 0
 
+    assert len(device_mesh) == len(strategy_in) == len(strategy_out), f"{device_mesh}, {strategy_in}, {strategy_out}"
     # FIXME: only use out_strategy here for shard_size is ok?
-    for strategy in [strategy_in, strategy_out]:
-        s1, s2 = strategy[0], strategy[1]
+    for strategy in (strategy_in, strategy_out):
         shard_size = 1
-        if s1.is_shard():
-            shard_size *= device_mesh[0]
-        if s2.is_shard():
-            shard_size *= device_mesh[1]
-
+        for n_devices_on_dim, s in zip(device_mesh, strategy):
+            if s.is_shard():
+                shard_size *= n_devices_on_dim
         memory_cost += var_size // shard_size
 
     return memory_cost
@@ -454,13 +448,10 @@ class AutoFlowSolver:
                     strategy = down_strategy[i].in_strtg_group[idx_for_down]
 
                     # FIXME: only use out_strategy here for shard_size is ok?
-                    s1, s2 = strategy[0], strategy[1]
                     shard_size = 1
-                    if s1.state == SPMD.SHARD:
-                        shard_size *= self.device_mesh[0]
-                    if s2.state == SPMD.SHARD:
-                        shard_size *= self.device_mesh[1]
-
+                    for n_device_on_dim, s in zip(self.device_mesh, strategy):
+                        if s.state == SPMD.SHARD:
+                            shard_size *= n_device_on_dim
                     memory_cost_list.append(var_size // shard_size)
 
                 return memory_cost_list
@@ -591,7 +582,7 @@ class AutoFlowSolver:
                 mem_cost = mem_cost + mip.xsum(mip_var[i][j] * mem_matrix[i][j]
                                                for i in range(shape_1) for j in range(shape_2))
 
-            def _mem_cost(var_size, down_strategy: 'list[VarSPMDStrategy]'):
+            def _mem_cost(var_size, down_strategy: List[VarSPMDStrategy]):
                 memory_cost_list = []
                 for i in range(len(down_strategy)):
                     strategy = down_strategy[i]

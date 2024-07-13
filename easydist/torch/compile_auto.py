@@ -21,7 +21,6 @@ from functools import partial
 from typing import Any, Union, cast, Set, Dict, List, Tuple
 from contextlib import nullcontext
 
-import numpy
 import rich
 import intervaltree
 import torch
@@ -155,7 +154,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
         if mdconfig.log_level <= logging.DEBUG:
             rich.print(sharding_strategy)
 
-        args_strategy = meta_graph.get_input_strategy(opt_strategy)
+        args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
 
@@ -608,7 +607,7 @@ def _compile_auto(func,
 
     if mdconfig.dump_fx_graph:
         print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
-        drawer = FxGraphDrawer(sharded_gm, "shard_fx", ignore_getattr=True)
+        drawer = FxGraphDrawer(sharded_gm, f"shard_fx-{rank}", ignore_getattr=True)
         dot_graphs = drawer.get_all_dot_graphs()
         for name, dot_graph in dot_graphs.items():
             dot_graph.write_jpg(f"./tmp/{name}.jpg")

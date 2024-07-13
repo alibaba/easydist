@@ -14,7 +14,7 @@
 
 import operator
 import logging
-from typing import List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.utils._pytree as pytree
@@ -281,66 +281,122 @@ def sharding_transform_dtensor(fx_module: torch.fx.GraphModule, sharding_strateg
     return fx_module
 
 
+def _replicate_then_shard(tup: Tuple[int, SPMD, SPMD]) -> int:
+    """
+    This is a helper function to allow reordering _TransformInfo list. The high level
+    idea is that we want to reorder the sharding redistributions so that the DTensor
+    redistribution is consistent with its full tensor. This is built on top of two simple
+    assumptions:
+    1. Replication happens from inner to outer dimension. i.e. Shard -> Replicate
+    2. Sharding happens from outer to inner dimension, i.e. Replicate -> Shard
+
+    So we always put the replication first and put sharding later.
+    """
+    mesh_dim, src, dst = tup
+    if (dst.is_replicate() or dst.is_partial()) and src.is_shard():
+        return -mesh_dim
+    elif (src.is_replicate() or src.is_partial()) and dst.is_shard():
+        return mesh_dim
+    else:
+        return 0
+
+
+def _gen_transform_infos(
+    src_placements: List[SPMD],
+    dst_placements: List[SPMD],
+) -> List[Tuple[int, SPMD, SPMD]]:
+    src_dim_counts: Dict[int, int] = {}
+    dst_dim_counts: Dict[int, int] = {}
+    transform_infos: List[Tuple[int, SPMD, SPMD]] = []
+    mesh_ndim = len(src_placements)
+
+    for i, (src, dst) in enumerate(zip(src_placements, dst_placements)):
+        # detect mis-aligned sharding and build logical shapes
+        if src.is_shard():
+            src_dim_counts[src.args['dim']] = src_dim_counts.get(src.args['dim'], 0) + 1
+
+        if dst.is_shard():
+            dst_dim_counts[dst.args['dim']] = dst_dim_counts.get(dst.args['dim'], 0) + 1
+
+        if (
+            src.is_shard()
+            and dst.is_shard()
+            and (mesh_ndim > 1 or src_dim_counts[src.args['dim']] != dst_dim_counts[dst.args['dim']])
+        ):
+            # decompose Shard(i) -> Shard(j) into Shard(i) -> Replicate() -> Shard(j)
+            transform_infos.append((i, src, SPMD(SPMD.REPLICATE)))
+            transform_infos.append((i, SPMD(SPMD.REPLICATE), dst))
+        else:
+            transform_infos.append((i, src, dst))
+
+    # sort the pairs by first perform replication then sharding
+    transform_infos.sort(key=_replicate_then_shard)
+    return transform_infos
+
+
 def insert_comm_node(fx_module: torch.fx.GraphModule,
                      node,
                      var_,
-                     sorted_placements,
+                     src_specs: List[SPMD],
+                     tgt_specs: List[SPMD],
                      copy_innode=None):
 
     spmd_mesh = get_device_mesh('spmd')
-
     spmd_axis_namelist = get_device_mesh()._binding['spmd']
-    if len(spmd_axis_namelist) != 2:
-        raise NotImplementedError("only support DeviceMesh with 2D SPMD axis (`spmd1` and `spmd2`)")
+    my_coordinate = spmd_mesh.get_coordinate()
 
-    for i, (current, target) in sorted_placements:
-        my_coordinate = spmd_mesh.get_coordinate()
+    sorted_placements = _gen_transform_infos(src_specs, tgt_specs)
+
+    for i, current, target in sorted_placements:
         num_chunks = spmd_mesh.size(mesh_dim=i)
-
         spmd_axis_name = spmd_axis_namelist[i]
+
         submesh = get_device_mesh(spmd_axis_name)
         ranks = submesh.mesh.flatten().tolist()
 
         if current == target:
             continue
 
-        if target.is_shard():
-            if current.is_replicate():
-                # insert split_tensor here
-                with fx_module.graph.inserting_before(node):
+        with fx_module.graph.inserting_before(node):
+            if target.is_shard():
+                if current.is_replicate():
+                    # insert split_tensor here
                     scatter_node = fx_module.graph.call_function(scatter_wrapper,
-                                                                 args=(var_, num_chunks,
-                                                                       target.args["dim"],
-                                                                       my_coordinate[i]))
+                                                                    args=(var_, num_chunks,
+                                                                        target.args["dim"],
+                                                                        my_coordinate[i]))
 
                     if copy_innode is not None:
                         copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                  args=(copy_innode, scatter_node))
+                                                                    args=(copy_innode, scatter_node))
                         node.replace_input_with(var_, copy_node)
+                        var_ = copy_node
                     else:
                         node.replace_input_with(var_, scatter_node)
-            elif current.is_shard():
-                # all_to_all
-                with fx_module.graph.inserting_before(node):
-                    all_to_all_start_node = fx_module.graph.call_function(
-                        all_to_all_start,
-                        args=(var_, current.args["dim"], target.args["dim"], num_chunks,
-                              my_coordinate[i], ranks))
-                    all_to_all_end_node = fx_module.graph.call_function(
-                        all_to_all_end,
-                        args=(all_to_all_start_node, current.args["dim"], target.args["dim"],
-                              num_chunks, my_coordinate[i], ranks))
+                        var_ = scatter_node
+                elif current.is_shard():
+                    if current.args["dim"] != target.args["dim"]:
+                        # all_to_all
+                        all_to_all_start_node = fx_module.graph.call_function(
+                            all_to_all_start,
+                            args=(var_, current.args["dim"], target.args["dim"], num_chunks,
+                                    my_coordinate[i], ranks))
+                        all_to_all_end_node = fx_module.graph.call_function(
+                            all_to_all_end,
+                            args=(all_to_all_start_node, current.args["dim"], target.args["dim"],
+                                    num_chunks, my_coordinate[i], ranks))
 
-                    if copy_innode is not None:
-                        copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                  args=(copy_innode,
-                                                                        all_to_all_end_node))
-                        node.replace_input_with(var_, copy_node)
-                    else:
-                        node.replace_input_with(var_, all_to_all_end_node)
-            elif current.is_partial():
-                # reduce_scatter
-                with fx_module.graph.inserting_before(node):
+                        if copy_innode is not None:
+                            copy_node = fx_module.graph.call_function(copy_wrapper,
+                                                                        args=(copy_innode,
+                                                                            all_to_all_end_node))
+                            node.replace_input_with(var_, copy_node)
+                            var_ = copy_node
+                        else:
+                            node.replace_input_with(var_, all_to_all_end_node)
+                            var_ = all_to_all_end_node
+                elif current.is_partial():
+                    # reduce_scatter
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
                     reduce_scatter_start_node = fx_module.graph.call_function(
@@ -352,16 +408,16 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
                     if copy_innode is not None:
                         copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                  args=(copy_innode,
+                                                                    args=(copy_innode,
                                                                         reduce_scatter_end_node))
                         node.replace_input_with(var_, copy_node)
+                        var_ = copy_node
                     else:
                         node.replace_input_with(var_, reduce_scatter_end_node)
-
-        elif target.is_replicate():
-            if current.is_shard():
-                # insert all_gather here
-                with fx_module.graph.inserting_before(node):
+                        var_ = reduce_scatter_end_node
+            elif target.is_replicate():
+                if current.is_shard():
+                    # insert all_gather here
                     # make sure contiguous
                     all_gather_start_node = fx_module.graph.call_function(
                         all_gather_start, args=(var_, current.args["dim"], ranks))
@@ -370,17 +426,18 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
                     if copy_innode is not None:
                         copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                  args=(copy_innode,
+                                                                    args=(copy_innode,
                                                                         all_gather_end_node))
                         node.replace_input_with(var_, copy_node)
+                        var_ = copy_node
                     else:
                         node.replace_input_with(var_, all_gather_end_node)
-            elif current.is_partial():
-                # insert all_reduce here
-                with fx_module.graph.inserting_before(node):
+                        var_ = all_gather_end_node
+                elif current.is_partial():
+                    # insert all_reduce here
                     reduceOp = reduce_map[current.args["ops"]]
                     all_reduce_start_node = fx_module.graph.call_function(all_reduce_start,
-                                                                          args=(var_, reduceOp,
+                                                                            args=(var_, reduceOp,
                                                                                 ranks))
 
                     all_reduce_end_node = fx_module.graph.call_function(
@@ -388,14 +445,15 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
                     if copy_innode is not None:
                         copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                  args=(copy_innode,
+                                                                    args=(copy_innode,
                                                                         all_reduce_end_node))
                         node.replace_input_with(var_, copy_node)
+                        var_ = copy_node
                     else:
                         node.replace_input_with(var_, all_reduce_end_node)
+                        var_ = all_reduce_end_node
 
     return fx_module
-
 
 # some of this part from torch/distributed/_tensor/ops/view_ops.py
 def override_args(node, invars_strategy):
@@ -430,6 +488,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
     shard_env = {}
 
+    spme_mesh = get_device_mesh('spmd')
+
     # (TODO) move this part out of this pass
     for node in fx_module.graph.nodes:
         if node.op == 'call_function' and 'val' not in node.meta:
@@ -447,7 +507,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                 shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group[0]
             else:
                 # TODO: only support 2d device mesh here
-                shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
+                shard_env[node.name] = VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(spme_mesh.ndim)])
 
             all_placeholder_node[node.name] = node
         elif node.op == 'call_function':
@@ -456,7 +516,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
             ops_name = _get_qualified_name(node.target)
             if node.target in CREATE_ATEN_OP:
                 # TODO: only support 2d device mesh here
-                shard_env[node.name] = VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE))
+                shard_env[node.name] = VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(spme_mesh.ndim)])
                 continue
 
             if node.target == operator.getitem:
@@ -479,12 +539,15 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
             assert len(invars) == len(invars_strategy)
 
+            visited = set()
             for var_, tgt_specs in zip(invars, invars_strategy):
+                if var_ in visited:  # same var may appear multiple times but only need to process once
+                    continue
+                visited.add(var_)
                 src_specs = shard_env[var_.name]
                 if tgt_specs != src_specs:
                     # mismatch need to insert communication node
-                    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
-                    fx_module = insert_comm_node(fx_module, node, var_, sorted_placements)
+                    fx_module = insert_comm_node(fx_module, node, var_, src_specs, tgt_specs)
 
             shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
             if len(shard_env[node.name]) == 1 and node.target not in ANNOTATION_OPS:  # ANNOTATION_OPS returns tensor list, no need to unwrap
@@ -499,8 +562,7 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                 tgt_specs = VarSPMDStrategy(*tgt_specs)
                 if tgt_specs != src_specs:
                     # mismatch need to insert communication node
-                    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
-                    fx_module = insert_comm_node(fx_module, node, o_node, sorted_placements)
+                    fx_module = insert_comm_node(fx_module, node, o_node, src_specs, tgt_specs)
 
             for in_node, out_node in state_io_map.items():
                 if in_node.name in shard_env:
@@ -514,40 +576,49 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                     assert o_node is not None
                     if tgt_specs != src_specs:
                         # mismatch need to insert communication node
-                        sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
                         fx_module = insert_comm_node(
                             fx_module,
                             node,
                             o_node,
-                            sorted_placements,
+                            src_specs,
+                            tgt_specs,
                             copy_innode=all_placeholder_node[in_node.name])
 
     fx_module.recompile()
 
+
     # (TODO) move this part out of this pass
-    for node in fx_module.graph.nodes:
-        if not hasattr(node, "ed_info"):
-            node.ed_info = EDInfo(ori_meta=node.meta)
+    try:
+        for node in fx_module.graph.nodes:
+            if not hasattr(node, "ed_info"):
+                node.ed_info = EDInfo(ori_meta=node.meta)
 
-        if node.name in opt_strategy:
-            node.ed_info.strategy = opt_strategy[node.name]['strategy']
+            if node.name in opt_strategy:
+                node.ed_info.strategy = opt_strategy[node.name]['strategy']
 
-        node.meta = node.ed_info.get_sharded_meta()
+            node.meta = node.ed_info.get_sharded_meta()
 
-        if node.op == 'placeholder':
-            node.ed_info.node_type = EDNodeType.AUXILIARY
-        elif node.op == 'call_function':
-            # create meta for custom function
-            # if node.target in CUSTOM_FUNCS:
-            node.meta = create_meta_from_node(node)
-            # annotate node type
-            if node.target in COMM_FUNCS:
-                node.ed_info.node_type = EDNodeType.COMMUNICATION
-            elif node.target == operator.getitem:
+            if node.op == 'placeholder':
                 node.ed_info.node_type = EDNodeType.AUXILIARY
-            else:
-                node.ed_info.node_type = EDNodeType.COMPUTATION
-        elif node.op == 'output':
-            node.ed_info.node_type = EDNodeType.AUXILIARY
+            elif node.op == 'call_function':
+                # create meta for custom function
+                # if node.target in CUSTOM_FUNCS:
+                node.meta = create_meta_from_node(node)
+                # annotate node type
+                if node.target in COMM_FUNCS:
+                    node.ed_info.node_type = EDNodeType.COMMUNICATION
+                elif node.target == operator.getitem:
+                    node.ed_info.node_type = EDNodeType.AUXILIARY
+                else:
+                    node.ed_info.node_type = EDNodeType.COMPUTATION
+            elif node.op == 'output':
+                node.ed_info.node_type = EDNodeType.AUXILIARY
+    except Exception as e:
+        drawer = torch.fx.passes.graph_drawer.FxGraphDrawer(fx_module, f"sharding_transform")
+        dot_graphs = drawer.get_all_dot_graphs()
+        for name, dot_graph in dot_graphs.items():
+            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+        raise e
+
 
     return fx_module

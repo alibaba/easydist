@@ -85,7 +85,7 @@ def test_main(args):
     module = SequentialLowCommGPT(depth=case.num_layers,
                                   dim=case.hidden_dim,
                                   num_heads=case.num_heads,
-                                  comm_dim=comm_dim)
+                                  comm_dim=comm_dim).cuda()
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
 
     annotate_split_points(module, {'block3', 'block7', 'block11'})
@@ -104,7 +104,7 @@ def test_main(args):
         opt.zero_grad()
         return out
 
-    train_dataloader = [torch.ones(batch_size, case.seq_size, comm_dim)
+    train_dataloader = [torch.ones(batch_size, case.seq_size, comm_dim, device='cuda')
                         ] * (dataset_size // batch_size)
 
     x_batch = next(iter(train_dataloader))

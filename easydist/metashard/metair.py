@@ -16,12 +16,12 @@ from __future__ import annotations
 import copy
 import os
 import logging
-from typing import List
+from typing import List, Tuple
 from functools import reduce
 
-from easydist.metashard.combination import ReduceOp
 from easydist.platform import get_backend
 import easydist.config as mdconfig
+from easydist.torch.device_mesh import get_device_mesh
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class SPMD:
 class VarSPMDStrategy:
 
     def __init__(self, *var_spmd_strategy) -> None:
-        self.var_spmd_strategy = list(var_spmd_strategy)
+        self.var_spmd_strategy : List[SPMD] = list(var_spmd_strategy)
 
     def __getitem__(self, idx) -> SPMD:
         return self.var_spmd_strategy[idx]
@@ -89,12 +89,15 @@ class VarSPMDStrategy:
 
     def __repr__(self) -> str:
         return self.__str__()
+    
+    def __iter__(self):
+        return iter(self.var_spmd_strategy)
 
 
 class VarSPMDStrategyGroup:
 
     def __init__(self, *var_spmd_strategy_group) -> None:
-        self.var_spmd_strategy_group = list(var_spmd_strategy_group)
+        self.var_spmd_strategy_group : List[VarSPMDStrategy] = list(var_spmd_strategy_group)
 
     def append(self, var_spmd_strategy: VarSPMDStrategy) -> None:
         self.var_spmd_strategy_group.append(var_spmd_strategy)
@@ -168,7 +171,7 @@ class NodeSPMDStrategyPool:
         return len(self.strategies)
 
     def __str__(self) -> str:
-        return f"{self.strategies})"
+        return f"({self.strategies})"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -408,48 +411,44 @@ class MetaNode:
         #         del strategy_list[del_idx]
 
         self.strtg_pool = NodeSPMDStrategyPool()
-        if DEVICE_MESH_1D == -1:
-            for idx1, s1 in enumerate(strategy_list_1d):
-                for idx2, s2 in enumerate(strategy_list_1d):
-                    # [Shard(i), Shard(i)] is not support for pytorch dtensor runtime
-                    if get_backend() == "torch":
-                        if any(i.state == SPMD.SHARD for i in s1.in_strtg_group) and idx1 == idx2:
-                            continue
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i, j in zip(s1.in_strtg_group, s2.in_strtg_group):
-                        invars_strategy.append(i + j)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i, j in zip(s1.out_strtg_group, s2.out_strtg_group):
-                        outvars_strategy.append(i + j)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-        else:
-            replicate_ = VarSPMDStrategy(SPMD(SPMD.REPLICATE))
-            for s in strategy_list_1d:
-                if DEVICE_MESH_1D == 0:
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i in s.in_strtg_group:
-                        invars_strategy.append(replicate_ + i)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i in s.out_strtg_group:
-                        outvars_strategy.append(replicate_ + i)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-                elif DEVICE_MESH_1D == 1:
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i in s.in_strtg_group:
-                        invars_strategy.append(i + replicate_)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i in s.out_strtg_group:
-                        outvars_strategy.append(i + replicate_)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-                else:
-                    exit(-1)
+
+        def searchNDStrategies(strategies_1d: List[NodeSPMDStrategy]) -> List[NodeSPMDStrategy]:
+            device_mesh = get_device_mesh()
+            spmd_mesh = device_mesh['spmd']
+            res = []
+
+            def flattenStrategies(cur_in_var_grp: List[VarSPMDStrategyGroup], cur_out_var_grp: List[VarSPMDStrategyGroup]) -> NodeSPMDStrategy:
+                assert len(set(map(len, cur_in_var_grp))) == 1 and len(set(map(len, cur_out_var_grp))) == 1, "flattenStrategies: all VarSPMDStrategyGroup should have the same length"
+
+                invars_strategy = VarSPMDStrategyGroup()
+                for nd_strg in zip(*cur_in_var_grp):
+                    invars_strategy.append(reduce(lambda x, y: x + y, nd_strg))
+                
+                outvars_strategy = VarSPMDStrategyGroup()
+                for nd_strg in zip(*cur_out_var_grp):
+                    outvars_strategy.append(reduce(lambda x, y: x + y, nd_strg))
+
+                return NodeSPMDStrategy(invars_strategy, outvars_strategy)
+
+            def _searchNDStrategies(cur_device_dim: int, cur_in_var_grp: List[VarSPMDStrategyGroup], cur_out_var_grp: List[VarSPMDStrategyGroup]):
+                if cur_device_dim >= spmd_mesh.mesh.dim():
+                    res.append(flattenStrategies(cur_in_var_grp, cur_out_var_grp))
+                    return
+
+                for x in strategies_1d:
+                    _searchNDStrategies(cur_device_dim + 1, cur_in_var_grp + [x.in_strtg_group], cur_out_var_grp + [x.out_strtg_group])
+
+            _searchNDStrategies(0, [], [])
+
+            return res
+
+        for strategy in searchNDStrategies(strategy_list_1d):
+            self.strtg_pool.add_strategy(strategy)
 
         if mdconfig.log_level <= logging.DEBUG:
             print("node: %s" % self.name.__str__())
             print(self.strtg_pool)
+
         return self.strtg_pool
 
     def __str__(self) -> str:
@@ -899,7 +898,7 @@ class MetaGraph:
                 f.write(self.__str__())
             logger.info(f"MetaIR dump into {filename}")
 
-    def get_input_strategy(self, opt_strategy):
+    def get_input_strategy(self, opt_strategy, device_mesh: Tuple[int, ...]):
 
         partial_strategy = {}
         for op in self.op_list:
@@ -916,7 +915,7 @@ class MetaGraph:
             if var.name in partial_strategy:
                 partial_strategy_list.append(partial_strategy[var.name])
             else:
-                partial_strategy_list.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE)))
+                partial_strategy_list.append(VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(len(device_mesh))]))
 
         return partial_strategy_list
 
