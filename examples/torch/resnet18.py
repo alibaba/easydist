@@ -1,7 +1,6 @@
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 8 examples/torch/simple_model.py --mode train
+# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/resnet18.py --mode train
 import argparse
 import copy
-import logging
 import os
 from contextlib import nullcontext
 
@@ -11,6 +10,8 @@ from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
 from torch.utils.checkpoint import checkpoint
 from torch.distributed._tensor import DeviceMesh
+
+from torchvision.models import resnet18
 
 from easydist import easydist_setup, mdconfig
 from easydist.torch.api import easydist_compile
@@ -28,23 +29,6 @@ def broadcast_module(model):
     return model
 
 
-class Foo(torch.nn.Module):
-
-    def __init__(self, enable_checkpoint=False):
-        super().__init__()
-        self.enable_checkpoint = enable_checkpoint
-        self.norm = torch.nn.LayerNorm(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        if self.enable_checkpoint:
-            x = checkpoint(self.linear, x, preserve_rng_state=False)
-        else:
-            x = self.linear(x)
-        return x
-
-
 def inference_example(fake_init=True, cpu_init_helper=False):
 
     @easydist_compile(tracing_mode="fake")
@@ -58,8 +42,8 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
-        model = Foo()
-        randn_input = torch.randn(1024, 1024)
+        model = resnet18()
+        randn_input = torch.randn(16, 3, 224, 224)
 
         if not fake_init:
             # broadcast the parameter and input
@@ -69,11 +53,11 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     torch_out = inference_step.original_func(model, randn_input)
 
     if fake_init:
-        randn_input = torch.randn(1024, 1024).cuda()
+        randn_input = torch.randn(16, 3, 224, 224).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
-        module = Foo().cuda()
+        module = resnet18().cuda()
         module = broadcast_module(module)
 
         inference_step.register_cpu_module(copy.deepcopy(module).to(device="cpu"))
@@ -90,7 +74,7 @@ def inference_example(fake_init=True, cpu_init_helper=False):
     print("simple model inference example pass.")
 
 
-def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False):
+def train_example(fake_init=True, cpu_init_helper=False):
 
     # when using cuda_graph, because of the warm-up and cuda graph capture,
     # the result of the first step is equivalent to the original result of the third step
@@ -107,9 +91,9 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
     # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627
     torch.ones(1).cuda()
     with torch.device('cuda'), fake_mode if fake_init else nullcontext():
-        model = Foo(enable_checkpoint)
+        model = resnet18()
 
-        randn_input = torch.randn(1024, 1024)
+        randn_input = torch.randn(16, 3, 224, 224)
 
         if not fake_init:
             # broadcast the parameter and input
@@ -126,11 +110,11 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
 
     # need real input for compiled func
     if fake_init:
-        randn_input = torch.randn(1024, 1024).cuda()
+        randn_input = torch.randn(16, 3, 224, 224).cuda()
         torch.distributed.broadcast(randn_input, src=0)
 
     if cpu_init_helper:
-        module = Foo(enable_checkpoint).cuda()
+        module = resnet18().cuda()
         module = broadcast_module(module)
         train_step.register_cpu_module(copy.deepcopy(module).to("cuda"))
 
@@ -163,7 +147,6 @@ def main():
                         choices=["train", "inference"],
                         required=True)
     parser.add_argument("--fake-init", action="store_true")
-    parser.add_argument("--checkpoint", action="store_true")
     parser.add_argument("--cpu-init-helper", action="store_true")
 
     args = parser.parse_args()
@@ -176,12 +159,11 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    mesh = torch.arange(world_size).reshape(2, 2, 2)
+    mesh = torch.arange(world_size).reshape(4)
     set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,
-                      enable_checkpoint=args.checkpoint,
                       cpu_init_helper=args.cpu_init_helper)
     if args.mode == "inference":
         inference_example(fake_init=args.fake_init, cpu_init_helper=args.cpu_init_helper)

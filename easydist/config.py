@@ -78,7 +78,7 @@ tile_context_length = 15
 nvlink_processor_usage = 0.15
 
 # Scheduling communication
-comm_optimization = False
+comm_optimization = True
 # 'general', 'odd_even'
 rcpsp_method = 'general'
 rcpsp_iter_round = 1 # odd_even rounds
