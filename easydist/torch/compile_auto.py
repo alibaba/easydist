@@ -61,6 +61,7 @@ from easydist.torch.mem_allocation_info import OutVar
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
 from easydist.torch.meta_allocator import profiling_allocator
 from easydist.torch.schedule.lifetime_info import mem_owner_tracer
+from easydist.torch.scope_auto.build_scope_modules import build_scope_modules
 
 # for pickle dump opt_strategy
 import sys
@@ -533,6 +534,8 @@ def _compile_auto(func,
             "ed_worker0", fetch_strategy, args=(), timeout=0)
 
     rpc.shutdown()
+
+    print(f"traced_graph._code: {traced_graph._code}")
     if mdconfig.use_dtensor:
         sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
     else:
@@ -556,6 +559,7 @@ def _compile_auto(func,
     if mdconfig.log_level <= logging.DEBUG:
         sharded_gm.print_readable()
 
+    print(f"sharded_gm._code: {sharded_gm._code}")
     if mdconfig.dump_fx_graph:
         print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
         drawer = FxGraphDrawer(sharded_gm, f"shard_fx-{rank}", ignore_getattr=True)

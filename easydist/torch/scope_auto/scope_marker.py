@@ -17,6 +17,8 @@ from typing import List, Sequence, Optional
 import torch
 import torch._custom_ops
 
+from torch.nn.utils import stateless
+from torch.fx.passes.graph_drawer import FxGraphDrawer
 from torch.fx.experimental.proxy_tensor import make_fx
 from easydist.torch.split_utils import list_before_split, list_after_split, tuple_before_split, tuple_after_split, _before_split, _after_split
 
@@ -85,7 +87,6 @@ class ScopeStartFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *tensor_tuple):
-        print(f"ScopeStartFunc::forward: input type: {type(tensor_tuple)}")
         tensor_list = list(tensor_tuple)  # custom op requires list
 
         # NOTE: return must be tensor of tuple of tensors
@@ -93,7 +94,7 @@ class ScopeStartFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        print(f"start func's backward: grad type: {type(grads)}, value: {grads}")
+        #print(f"start func's backward: grad type: {type(grads)}, value: {grads}")
         grads = list(grads)
         return tuple(torch.ops.easydist.bw_scope_end(grads))
 
@@ -102,7 +103,6 @@ class ScopeEndFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *tensor_tuple):
-        print(f"ScopeEndFunc::forward: input type: {type(tensor_tuple)}")
         tensor_list = list(tensor_tuple)  # custom op requires list
 
         # NOTE: return must be tensor of tuple of tensors
@@ -110,16 +110,14 @@ class ScopeEndFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        print(f"end func's backward: grad type: {type(grads)}, value: {grads}")
+        #print(f"end func's backward: grad type: {type(grads)}, value: {grads}")
         grads = list(grads)
         return tuple(torch.ops.easydist.bw_scope_start(grads))
 
 def scope_start_func(tensor_list: op_param_type) -> op_ret_type:
-    print(f"scope_start_func: input type: {type(tensor_list)}")
     return ScopeStartFunc.apply(*tensor_list)
 
 def scope_end_func(tensor_list: op_param_type) -> op_ret_type:
-    print(f"scope_end_func: input type: {type(tensor_list)}")
     return ScopeEndFunc.apply(*tensor_list)
 
 
@@ -144,7 +142,6 @@ def split_with_helper_var(split_func, ret, helper_var):
     return ret, helper_var
 
 
-#scope_marker_help_tensors = []
 def scope_marker(marker_aux_vars: List[torch.Tensor]):
     def wrapper(func):
         def impl(*args):
@@ -152,14 +149,11 @@ def scope_marker(marker_aux_vars: List[torch.Tensor]):
             marker_aux_vars.append(helper_var)
 
             ctx_start = {}
-            print(f"scope marker: args type: {type(args)}")
-            print(f"args value: {args}")
+            #print(f"args value: {args}")
             args, helper_var = split_with_helper_var(scope_start_func, args, helper_var)
 
             result = func(*args)
             result, helper_var = split_with_helper_var(scope_end_func, result, helper_var)
-
-            #scope_marker_help_tensors.append(helper_var)
 
             return result
 
@@ -178,7 +172,6 @@ class SimpleMLP(torch.nn.Module):
 
 
     def forward(self, x):
-        x = self.relu(x)
         x = self.first_layer(x)
         x = self.fc2(x)
         return x
@@ -215,9 +208,26 @@ if __name__ == '__main__':
         loss = criterion(output, target_tensor)
         loss.backward()
 
-    traced_graph = make_fx(forward_backward_pass)(input_tensor, target_tensor)
+        return loss
+
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    def stateless_func(params, buffers, input_tensor, target_tensor):
+        with stateless._reparametrize_module(model, {**params, **buffers}):
+            ret = forward_backward_pass(input_tensor, target_tensor)
+            return ret
+
+    traced_graph = make_fx(stateless_func)(params, buffers, input_tensor, target_tensor)
 
     print(traced_graph)
+    print(f"python codes\n{traced_graph.code}")
+
+    drawer = FxGraphDrawer(traced_graph, "traced_fx", ignore_getattr=True)
+    dot_graphs = drawer.get_all_dot_graphs()
+    for name, dot_graph in dot_graphs.items():
+        dot_graph.write_jpg(f"./{name}.jpg")
+        dot_graph.write_raw(f"./{name}.txt")
 
     for node in traced_graph.graph.nodes:
         print(f"Node: {node.name}, Op: {node.op}, Target: {node.target}, Args: {node.args}")

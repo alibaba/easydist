@@ -374,12 +374,14 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
             new_comm_node = fx_module.graph.call_function(grouped_comm,
                                                           args=(input_nodes, comm_funcs,
                                                                 comm_args))
+            new_comm_node.meta = create_meta_from_node(new_comm_node)
 
         # add retrive node
         for idx, comm_node in enumerate(comm_map[node]):
             with fx_module.graph.inserting_after(new_comm_node):
                 idx_node = fx_module.graph.call_function(operator.getitem,
                                                          args=(new_comm_node, idx))
+                idx_node.meta = create_meta_from_node(idx_node)
             comm_node.ed_info.comm_meta['to_node'].replace_input_with(comm_node, idx_node)
 
     # at this point all old comm operators should be eliminated

@@ -19,6 +19,7 @@
 #include <set>
 
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
+#include <torch/csrc/api/include/torch/version.h>
 
 
 namespace torch::cuda::CUDAPluggableAllocator {

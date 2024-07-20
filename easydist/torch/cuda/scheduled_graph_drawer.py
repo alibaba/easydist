@@ -20,6 +20,10 @@ from torch.fx.passes.graph_drawer import FxGraphDrawer
 import easydist.config as mdconfig
 from easydist.torch.schedule.schedule_result import ScheduleResult
 from easydist.torch.schedule.lifetime_info import ScheduledLifetimeInfo
+from packaging.version import parse as parse_version
+
+torch_version = torch.__version__
+parsed_version = parse_version(torch_version)
 
 class ScheduledFxGraphDrawer(FxGraphDrawer):
     def __init__(
@@ -43,8 +47,13 @@ class ScheduledFxGraphDrawer(FxGraphDrawer):
         module: torch.fx.GraphModule,
         node: torch.fx.Node,
         skip_node_names_in_args: bool,
+        parse_stack_trace: bool,
     ) -> str:
-        orig_label = super()._get_node_label(module, node, skip_node_names_in_args)
+        if parsed_version >= parse_version("2.2.0"):
+            orig_label = super()._get_node_label(module, node, skip_node_names_in_args, parse_stack_trace)
+        else:
+            orig_label = super()._get_node_label(module, node, skip_node_names_in_args)
+
         label = orig_label[0:-1]  # strip ending "}"
 
         # 1. local index information
@@ -75,10 +84,17 @@ class ScheduledFxGraphDrawer(FxGraphDrawer):
         ignore_getattr: bool,
         ignore_parameters_and_buffers: bool,
         skip_node_names_in_args: bool,
+        parse_stack_trace: bool,
     ) -> pydot.Dot:
-        dot_graph = super()._to_dot(graph_module, name, ignore_getattr,
-                                    ignore_parameters_and_buffers,
-                                    skip_node_names_in_args)
+        if parsed_version >= parse_version("2.2.0"):
+            dot_graph = super()._to_dot(graph_module, name, ignore_getattr,
+                                        ignore_parameters_and_buffers,
+                                        skip_node_names_in_args,
+                                        parse_stack_trace)
+        else:
+            dot_graph = super()._to_dot(graph_module, name, ignore_getattr,
+                                        ignore_parameters_and_buffers,
+                                        skip_node_names_in_args)
 
         # 1. add edges to represent executing sequence inside a stream
         for sid, sequence in enumerate(self.schedule_result.node_sequences):

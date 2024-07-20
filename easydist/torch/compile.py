@@ -9,6 +9,7 @@ from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, 
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
+from easydist.torch.scope_auto.build_scope_modules import build_scope_modules
 
 
 import torch
@@ -84,6 +85,7 @@ def ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls,
     if len(list(traced_graph.named_buffers())) != 0:
         warnings.warn(f"No buffer should be found in the traced graph, please check if the model is correctly traced, found {dict(traced_graph.named_buffers())}")
 
+    traced_graph = build_scope_modules(traced_graph)
     traced_graph.graph.eliminate_dead_code()
     traced_graph.recompile()
 
