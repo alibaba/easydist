@@ -17,7 +17,7 @@ import os
 import pickle
 import time
 import threading
-from functools import partial
+from functools import partial, reduce
 from typing import Any, Union, cast, Set, Dict, List, Tuple
 from contextlib import nullcontext
 
@@ -35,7 +35,7 @@ from torch.nn.utils import stateless
 from torch._functorch.partitioners import default_partition
 
 import easydist.config as mdconfig
-from easydist.autoflow.solver import AutoFlowSolver
+from easydist.autoflow.solver import AutoFlowSolver1D
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
@@ -121,51 +121,66 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
 
         fx_module = create_edinfo(fx_module, sharding_info, shape_info)
 
-        # (2) translate fx.GraphModule into MetaGraph
-        meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info)
-
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print(meta_graph)
-
-        # (3) construct AutoFlowSolver and run ILP
         spmd_mesh = get_device_mesh('spmd')
-
         total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-        solver = AutoFlowSolver(spmd_mesh.shape, total_memery=total_memory)
 
-        if mdconfig.enable_graph_coarsen:
-            logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
-            solver.add_coarsen_graph(meta_graph)
-        else:
-            solver.add_graph(meta_graph)
+        opt_strtg_per_dim = []
+        for dim, dim_size in enumerate(spmd_mesh.shape):
+            # (2) translate fx.GraphModule into MetaGraph
+            meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info, opt_strtg_per_dim)
 
-        start_t = time.perf_counter()
-        if mdconfig.enable_graph_coarsen:
-            opt_strategy = solver.ilp_solve()
-        else:
-            opt_strategy = solver.ilp_optimize()
-        logger.info(f"[AutoFlowSolver.time]:\t {time.perf_counter() - start_t} s.")
+            if mdconfig.log_level <= logging.DEBUG:
+                rich.print(meta_graph) 
+            
+            # (3) construct AutoFlowSolver and run ILP
+            solver = AutoFlowSolver1D(dim_size, total_memery=total_memory)
 
+            if mdconfig.enable_graph_coarsen:
+                logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
+                solver.add_coarsen_graph(meta_graph)
+            else:
+                solver.add_graph(meta_graph, global_strtg)
+
+            start_t = time.perf_counter()
+            if mdconfig.enable_graph_coarsen:
+                opt_strategy = solver.ilp_solve()
+            else:
+                opt_strategy = solver.ilp_optimize()
+            logger.info(f"[AutoFlowSolver.time]:\t {dim} round {time.perf_counter() - start_t} s.")
+
+            opt_strtg_per_dim.append(opt_strategy)
+
+        def reduce_fn(global_strtg, cur_dim_opt_strgt):
+            assert set(global_strtg.keys()) == set(cur_dim_opt_strgt.keys()), f"{set(global_strtg.keys()) - set(cur_dim_opt_strgt.keys())}"
+            for k in global_strtg.keys():
+                for i, in_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].in_strtg_group):
+                    global_strtg[k]['strategy'].in_strtg_group[i] += in_var_spmd_strtg
+                for i, out_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].out_strtg_group):
+                    if global_strtg[k]['strategy'].out_strtg_group[i]:
+                        global_strtg[k]['strategy'].out_strtg_group[i] += out_var_spmd_strtg
+            return global_strtg
+
+        global_strtg = reduce(reduce_fn, opt_strtg_per_dim)
         if mdconfig.log_level <= logging.DEBUG:
-            rich.print(opt_strategy)
+            rich.print(global_strtg)
 
-        sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
+        sharding_strategy = get_torch_sharding_strategy(fx_module, global_strtg)
 
         if mdconfig.log_level <= logging.DEBUG:
             rich.print(sharding_strategy)
 
-        args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
+        args_strategy = meta_graph.get_input_strategy(global_strtg, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
 
         state_io_map = meta_graph.state_io_map
 
         if mdconfig.enable_compile_cache:
-            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
+            pickle.dump([shape_info, global_strtg, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
 
-    return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
+    return shape_info, global_strtg, sharding_strategy, args_strategy, state_io_map
 
 
 @torch.no_grad()

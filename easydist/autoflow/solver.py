@@ -15,7 +15,7 @@
 import logging
 import random
 from pprint import pprint
-from typing import List
+from typing import Dict, List, Optional
 
 import easydist.config as mdconfig
 import mip
@@ -41,7 +41,7 @@ def get_idx_in_var_list(var: MetaVar, var_list: List[MetaVar]):
 
 
 def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
-                              strategy_out: VarSPMDStrategy, device_mesh):
+                              strategy_out: VarSPMDStrategy, device_num):
     var_size = var.get_var_size()
 
     all_gather = lambda x, ndevices: x * (ndevices - 1) / ndevices
@@ -55,47 +55,36 @@ def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
 
     resharding_cost = 0
 
-    assert len(device_mesh) == len(strategy_in) == len(strategy_out), f"{device_mesh}, {strategy_in}, {strategy_out}"
-    n_devices_total = n_devices_shard_total = 1
-
-    for n_devices_on_dim, s_in in zip(device_mesh, strategy_in):
-        if s_in.is_shard():
-            n_devices_shard_total *= n_devices_on_dim
-        n_devices_total *= n_devices_on_dim
-
-    for n_devices_on_dim, s_in, s_out in zip(
-        device_mesh, strategy_in, strategy_out
-    ):
-        message_size = var_size
-        n_devices_shard_other = n_devices_shard_total
-        if s_in.is_shard():
-            n_devices_shard_other /= n_devices_on_dim
-        message_size /= n_devices_shard_other
-        if s_in.is_shard():
-            if s_out.is_shard():
-                if s_in.args != s_out.args:
-                    resharding_cost += all_to_all(message_size, n_devices_on_dim)
+    strategy_in = strategy_in[0]
+    strategy_out = strategy_out[0]
+    if device_num > 1:
+        message_size = var_size            
+        if strategy_in.is_shard():
+            message_size /= device_num
+            if strategy_out.is_shard():
+                if strategy_in.args != strategy_out.args:
+                    resharding_cost += all_to_all(message_size, device_num)
             else:
-                resharding_cost += all_gather(message_size, n_devices_on_dim)
-        elif s_in.is_partial():
-            resharding_cost += all_reduce(message_size, n_devices_on_dim)
+                resharding_cost += all_gather(message_size, device_num)
+        elif strategy_in.is_partial():
+            resharding_cost += all_reduce(message_size, device_num)
 
     return resharding_cost
 
 
 def calculate_memory_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
-                          strategy_out: VarSPMDStrategy, device_mesh):
+                          strategy_out: VarSPMDStrategy, device_num):
     var_size = var.get_var_size()
 
     memory_cost = 0
 
-    assert len(device_mesh) == len(strategy_in) == len(strategy_out), f"{device_mesh}, {strategy_in}, {strategy_out}"
     # FIXME: only use out_strategy here for shard_size is ok?
-    for strategy in (strategy_in, strategy_out):
+    for strategy in [strategy_in, strategy_out]:
+        strategy = strategy[0]
         shard_size = 1
-        for n_devices_on_dim, s in zip(device_mesh, strategy):
-            if s.is_shard():
-                shard_size *= n_devices_on_dim
+        if strategy.is_shard():
+            shard_size *= device_num
+
         memory_cost += var_size // shard_size
 
     return memory_cost
@@ -206,17 +195,17 @@ class ClusterEdgeMipInfo:
         return self.__str__()
 
 
-class AutoFlowSolver:
+class AutoFlowSolver1D:
 
     def __init__(self,
-                 device_mesh=None,
+                 device_num=None,
                  constraints=None,
                  memory_ratio=0.9,
                  total_memery=None) -> None:
         self.m = mip.Model("autoflow")
         self.nodes = {}
         self.edges = {}
-        self.device_mesh = device_mesh
+        self.device_num = device_num
         self.constraints = constraints
 
         self.memory_ratio = memory_ratio
@@ -264,7 +253,7 @@ class AutoFlowSolver:
                     self.add_cluster_edge(var, out_idx, up_node=cluster.output_node)
 
     # Lansong(TODO) add_graph is deprecated, use add_coarsen_graph instead
-    def add_graph(self, graph: MetaGraph) -> None:
+    def add_graph(self, graph: MetaGraph, global_strtg: Optional[Dict[str, VarSPMDStrategy]]) -> None:
         self.graph = graph
 
         if self.constraints:
@@ -285,13 +274,13 @@ class AutoFlowSolver:
             self.liveness = self.liveness[:1]
 
         for op in graph.op_list:
-            self.add_node(op)
+            self.add_node(op, global_strtg)
 
     # Lansong(TODO) add_node is deprecated, use add_cluster instead
-    def add_node(self, node: MetaNode) -> None:
+    def add_node(self, node: MetaNode, global_strtg: Optional[Dict[str, VarSPMDStrategy]]) -> None:
         unique_key_ = node.unique_key()
 
-        strategies = node.get_strtg_pool().strategies
+        strategies = node.get_strtg_pool(global_strtg).strategies
         if len(strategies) > 0:
             self.nodes[unique_key_] = {
                 "node": node,
@@ -344,7 +333,7 @@ class AutoFlowSolver:
                     self.cluster_edges[unique_key_].edge,
                     up_out_strategy_list,
                     down_in_strategy_list,
-                    self.device_mesh,
+                    self.device_num,
                 ))
 
             self.cluster_edges[unique_key_].mem_matrix.append(
@@ -352,7 +341,7 @@ class AutoFlowSolver:
                     self.cluster_edges[unique_key_].edge,
                     up_out_strategy_list,
                     down_in_strategy_list,
-                    self.device_mesh,
+                    self.device_num,
                 ))
 
         # if adding an up_node forms an edge
@@ -414,7 +403,7 @@ class AutoFlowSolver:
                         down_strategy,  # list of NodeSPMDStrategy
                         idx_for_up,
                         idx_for_down,
-                        self.device_mesh,
+                        self.device_num,
                     ))
 
                 self.edges[unique_key_]["mem_matrix"].append(
@@ -424,7 +413,7 @@ class AutoFlowSolver:
                         down_strategy,  # list of NodeSPMDStrategy
                         idx_for_up,
                         idx_for_down,
-                        self.device_mesh,
+                        self.device_num,
                     ))
 
     # Lansong(TODO) ilp_optimize is deprecated, use ilp_solve instead
@@ -449,9 +438,10 @@ class AutoFlowSolver:
 
                     # FIXME: only use out_strategy here for shard_size is ok?
                     shard_size = 1
-                    for n_device_on_dim, s in zip(self.device_mesh, strategy):
-                        if s.state == SPMD.SHARD:
-                            shard_size *= n_device_on_dim
+
+                    if strategy.state == SPMD.SHARD:
+                        shard_size *= self.device_num
+
                     memory_cost_list.append(var_size // shard_size)
 
                 return memory_cost_list
@@ -585,15 +575,13 @@ class AutoFlowSolver:
             def _mem_cost(var_size, down_strategy: List[VarSPMDStrategy]):
                 memory_cost_list = []
                 for i in range(len(down_strategy)):
-                    strategy = down_strategy[i]
+                    strategy = down_strategy[i][0]
 
                     # FIXME: only use out_strategy here for shard_size is ok?
-                    s1, s2 = strategy[0], strategy[1]
                     shard_size = 1
-                    if s1.state == SPMD.SHARD:
-                        shard_size *= self.device_mesh[0]
-                    if s2.state == SPMD.SHARD:
-                        shard_size *= self.device_mesh[1]
+
+                    if strategy.state == SPMD.SHARD:
+                        shard_size *= self.device_num
 
                     memory_cost_list.append(var_size // shard_size)
 
@@ -740,7 +728,7 @@ class AutoFlowSolver:
 
     def calc_graph_comm_cost(self, graph_strategy):
         total_comm_cost = 0
-        default_strtg = [SPMD(SPMD.REPLICATE) for _ in range(len(self.device_mesh))]
+        default_strtg = [SPMD(SPMD.REPLICATE)]
         for node in self.graph.op_list:
             for in_idx, in_var in enumerate(node.invars):
                 if in_var.up_node.unique_key() in graph_strategy:
@@ -756,7 +744,7 @@ class AutoFlowSolver:
                     var_down_strtg = VarSPMDStrategy(*default_strtg)
 
                 comm_cost = calculate_resharding_cost(in_var, var_up_strtg, var_down_strtg,
-                                                      self.device_mesh)
+                                                      self.device_num)
 
                 total_comm_cost += comm_cost
                 if mdconfig.log_level <= logging.DEBUG:

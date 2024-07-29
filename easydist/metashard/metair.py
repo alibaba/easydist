@@ -16,7 +16,7 @@ from __future__ import annotations
 import copy
 import os
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 from functools import reduce
 
 from easydist.platform import get_backend
@@ -117,6 +117,9 @@ class VarSPMDStrategyGroup:
     def __getitem__(self, idx) -> VarSPMDStrategy:
         return self.var_spmd_strategy_group[idx]
 
+    def __setitem__(self, idx, value: VarSPMDStrategy) -> None:
+        self.var_spmd_strategy_group[idx] = value
+
     def __len__(self) -> str:
         return self.var_spmd_strategy_group.__len__()
 
@@ -209,7 +212,8 @@ def combination_to_sharding_strategy(comm_anns, all_replicate=False):
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.SHARD, comm_ann.keywords)))
         elif func_name == "reduce":
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.PARTIAL, comm_ann.keywords)))
-
+        else:
+            raise RuntimeError(f"got {func_name} in combination_ann")
     return spmd_strategy
 
 
@@ -361,7 +365,7 @@ class MetaNode:
         assert self.strtg_pool
         return self.strtg_pool.get_strtg(idx)
 
-    def get_strtg_pool(self) -> NodeSPMDStrategyPool:
+    def get_strtg_pool(self, opt_strtg_per_dim: List[Dict]) -> NodeSPMDStrategyPool:
         if self.strtg_pool is not None:
             return self.strtg_pool
 
@@ -375,9 +379,12 @@ class MetaNode:
             self.strtg_pool = NodeSPMDStrategyPool()
             return self.strtg_pool
 
-        for comm_ann in comm_anns:
-            in_strtg_group = get_sharding_strategy(sharding_anns, comm_ann)
-            out_strtg_group = combination_to_sharding_strategy(comm_anns[comm_ann])
+        for shard_idx in comm_anns:
+            in_strtg_group = get_sharding_strategy(sharding_anns, shard_idx)    
+            out_strtg_group = combination_to_sharding_strategy(comm_anns[shard_idx])
+            # skip the possible solution when it has appeared in previous dim solution
+            if any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_dim):
+                continue
             strategy_list_1d.append(NodeSPMDStrategy(in_strtg_group, out_strtg_group))
 
         if all(op not in self.op_name for op in _heavy_ops) or len(comm_anns) == 0:
@@ -412,37 +419,7 @@ class MetaNode:
 
         self.strtg_pool = NodeSPMDStrategyPool()
 
-        def searchNDStrategies(strategies_1d: List[NodeSPMDStrategy]) -> List[NodeSPMDStrategy]:
-            device_mesh = get_device_mesh()
-            spmd_mesh = device_mesh['spmd']
-            res = []
-
-            def flattenStrategies(cur_in_var_grp: List[VarSPMDStrategyGroup], cur_out_var_grp: List[VarSPMDStrategyGroup]) -> NodeSPMDStrategy:
-                assert len(set(map(len, cur_in_var_grp))) == 1 and len(set(map(len, cur_out_var_grp))) == 1, "flattenStrategies: all VarSPMDStrategyGroup should have the same length"
-
-                invars_strategy = VarSPMDStrategyGroup()
-                for nd_strg in zip(*cur_in_var_grp):
-                    invars_strategy.append(reduce(lambda x, y: x + y, nd_strg))
-                
-                outvars_strategy = VarSPMDStrategyGroup()
-                for nd_strg in zip(*cur_out_var_grp):
-                    outvars_strategy.append(reduce(lambda x, y: x + y, nd_strg))
-
-                return NodeSPMDStrategy(invars_strategy, outvars_strategy)
-
-            def _searchNDStrategies(cur_device_dim: int, cur_in_var_grp: List[VarSPMDStrategyGroup], cur_out_var_grp: List[VarSPMDStrategyGroup]):
-                if cur_device_dim >= spmd_mesh.mesh.dim():
-                    res.append(flattenStrategies(cur_in_var_grp, cur_out_var_grp))
-                    return
-
-                for x in strategies_1d:
-                    _searchNDStrategies(cur_device_dim + 1, cur_in_var_grp + [x.in_strtg_group], cur_out_var_grp + [x.out_strtg_group])
-
-            _searchNDStrategies(0, [], [])
-
-            return res
-
-        for strategy in searchNDStrategies(strategy_list_1d):
+        for strategy in strategy_list_1d:
             self.strtg_pool.add_strategy(strategy)
 
         if mdconfig.log_level <= logging.DEBUG:
@@ -629,7 +606,7 @@ class MetaNodeCluster:
         meta_node.cluster_id = self.unique_id
 
     def back_build_strategy(self, nd: MetaNode, nd_strtg_idx: int,
-                            cluster_strtg: ClusterStrategy) -> bool:
+                            cluster_strtg: ClusterStrategy, opt_strtg_per_dim: List[Dict]) -> bool:
         succ = True
         for invar_idx, invar in enumerate(nd.invars):
             if not invar:
@@ -651,19 +628,19 @@ class MetaNodeCluster:
             nd_strtg = nd.strtg_pool.get_strtg(nd_strtg_idx)
             expected_var_strtg = nd_strtg.get_invar_strtg(invar_idx)
 
-            up_nd_strtg_pool = up_node.get_strtg_pool()
+            up_nd_strtg_pool = up_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
             up_nd_strtg_idx = up_nd_strtg_pool.find_matched_out(idx_for_up, expected_var_strtg)
             if up_nd_strtg_idx >= 0:
                 up_nd_strtg = up_nd_strtg_pool.get_strtg(up_nd_strtg_idx)
                 cluster_strtg.set_node_strategy(up_node.unique_id, up_nd_strtg_idx, up_nd_strtg)
-                if not self.back_build_strategy(up_node, up_nd_strtg_idx, cluster_strtg):
+                if not self.back_build_strategy(up_node, up_nd_strtg_idx, cluster_strtg, opt_strtg_per_dim):
                     succ = False
             else:
                 succ = False
 
         return succ
 
-    def finalize(self) -> None:
+    def finalize(self, opt_strtg_per_dim: List[Dict]) -> None:
         for node in self.nodes.values():
             if node.invars:
                 for idx, invar in enumerate(node.invars):
@@ -704,14 +681,14 @@ class MetaNodeCluster:
 
         # build strategy candidates for cluster
         self.strategy_pool = ClusterStrategyPool(self)
-        out_strtg_pool = out_node.get_strtg_pool()
+        out_strtg_pool = out_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
 
         for out_strtg_idx in range(out_strtg_pool.strtg_num()):
             cluster_strtg = ClusterStrategy()
             out_strtg = out_node.get_strtg(out_strtg_idx)
             cluster_strtg.set_node_strategy(out_node.unique_id, out_strtg_idx, out_strtg)
 
-            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg):
+            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg, opt_strtg_per_dim):
                 assert len(cluster_strtg.node_strategies) == len(self.nodes)
                 self.strategy_pool.add_strategy(cluster_strtg)
             else:
@@ -800,12 +777,12 @@ class MetaGraph:
 
         return liveness_list
 
-    def build_fine_grain_clusters(self):
+    def build_fine_grain_clusters(self, opt_strtg_per_dim: List[Dict]):
         cluster_id = 0
         for node in self.op_list:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             cluster.add_node(node)
-            cluster.finalize()
+            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
@@ -856,10 +833,9 @@ class MetaGraph:
         for in_var in nd.invars:
             if in_var and in_var.up_node:
                 if in_var.up_node.unique_id not in root_ids:
-                    #print("recursive build cone from %s" % str(in_var.up_node))
                     self.build_cone_cluster(in_var.up_node, root_ids, cluster)
 
-    def build_cone_clusters(self):
+    def build_cone_clusters(self, opt_strtg_per_dim: List[Dict]):
         cone_roots = self.find_cone_roots()
         logger.debug("root num: %d" % len(cone_roots))
         logger.debug(cone_roots)
@@ -872,15 +848,15 @@ class MetaGraph:
         for cone_root in cone_roots:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             self.build_cone_cluster(cone_root, root_ids, cluster)
-            cluster.finalize()
+            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
-    def coarsen(self, coarsen_level: int):
+    def coarsen(self, coarsen_level: int, opt_strtg_per_dim: List[Dict]):
         if coarsen_level == 0:
-            self.build_fine_grain_clusters()
+            self.build_fine_grain_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
         elif coarsen_level == 1:
-            self.build_cone_clusters()
+            self.build_cone_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
         else:
             print("Lansong 2do: support more aggressive coarsening")
             # call cone cluster building instead

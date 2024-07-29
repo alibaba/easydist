@@ -335,7 +335,6 @@ class EDTorchShardingAnn(Interpreter):
             if sharding_ann is None and combination_ann is None:
                 sharding_ann, combination_ann = meta_op.sharding_discovery(
                     prompt_annotation=copy.deepcopy(prompt_annotation))
-
             self.sharding_info[op_perf_key["ops_name"]][op_perf_key["args_meta"]] = {
                 "sharding_ann": sharding_ann,
                 "combination_ann": combination_ann,

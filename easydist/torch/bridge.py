@@ -12,12 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 
+from typing import Dict, List, Optional
 import torch
 from torch.fx.node import Node, _get_qualified_name
 from torch.distributed._tensor import distribute_tensor
 import torch.utils._pytree as pytree
 
-from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar
+from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar, VarSPMDStrategy
 from easydist.utils import rsetattr, rgetattr
 from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
@@ -47,7 +48,7 @@ def materialize(x, device):
 
 
 def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding_info,
-                     shape_info) -> MetaGraph:
+                     shape_info, opt_strtg_per_dim: List[Dict]) -> MetaGraph:
     meta_graph = MetaGraph(fx_module)
     meta_node_map = {}
     meta_var_map = {}
@@ -187,7 +188,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
         state_io_map[meta_graph.input_list[i]] = meta_graph.output_list[i]
     meta_graph.state_io_map = state_io_map
 
-    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level)
+    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level, opt_strtg_per_dim=opt_strtg_per_dim)
 
     return meta_graph
 
