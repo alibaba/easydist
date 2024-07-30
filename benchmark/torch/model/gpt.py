@@ -97,10 +97,9 @@ class SelfAttention(nn.Module):
         k = k.view(new_qkv_shape)
         v = v.view(new_qkv_shape)
 
-        # TODO @botbw: solve non-contiguous
-        q = q.permute((0, 2, 1, 3)).contiguous()
-        k = k.permute((0, 2, 1, 3)).contiguous()
-        v = v.permute((0, 2, 1, 3)).contiguous()
+        q = q.permute((0, 2, 1, 3))
+        k = k.permute((0, 2, 1, 3))
+        v = v.permute((0, 2, 1, 3))
 
         x = self.core_attention(q, k, v)
 
