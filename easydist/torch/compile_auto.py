@@ -139,16 +139,16 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
                 logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
                 solver.add_coarsen_graph(meta_graph)
             else:
-                solver.add_graph(meta_graph, global_strtg)
+                solver.add_graph(meta_graph, opt_strategy)
 
             start_t = time.perf_counter()
             if mdconfig.enable_graph_coarsen:
-                opt_strategy = solver.ilp_solve()
+                opt_strategy_cur_dim = solver.ilp_solve()
             else:
-                opt_strategy = solver.ilp_optimize()
+                opt_strategy_cur_dim = solver.ilp_optimize()
             logger.info(f"[AutoFlowSolver.time]:\t {dim} round {time.perf_counter() - start_t} s.")
 
-            opt_strtg_per_dim.append(opt_strategy)
+            opt_strtg_per_dim.append(opt_strategy_cur_dim)
 
         def reduce_fn(global_strtg, cur_dim_opt_strgt):
             assert set(global_strtg.keys()) == set(cur_dim_opt_strgt.keys()), f"{set(global_strtg.keys()) - set(cur_dim_opt_strgt.keys())}"
@@ -160,27 +160,27 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
                         global_strtg[k]['strategy'].out_strtg_group[i] += out_var_spmd_strtg
             return global_strtg
 
-        global_strtg = reduce(reduce_fn, opt_strtg_per_dim)
+        opt_strategy = reduce(reduce_fn, opt_strtg_per_dim)
         if mdconfig.log_level <= logging.DEBUG:
-            rich.print(global_strtg)
+            rich.print(opt_strategy)
 
-        sharding_strategy = get_torch_sharding_strategy(fx_module, global_strtg)
+        sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
 
         if mdconfig.log_level <= logging.DEBUG:
             rich.print(sharding_strategy)
 
-        args_strategy = meta_graph.get_input_strategy(global_strtg, spmd_mesh.mesh.shape)
+        args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
 
         state_io_map = meta_graph.state_io_map
 
         if mdconfig.enable_compile_cache:
-            pickle.dump([shape_info, global_strtg, sharding_strategy, args_strategy, state_io_map],
+            pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
 
-    return shape_info, global_strtg, sharding_strategy, args_strategy, state_io_map
+    return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
 
 
 @torch.no_grad()
@@ -538,6 +538,7 @@ def _compile_auto(func,
                                _allow_non_fake_inputs=False)(params, buffers, named_states, args,
                                                              kwargs)
 
+    assert len(list(traced_graph.buffers())) == 0, f"{set(traced_graph.named_buffers().keys())}"
     traced_graph.graph.eliminate_dead_code()
     traced_graph = preprocess_traced_graph(traced_graph)
     traced_graph.recompile()

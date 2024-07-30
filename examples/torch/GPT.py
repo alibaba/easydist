@@ -90,8 +90,8 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    mesh = torch.arange(world_size)
-    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0"]))
+    mesh = torch.arange(world_size).reshape(2, 2, 2)
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1", "spmd2"]))
 
     train_example()
 

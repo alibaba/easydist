@@ -1,4 +1,4 @@
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 8 examples/torch/simple_model.py --mode train
+# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/simple_model.py --mode train
 import argparse
 import copy
 import logging
@@ -177,7 +177,7 @@ def main():
     torch.cuda.set_device(local_rank)
 
     mesh = torch.arange(world_size).reshape(2, 2, 2)
-    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0"]))
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1", "spmd2"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,
