@@ -36,6 +36,7 @@ from torch._functorch.partitioners import default_partition
 
 import easydist.config as mdconfig
 from easydist.autoflow.solver import AutoFlowSolver1D
+from easydist.metashard.metair import SPMD, VarSPMDStrategy
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
@@ -151,13 +152,19 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             opt_strtg_per_dim.append(opt_strategy_cur_dim)
 
         def reduce_fn(global_strtg, cur_dim_opt_strgt):
-            assert set(global_strtg.keys()) == set(cur_dim_opt_strgt.keys()), f"{set(global_strtg.keys()) - set(cur_dim_opt_strgt.keys())}"
             for k in global_strtg.keys():
-                for i, in_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].in_strtg_group):
-                    global_strtg[k]['strategy'].in_strtg_group[i] += in_var_spmd_strtg
-                for i, out_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].out_strtg_group):
-                    if global_strtg[k]['strategy'].out_strtg_group[i]:
-                        global_strtg[k]['strategy'].out_strtg_group[i] += out_var_spmd_strtg
+                if k in cur_dim_opt_strgt:
+                    for i, in_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].in_strtg_group):
+                        global_strtg[k]['strategy'].in_strtg_group[i] += in_var_spmd_strtg
+                    for i, out_var_spmd_strtg in enumerate(cur_dim_opt_strgt[k]['strategy'].out_strtg_group):
+                        if global_strtg[k]['strategy'].out_strtg_group[i]:
+                            global_strtg[k]['strategy'].out_strtg_group[i] += out_var_spmd_strtg
+                else:
+                    for i, _ in enumerate(global_strtg[k]['strategy'].in_strtg_group):
+                        global_strtg[k]['strategy'].in_strtg_group[i] += VarSPMDStrategy(SPMD(SPMD.REPLICATE))
+                    for i, _ in enumerate(global_strtg[k]['strategy'].out_strtg_group):
+                        if global_strtg[k]['strategy'].out_strtg_group[i]:
+                            global_strtg[k]['strategy'].out_strtg_group[i] += VarSPMDStrategy(SPMD(SPMD.REPLICATE))
             return global_strtg
 
         opt_strategy = reduce(reduce_fn, opt_strtg_per_dim)
