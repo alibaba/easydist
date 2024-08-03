@@ -140,7 +140,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
                 logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
                 solver.add_coarsen_graph(meta_graph)
             else:
-                solver.add_graph(meta_graph, opt_strategy)
+                solver.add_graph(meta_graph, opt_strtg_per_dim)
 
             start_t = time.perf_counter()
             if mdconfig.enable_graph_coarsen:
@@ -603,7 +603,6 @@ def _compile_auto(func,
             "ed_worker0", fetch_strategy, args=(), timeout=0)
 
     rpc.shutdown()
-
     if mdconfig.use_dtensor:
         sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
     else:

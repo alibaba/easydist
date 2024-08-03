@@ -25,8 +25,6 @@ from easydist.torch.device_mesh import get_device_mesh
 
 logger = logging.getLogger(__name__)
 
-DEVICE_MESH_1D = -1
-
 
 class SPMD:
 

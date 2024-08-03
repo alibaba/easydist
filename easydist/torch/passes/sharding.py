@@ -366,14 +366,8 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                                                                         target.args["dim"],
                                                                         my_coordinate[i]))
 
-                    if copy_innode is not None:
-                        copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                    args=(copy_innode, scatter_node))
-                        node.replace_input_with(var_, copy_node)
-                        var_ = copy_node
-                    else:
-                        node.replace_input_with(var_, scatter_node)
-                        var_ = scatter_node
+                    node.replace_input_with(var_, scatter_node)
+                    var_ = scatter_node
                 elif current.is_shard():
                     if current.args["dim"] != target.args["dim"]:
                         # all_to_all
@@ -386,35 +380,20 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                             args=(all_to_all_start_node, current.args["dim"], target.args["dim"],
                                     num_chunks, my_coordinate[i], ranks))
 
-                        if copy_innode is not None:
-                            copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                        args=(copy_innode,
-                                                                            all_to_all_end_node))
-                            node.replace_input_with(var_, copy_node)
-                            var_ = copy_node
-                        else:
-                            node.replace_input_with(var_, all_to_all_end_node)
-                            var_ = all_to_all_end_node
+                        node.replace_input_with(var_, all_to_all_end_node)
+                        var_ = all_to_all_end_node
                 elif current.is_partial():
                     # reduce_scatter
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
                     reduce_scatter_start_node = fx_module.graph.call_function(
                         reduce_scatter_start, args=(var_, reduceOp, target.args["dim"], ranks))
-
                     reduce_scatter_end_node = fx_module.graph.call_function(
                         reduce_scatter_end,
                         args=(reduce_scatter_start_node, reduceOp, target.args["dim"], ranks))
 
-                    if copy_innode is not None:
-                        copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                    args=(copy_innode,
-                                                                        reduce_scatter_end_node))
-                        node.replace_input_with(var_, copy_node)
-                        var_ = copy_node
-                    else:
-                        node.replace_input_with(var_, reduce_scatter_end_node)
-                        var_ = reduce_scatter_end_node
+                    node.replace_input_with(var_, reduce_scatter_end_node)
+                    var_ = reduce_scatter_end_node
             elif target.is_replicate():
                 if current.is_shard():
                     # insert all_gather here
@@ -424,34 +403,24 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                     all_gather_end_node = fx_module.graph.call_function(
                         all_gather_end, args=(all_gather_start_node, current.args["dim"], ranks))
 
-                    if copy_innode is not None:
-                        copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                    args=(copy_innode,
-                                                                        all_gather_end_node))
-                        node.replace_input_with(var_, copy_node)
-                        var_ = copy_node
-                    else:
-                        node.replace_input_with(var_, all_gather_end_node)
-                        var_ = all_gather_end_node
+                    node.replace_input_with(var_, all_gather_end_node)
+                    var_ = all_gather_end_node
                 elif current.is_partial():
                     # insert all_reduce here
                     reduceOp = reduce_map[current.args["ops"]]
                     all_reduce_start_node = fx_module.graph.call_function(all_reduce_start,
                                                                             args=(var_, reduceOp,
                                                                                 ranks))
-
                     all_reduce_end_node = fx_module.graph.call_function(
                         all_reduce_end, args=(all_reduce_start_node, reduceOp, ranks))
 
-                    if copy_innode is not None:
-                        copy_node = fx_module.graph.call_function(copy_wrapper,
-                                                                    args=(copy_innode,
-                                                                        all_reduce_end_node))
-                        node.replace_input_with(var_, copy_node)
-                        var_ = copy_node
-                    else:
-                        node.replace_input_with(var_, all_reduce_end_node)
-                        var_ = all_reduce_end_node
+                    node.replace_input_with(var_, all_reduce_end_node)
+                    var_ = all_reduce_end_node
+
+    if copy_innode is not None:
+        with fx_module.graph.inserting_before(node):
+            copy_node = fx_module.graph.call_function(copy_wrapper, args=(copy_innode, var_))
+            node.replace_input_with(var_, copy_node)
 
     return fx_module
 
@@ -588,37 +557,29 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
 
 
     # (TODO) move this part out of this pass
-    try:
-        for node in fx_module.graph.nodes:
-            if not hasattr(node, "ed_info"):
-                node.ed_info = EDInfo(ori_meta=node.meta)
+    for node in fx_module.graph.nodes:
+        if not hasattr(node, "ed_info"):
+            node.ed_info = EDInfo(ori_meta=node.meta)
 
-            if node.name in opt_strategy:
-                node.ed_info.strategy = opt_strategy[node.name]['strategy']
+        if node.name in opt_strategy:
+            node.ed_info.strategy = opt_strategy[node.name]['strategy']
 
-            node.meta = node.ed_info.get_sharded_meta()
+        node.meta = node.ed_info.get_sharded_meta()
 
-            if node.op == 'placeholder':
+        if node.op == 'placeholder':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
+        elif node.op == 'call_function':
+            # create meta for custom function
+            # if node.target in CUSTOM_FUNCS:
+            node.meta = create_meta_from_node(node)
+            # annotate node type
+            if node.target in COMM_FUNCS:
+                node.ed_info.node_type = EDNodeType.COMMUNICATION
+            elif node.target == operator.getitem:
                 node.ed_info.node_type = EDNodeType.AUXILIARY
-            elif node.op == 'call_function':
-                # create meta for custom function
-                # if node.target in CUSTOM_FUNCS:
-                node.meta = create_meta_from_node(node)
-                # annotate node type
-                if node.target in COMM_FUNCS:
-                    node.ed_info.node_type = EDNodeType.COMMUNICATION
-                elif node.target == operator.getitem:
-                    node.ed_info.node_type = EDNodeType.AUXILIARY
-                else:
-                    node.ed_info.node_type = EDNodeType.COMPUTATION
-            elif node.op == 'output':
-                node.ed_info.node_type = EDNodeType.AUXILIARY
-    except Exception as e:
-        drawer = torch.fx.passes.graph_drawer.FxGraphDrawer(fx_module, f"sharding_transform")
-        dot_graphs = drawer.get_all_dot_graphs()
-        for name, dot_graph in dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
-        raise e
-
+            else:
+                node.ed_info.node_type = EDNodeType.COMPUTATION
+        elif node.op == 'output':
+            node.ed_info.node_type = EDNodeType.AUXILIARY
 
     return fx_module

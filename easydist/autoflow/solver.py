@@ -253,7 +253,7 @@ class AutoFlowSolver1D:
                     self.add_cluster_edge(var, out_idx, up_node=cluster.output_node)
 
     # Lansong(TODO) add_graph is deprecated, use add_coarsen_graph instead
-    def add_graph(self, graph: MetaGraph, global_strtg: Optional[Dict[str, VarSPMDStrategy]]) -> None:
+    def add_graph(self, graph: MetaGraph, opt_strtg_per_dim: List[Dict]) -> None:
         self.graph = graph
 
         if self.constraints:
@@ -274,13 +274,13 @@ class AutoFlowSolver1D:
             self.liveness = self.liveness[:1]
 
         for op in graph.op_list:
-            self.add_node(op, global_strtg)
+            self.add_node(op, opt_strtg_per_dim)
 
     # Lansong(TODO) add_node is deprecated, use add_cluster instead
-    def add_node(self, node: MetaNode, global_strtg: Optional[Dict[str, VarSPMDStrategy]]) -> None:
+    def add_node(self, node: MetaNode, opt_strtg_per_dim: List[Dict]) -> None:
         unique_key_ = node.unique_key()
 
-        strategies = node.get_strtg_pool(global_strtg).strategies
+        strategies = node.get_strtg_pool(opt_strtg_per_dim).strategies
         if len(strategies) > 0:
             self.nodes[unique_key_] = {
                 "node": node,
@@ -434,7 +434,7 @@ class AutoFlowSolver1D:
             def _mem_cost(var_size, down_strategy, idx_for_down):
                 memory_cost_list = []
                 for i in range(len(down_strategy)):
-                    strategy = down_strategy[i].in_strtg_group[idx_for_down]
+                    strategy = down_strategy[i].in_strtg_group[idx_for_down][0]
 
                     # FIXME: only use out_strategy here for shard_size is ok?
                     shard_size = 1
