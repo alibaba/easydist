@@ -381,7 +381,10 @@ class MetaNode:
             in_strtg_group = get_sharding_strategy(sharding_anns, shard_idx)    
             out_strtg_group = combination_to_sharding_strategy(comm_anns[shard_idx])
             # skip the possible solution when it has appeared in previous dim solution
-            if any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_dim):
+            if (
+                not mdconfig.allow_1d_fallback_sol
+                and any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_dim)
+            ):
                 continue
             strategy_list_1d.append(NodeSPMDStrategy(in_strtg_group, out_strtg_group))
 
@@ -558,7 +561,6 @@ class ClusterStrategyPool:
                     invar_strtg = nd_strtg.get_invar_strtg(invar_idx)
                     nd_io_strtg.add_in_strategy(invar_idx, invar_strtg)
 
-                
             for outvar_idx in range(len(nd.outvars)):
                 outvar_strtg = nd_strtg.get_outvar_strtg(outvar_idx)
                 nd_io_strtg.add_out_strategy(outvar_idx, outvar_strtg)

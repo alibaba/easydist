@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import operator
 from typing import Dict, List, Optional
 import torch
 from torch.fx.node import Node, _get_qualified_name
@@ -19,6 +20,7 @@ from torch.distributed._tensor import distribute_tensor
 import torch.utils._pytree as pytree
 
 from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar, VarSPMDStrategy
+from easydist.torch.device_mesh import get_device_mesh
 from easydist.utils import rsetattr, rgetattr
 from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
@@ -55,9 +57,30 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
     MetaNode.clear_id_counter()
     MetaVar.clear_id_counter()
     output_names = []
+
+    def apply_previous_sharding(shape_info, node, opt_strtg_per_dim):
+        shape = list(shape_info[node.name]["shape"])
+        if len(shape) == 0:  # for scalar tensor
+            return torch.Size(shape)
+        node_name = node.name
+        spmd_mesh = get_device_mesh("spmd")
+
+        for device_num, dim_strtg in zip(spmd_mesh.mesh.shape, opt_strtg_per_dim):
+            if node.target is operator.getitem: # getitem is not node in meta graph
+                assert len(dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]) == 1, "var should have single input and single output"
+                spmd_strtg = dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]
+            else:
+                assert len(dim_strtg[node_name]['strategy'].out_strtg_group) == 1, "var should have single input and single output"
+                spmd_strtg = dim_strtg[node_name]['strategy'].out_strtg_group[0]
+            assert len(spmd_strtg) == 1, "per dim strategy should be empty"
+            spmd = spmd_strtg[0]
+            if spmd.is_shard():
+                shape[spmd.args['dim']] = (shape[spmd.args['dim']] + device_num - 1) // device_num  # ceil
+
+        return torch.Size(shape)
+
     # 1. create MetaVar for each output of fx graph node except list or tuple
     #    and create MetaNode for each fx graph node except getitem
-
     for node in fx_module.graph.nodes:
         if node.op == "call_function":
             # 1.1. create MetaVar
@@ -78,8 +101,13 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
                     outvars = [None] * compact_out_idx
             else:
                 compact_out_idx_tbl = [0]
+                # apply previous sharding over the var
+                # if node.target is operator.getitem:
+                #     shape = apply_previous_sharding(shape_info, node.args[0], opt_strtg_per_dim)
+                # else:
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
                 meta_var = MetaVar(name=node.name,
-                                   shape=shape_info[node.name]["shape"],
+                                   shape=shape,
                                    dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
 
                 meta_var_map[node.name] = meta_var
@@ -127,8 +155,9 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
         elif node.op in ["placeholder", "get_attr"]:
             if shape_info[node.name] != {}:
                 # 1.1. create MetaVar
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
                 meta_var = MetaVar(name=node.name,
-                                   shape=shape_info[node.name]["shape"],
+                                   shape=shape,
                                    dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
 
                 meta_var_map[node.name] = meta_var
