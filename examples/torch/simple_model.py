@@ -42,7 +42,7 @@ class Foo(torch.nn.Module):
             x = checkpoint(self.linear, x, preserve_rng_state=False)
         else:
             x = self.linear(x)
-        return x
+        return x.relu()
 
 
 def inference_example(fake_init=True, cpu_init_helper=False):
@@ -100,6 +100,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
         out.backward()
         opt.step()
         opt.zero_grad(True)
+
         return out
 
     fake_mode = FakeTensorMode()
@@ -116,10 +117,10 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
             model = broadcast_module(model)
             torch.distributed.broadcast(randn_input, src=0)
 
-        opt = torch.optim.SGD(model.parameters(), lr=0.001, foreach=True)
+        opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
 
         model_2 = copy.deepcopy(model)
-        opt_2 = torch.optim.SGD(model_2.parameters(), lr=0.001, foreach=True)
+        opt_2 = torch.optim.Adam(model_2.parameters(), lr=0.001, foreach=True, capturable=True)
 
         torch_step_1_result = train_step.original_func(randn_input, model, opt)
         torch_step_2_result = train_step.original_func(randn_input, model, opt)
@@ -134,7 +135,7 @@ def train_example(fake_init=True, enable_checkpoint=False, cpu_init_helper=False
         module = broadcast_module(module)
         train_step.register_cpu_module(copy.deepcopy(module).to("cuda"))
 
-        opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
+        opt = torch.optim.Adam(module.parameters(), lr=0.001, foreach=True, capturable=True)
 
         torch_step_1_result = train_step.original_func(randn_input, module, opt)
         torch_step_2_result = train_step.original_func(randn_input, module, opt)
