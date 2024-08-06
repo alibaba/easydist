@@ -9,6 +9,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from torch.nn.utils import stateless
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from easydist.torch.compile import compile_train_step
 from easydist.torch.compile_auto import preprocess_traced_graph
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.compile_pipeline import (EDGraphModule, SplitPatcher,
@@ -59,6 +60,9 @@ def _compile_pp(func,
                 strict=True,
                 local=False,
                 local_pp_stage_cnt=None) -> PipelineStage:
+    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                             args_chunk_spec, kwargs_chunk_spec)
+    args, kwargs = args_split[0], kwargs_split[0]
 
     if local_pp_stage_cnt is not None:
         world_size = local_pp_stage_cnt
@@ -77,74 +81,8 @@ def _compile_pp(func,
             assert opt is None, "Only support single Optimizer in args now"
             opt = arg
 
-    params, buffers = {}, {}
-    if module is not None:
-        params = dict(module.named_parameters())
-        buffers = dict(module.named_buffers())
+    params, buffers, named_states, _, traced_stateless_func = compile_train_step(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt)
 
-        if isinstance(init_helper, SetParaInitHelper):
-            init_helper.module = module
-
-    named_states = {}
-
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = rgetattr(module, name).data.fake_mode
-
-        with mode, _enable_compile():
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
-
-    flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-    # fix for sgd withtout momentum
-    if all(state is None for state in flat_named_states):
-        named_states = {}
-        flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
-
-    state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
-
-    def stateless_func(func, params, buffers, named_states, args, kwargs):
-        clear_pp_compile_states()
-        with stateless._reparametrize_module(
-                cast(torch.nn.Module, module), {
-                    **params,
-                    **buffers
-                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-                    opt, named_states, params) if opt else nullcontext():
-            ret = func(*args, **kwargs)
-        if (tup := get_updated_params_states()) != (None, None):
-            params, named_states = tup
-        grads = {k: v.grad for k, v in params.items()}
-        return params, buffers, named_states, grads, ret
-
-    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
-                                                             args_chunk_spec, kwargs_chunk_spec)
-
-    with _enable_compile(), SplitPatcher(module, opt):
-        traced_stateless_func = make_fx(partial(stateless_func, func),
-                                        tracing_mode=tracing_mode,
-                                        decomposition_table=EASYDIST_DECOMP_TABLE,
-                                        _allow_non_fake_inputs=False)(params, buffers,
-                                                                      named_states, args_split[0],
-                                                                      kwargs_split[0])
-
-    if len(list(traced_stateless_func.named_buffers())) == 0:
-        warnings.warn("No buffers found in the traced graph, please check if the model is correctly traced")
-
-    traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func_node_metas = {
         node.name: node.meta
         for node in traced_stateless_func.graph.nodes

@@ -44,42 +44,23 @@ from torch.nn.utils import stateless
 
 
 # Copyright (c) Meta Platforms, Inc. and affiliates
-class PipeSplitWrapper(torch.nn.Module):
 
-    def __init__(self, mod: torch.nn.Module):
-        super().__init__()
-        self.mod = mod
-
-    def forward(self, *args, **kwargs):
-        ret: Any = self.mod(*args, **kwargs)
-        ret_on_new_stage: Any = split(ret)
-        assert type(ret) == type(
-            ret_on_new_stage), f"Please make sure you register the unflatten func correctly"
+def split_after_forward(module: torch.nn.Module):
+    def hook(module, args, ret):
+        ret_on_new_stage = split(ret)
         return ret_on_new_stage
-
-    def __getattr__(self, name: str):
-        if '_parameters' in self.__dict__:
-            _parameters = self.__dict__['_parameters']
-            if name in _parameters:
-                return _parameters[name]
-        if '_buffers' in self.__dict__:
-            _buffers = self.__dict__['_buffers']
-            if name in _buffers:
-                return _buffers[name]
-        if '_modules' in self.__dict__:
-            modules = self.__dict__['_modules']
-            if name in modules:
-                return modules[name]
-        if hasattr(self.mod, name):
-            return getattr(self.mod, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    module.register_forward_hook(hook, prepend=True)
+    return module
 
 
-def annotate_split_points(mod: torch.nn.Module, spec: Set[str]):
+def annotate_split_points(module: torch.nn.Module, spec: Set[str]):
+    if not isinstance(spec, set):
+        raise TypeError("spec should be a set of strings")
+
     # TODO: make this implementation out-of-place?
     for qualname in iter(spec):
         atoms = qualname.split(".")
-        predecessor_module = mod
+        predecessor_module = module
         for i, atom in enumerate(atoms[:-1]):
             try:
                 predecessor_module = getattr(predecessor_module, atom)
@@ -89,16 +70,16 @@ def annotate_split_points(mod: torch.nn.Module, spec: Set[str]):
                 )
 
         mod_to_wrap = getattr(predecessor_module, atoms[-1])
-        wrapped_mod = PipeSplitWrapper(mod_to_wrap)
+        wrapped_mod = split_after_forward(mod_to_wrap)
         setattr(predecessor_module, atoms[-1], wrapped_mod)
 
 
 def split_into_equal_size(nstages: int = 1, ) -> Callable[[torch.nn.Module], torch.fx.GraphModule]:
 
-    def _split_into_nstages_equal_size(mod: torch.nn.Module) -> torch.fx.GraphModule:
+    def _split_into_nstages_equal_size(module: torch.nn.Module) -> torch.fx.GraphModule:
         tracer = torch.fx.Tracer()
-        g = tracer.trace(mod)
-        gm = torch.fx.GraphModule(mod, g)
+        g = tracer.trace(module)
+        gm = torch.fx.GraphModule(module, g)
         param_size = 0
         for param in gm.parameters():
             param_size += param.numel()
@@ -225,7 +206,7 @@ def _split_on_size_threshold_with_max_stages(
         return wrapped_func
 
     def gen_module_wrapper(target_module):
-        return PipeSplitWrapper(target_module)
+        return split_after_forward(target_module)
 
     nstages = 1
     for node in insert_after_nodes:
@@ -522,13 +503,13 @@ class CompiledStage:
     def has_bw(self):
         return hasattr(self, 'bw_gm')
 
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
         state_dict = {}
         state_dict.update(self.named_parameters())
         state_dict.update(self.named_buffers())
         return state_dict
 
-    def _load_params(self, state_dict):  # TODO @botbw: better way of doing this
+    def _load_params(self, state_dict: Dict[str, Any]):
         to_pop = []
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.params_nodes_unflatten[torch_name]
@@ -541,7 +522,7 @@ class CompiledStage:
         for torch_name in to_pop:
             state_dict.pop(torch_name)
 
-    def _load_buffers(self, state_dict):  # TODO @botbw: better way of doing this
+    def _load_buffers(self, state_dict: Dict[str, Any]):
         to_pop = []
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.buffers_nodes_unflatten[torch_name]
@@ -554,25 +535,28 @@ class CompiledStage:
         for torch_name in to_pop:
             state_dict.pop(torch_name)
 
-    def load_state_dict(self, state_dict, strict=True):  # TODO @botbw: better way of doing this
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool=True):
         self._load_params(state_dict)
         self._load_buffers(state_dict)
-        if strict:
-            if len(state_dict) != 0:
-                raise RuntimeError(f"state_dict has unexpected keys {state_dict.keys()}")
+        if strict and len(state_dict) != 0:
+            raise RuntimeError(f"Unexpected keys in state_dict {state_dict.keys()}")
 
-    def load_optimizer_state_dict(self, state_dict, strict=True):  # TODO @botbw: better way of doing this
-        for torch_name, typ_dict in state_dict.items():
-            for typ, tensor in typ_dict.items():
+    def load_optimizer_state_dict(self, state_dict: Dict[str, Any], strict: bool=True):
+        for torch_name, sub_state_dict in state_dict.items():
+            cnt = 0
+            for typ, tensor in sub_state_dict.items():
                 node_name = self.compiled_meta.optimstates_nodes_unflatten[torch_name][typ]
                 if node_name in self.compiled_meta.optimstates_strategies:
+                    cnt += 1
                     src_specs = [to_torch_spmd(SPMD(SPMD.REPLICATE))] * len(src_specs)
                     tgt_specs = self.compiled_meta.optimstates_strategies[node_name]
                     tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
                 self.step_gm.injected_states[StateType.OPTIMSTATES][node_name] = tensor
-        # TODO: pop states after loading
 
-    def named_parameters(self):  # TODO @botbw: better way of doing this
+            if strict and cnt != len(sub_state_dict):
+                raise RuntimeError(f"Unexpected keys in state_dict {state_dict.keys()}")
+
+    def named_parameters(self) -> Dict[str, Any]:
         if self.compiled_meta.params_strategies:
             params = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items():
@@ -588,7 +572,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.PARAMS].items()
             }
 
-    def named_buffers(self):  # TODO @botbw: better way of doing this
+    def named_buffers(self) -> Dict[str, Any]:
         if self.compiled_meta.buffers_strategies:
             buffers = {}
             for node_name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items():
@@ -604,7 +588,7 @@ class CompiledStage:
                 for name, tensor in self.fw_gm.injected_states[StateType.BUFFERS].items()
             }
 
-    def optimizer_state_dict(self):  # TODO @botbw: better way of doing this
+    def optimizer_state_dict(self) -> Dict[str, Any]:
         optim_state = defaultdict(dict)
         if self.compiled_meta.optimstates_strategies:
             for name, state in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
@@ -623,10 +607,10 @@ class CompiledStage:
 
 class SplitPatcher(_Patcher):
 
-    def __init__(self, mod: torch.nn.Module, opt: torch.optim.Optimizer):
+    def __init__(self, module: torch.nn.Module, optimizer: torch.optim.Optimizer):
         super().__init__()
-        self.mod = mod
-        self.opt = opt
+        self.module = module
+        self.optimizer = optimizer
 
     def __enter__(self):
         patcher = super().__enter__()
@@ -648,27 +632,27 @@ class SplitPatcher(_Patcher):
 
         patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
 
-        if self.mod:
-            mod_cls = type(self.mod)
+        if self.module:
+            mod_cls = type(self.module)
             orig_forward = mod_cls.forward
 
-            def forward_wrapper(mod, *args, **kwargs):
-                ret = orig_forward(mod, *args, **kwargs)
+            def forward_wrapper(module, *args, **kwargs):
+                ret = orig_forward(module, *args, **kwargs)
                 return ret
 
             patcher.patch_method(mod_cls, 'forward', forward_wrapper, deduplicate=False)
 
-        if self.opt:
-            opt_cls = type(self.opt)
+        if self.optimizer:
+            opt_cls = type(self.optimizer)
             orig_step = opt_cls.step
 
-            def step_wrapper(opt, *args, **kwargs):
-                params = dict(self.mod.named_parameters()) if self.mod else {}
+            def step_wrapper(optimizer, *args, **kwargs):
+                params = dict(self.module.named_parameters()) if self.module else {}
                 grads = {n: p.grad for n, p in params.items() if p.grad is not None}
                 named_states = {}
                 for n, p in params.items():
-                    if p in self.opt.state:
-                        named_states[n] = self.opt.state[p]
+                    if p in self.optimizer.state:
+                        named_states[n] = self.optimizer.state[p]
 
                 states, spec = pytree.tree_flatten((params, grads, named_states))
 
@@ -682,12 +666,12 @@ class SplitPatcher(_Patcher):
                     p.grad = split_grads[n]
 
                 with stateless._reparametrize_module(
-                        cast(torch.nn.Module, self.mod), {
+                        cast(torch.nn.Module, self.module), {
                             **params,
                         },
-                        tie_weights=True) if self.mod else nullcontext(), _rematerialize_optimizer(
-                            opt, named_states, params) if opt else nullcontext():
-                    orig_step(opt, *args, **kwargs)
+                        tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
+                            optimizer, named_states, params) if optimizer else nullcontext():
+                    orig_step(optimizer, *args, **kwargs)
 
                 set_updated_params_states(params, named_states)
                 set_step_flag(True)
@@ -723,11 +707,8 @@ def split_by(traced: torch.fx.GraphModule, split_point: Callable):
             part_idx += 1
         return part_idx
 
-    # Ask split_module to return mapping from new qualname to old qualname
-    qualname_map: Dict[str, str] = {}
-    # TODO: what does split do with module invocations? does it move the modules
-    # into the submodules?
-    split = ed_split_module(traced, None, split_callback, qualname_map)
+    # split module
+    split = ed_split_module(traced, None, split_callback, {})
 
     # remove pipe_split point
     for submodule in split.children():
@@ -776,7 +757,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: Set[str]
             if node.target == operator.getitem:
                 pass  # getitem is handled in foreach operators
             elif '_foreach_' == node.name[:
-                                          9]:  # handle foreach operators # TODO @botbw: better way of doing this? register foreach ops?
+                                          9]:  # handle foreach operators
                 list_args_kwargs_mask = []
                 args = []
                 for arg in node.args:

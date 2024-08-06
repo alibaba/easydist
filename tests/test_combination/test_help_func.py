@@ -13,10 +13,12 @@
 # ==============================================================================
 
 import numpy
+import pytest
 from easydist import platform
 from easydist.metashard.combination import aligned_prefix, shape_aligned_otherdim
 
 
+@pytest.mark.all_platform
 def test_aligned_prefix():
     t1 = platform.from_numpy(numpy.array([1, 2, 3, 4]))
     t2 = platform.from_numpy(numpy.array([1, 2, 3, 4]))
@@ -32,6 +34,7 @@ def test_aligned_prefix():
     assert 3 == aligned_prefix(t1, t2, dim_idx=1)
 
 
+@pytest.mark.all_platform
 def test_aligned_otherdim():
     shape_1 = (10, 11, 12)
     shape_2 = (10, 13, 12)

@@ -14,14 +14,15 @@
 
 import functools
 
+import pytest
 import torch
 
 from easydist.metashard.combination import CombinationFunc
 from easydist.metashard import ShardAnnotation, ShardDim, MetaOp
-from easydist.utils.testing import assert_partial_func_equal
+from easydist.utils.testing.mock import assert_partial_func_equal
 from easydist import easydist_setup
 
-
+@pytest.mark.torch
 def test_metaop_preset():
     easydist_setup("torch")
     input_args = (torch.rand((3, 4, 768)), 3, 2), {}

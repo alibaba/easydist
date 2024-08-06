@@ -1,21 +1,20 @@
-import os
-import difflib
-
+import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
+import torch.distributed
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
-from easydist.torch import set_device_mesh
-from easydist.utils.testing import TorchMockDeviceMesh
+from easydist.torch.device_mesh import set_device_mesh, NDDeviceMesh
+from easydist.utils.testing import spawn
+from torch.distributed._tensor import DeviceMesh
 
 
 class Foo(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.norm = torch.nn.LayerNorm(5)
-        self.linear = torch.nn.Linear(5, 5)
+        self.norm = torch.nn.LayerNorm(8)
+        self.linear = torch.nn.Linear(8, 8)
 
     def forward(self, x):
         x = self.norm(x)
@@ -34,33 +33,33 @@ def train_step(input, model, opt):
 
 
 def train_example():
-    fake_mode = FakeTensorMode()
 
     torch.ones(1).cuda()
-    with torch.device('cuda'), fake_mode:
+    with torch.device('cuda'):
         model = Foo()
-        randn_input = torch.randn(16, 5)
+        randn_input = torch.randn(16, 8)
 
         torch.distributed.broadcast(randn_input, src=0)
 
         opt = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True, capturable=True)
 
     # trace train step func
-    mock_mesh = TorchMockDeviceMesh(1, 2, debug_only=True)
-    set_device_mesh(mock_mesh)
+    mesh = NDDeviceMesh(DeviceMesh(
+        "cuda", [0, 1], mesh_dim_names=["spmd"]
+    ))
+    set_device_mesh(mesh)
 
     train_step(randn_input, model, opt)
 
 def main():
     # setting up easydist and torch.distributed
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
-
-    torch.distributed.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-
+    torch.cuda.set_device(torch.distributed.get_rank())
     train_example()
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.torch
+def test_simple_model():
+    spawn(main, nprocs=2)
 
+if __name__ == "__main__":
+    test_simple_model()

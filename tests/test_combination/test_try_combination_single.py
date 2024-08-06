@@ -23,6 +23,7 @@ from easydist.utils.testing import ALL_PLATFORM, assert_partial_func_equal
 from easydist import easydist_setup
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_reduce(backend):
     easydist_setup(backend)
@@ -37,6 +38,7 @@ def test_reduce(backend):
         assert_partial_func_equal(comb_func, return_func)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather(backend):
     easydist_setup(backend)
@@ -51,6 +53,7 @@ def test_gather(backend):
         assert_partial_func_equal(comb_func, return_func)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather_halo(backend):
     easydist_setup(backend)
@@ -67,6 +70,7 @@ def test_gather_halo(backend):
         assert_partial_func_equal(comb_func, return_func)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather_chunk(backend):
     easydist_setup(backend)

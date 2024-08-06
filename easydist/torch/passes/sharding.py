@@ -28,7 +28,7 @@ from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
 from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
-from easydist.utils.testing import MockDeviceMesh
+from easydist.utils.testing.mock import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
 from easydist.metashard.combination import ReduceOp
 

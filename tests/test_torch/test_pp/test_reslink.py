@@ -12,19 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 
-# torchrun --nproc_per_node 4 tests/test_torch/test_pp/test_reslink.py
-import argparse
-from contextlib import nullcontext
-import os
 import random
-import time
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
 
-from torchvision import datasets, transforms
 from torch.distributed._tensor import DeviceMesh
 from tqdm import tqdm
 
@@ -32,10 +26,10 @@ from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
-from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
-                                                             split_into_equal_size)
-from torch.profiler import profile, ProfilerActivity
+from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
+from easydist.utils.testing import spawn
 
+import pytest
 
 class Foo(torch.nn.Module):
 
@@ -69,19 +63,16 @@ def seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-def test_main(args):
-    per_chunk_sz = args.micro_batch_size
-    num_chunks = args.num_chunks
+def main(schedule_cls):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    pp_size = world_size
+    per_chunk_sz = 1
+    num_chunks = 16
     batch_size = per_chunk_sz * num_chunks
-    schedule_cls = ScheduleGPipe if args.schedule == 'gpipe' else ScheduleDAPPLE
-    do_profile = args.do_profile
     seed(42)
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
-    dist.init_process_group(backend="nccl")
-    rank = int(os.environ["RANK"])
-    pp_size = int(os.environ["WORLD_SIZE"])
     device = torch.device('cuda')
     torch.cuda.set_device(rank)
 
@@ -106,65 +97,27 @@ def test_main(args):
         opt.zero_grad()
         return out, loss
 
-    dataset_size = 10000
+    dataset_size = 100
     train_dataloader = [(torch.randn(
         batch_size, 1024, device=device), torch.randint(0, 10, (batch_size, ), device=device))
                         ] * (dataset_size // batch_size)
 
     x_batch, y_batch = next(iter(train_dataloader))
-    train_step(x_batch, y_batch, module, opt)  # compile
     epochs = 1
-    with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            with_stack=True,
-            #  experimental_config=torch._C._profiler._ExperimentalConfig(
-            #      verbose=True),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                f'./log/res-{schedule_cls.__name__}-{rank}')) if do_profile else nullcontext(
-                ) as prof:
-        time_start = time.time()
-        torch.cuda.synchronize()
-        for _ in range(epochs):
-            for x_batch, y_batch in tqdm(train_dataloader,
-                                         dynamic_ncols=True) if rank == 0 else train_dataloader:
-                if x_batch.size(0) != batch_size:  # TODO need to solve this
-                    continue
-                _ = train_step(x_batch, y_batch, module, opt)
-        torch.cuda.synchronize()
-        time_sum = time.time() - time_start
-        if rank == 0:
-            print(f"Finish in {time_sum:.3f} seconds")
-    with open(f'{schedule_cls.__name__}-{rank}-test.txt', 'a') as f:
-        f.write(
-            f'num_chunks: {num_chunks}, chunk_sz {per_chunk_sz}, time: {time_sum / epochs:2.1f}, memory: {torch.cuda.max_memory_allocated(rank) / 1024 / 1024:5.0f}MB\n'
-        )
-    if do_profile:
-        config = {
-            'row_limit': 100,
-            'max_src_column_width': 75,
-            'max_name_column_width': 55,
-            'max_shapes_column_width': 80,
-        }
-        with open(f'./log/res-{schedule_cls.__name__}-profile-{rank}.txt', 'w') as f:
-            f.write(prof.key_averages().table(sort_by="cuda_time_total",
-                                              top_level_events_only=True,
-                                              header='sort by cuda_time_total',
-                                              **config))
-            f.write('\n\n\n')
-            f.write(prof.key_averages().table(sort_by="cpu_time_total",
-                                              top_level_events_only=True,
-                                              header='sort by cpu_time_total',
-                                              **config))
-        # prof.export_stacks(f"{schedule_cls.__name__}-profile-fg.txt",
-        #                    "self_cuda_time_total")
 
+    for _ in range(epochs):
+        for x_batch, y_batch in tqdm(train_dataloader,
+                                        dynamic_ncols=True) if rank == 0 else train_dataloader:
+            if x_batch.size(0) != batch_size:  # TODO need to solve this
+                continue
+            _ = train_step(x_batch, y_batch, module, opt)
+
+@pytest.mark.torch
+@pytest.mark.parametrize("schedule_cls", [ScheduleGPipe, ScheduleDAPPLE])
+@pytest.mark.timeout(150)
+def test_reslink(schedule_cls):
+    spawn(main, (schedule_cls,), nprocs=4)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--micro-batch-size', type=int, default=128)
-    parser.add_argument('--num-chunks', type=int, default=4)
-    parser.add_argument('--schedule', type=str, default='gpipe', choices=['gpipe', 'dapple'])
-    parser.add_argument('--do-profile', action='store_true', default=False)
-    args = parser.parse_args()
-    test_main(args)
-    print("no deadlock")
+    test_reslink()
+

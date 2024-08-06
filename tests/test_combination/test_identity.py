@@ -21,6 +21,7 @@ from easydist.utils.testing import ALL_PLATFORM
 from easydist import easydist_setup
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_identity(backend):
     easydist_setup(backend)
@@ -31,6 +32,7 @@ def test_identity(backend):
     assert platform.allclose(global_tensor, combination_tensor)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_identity_2(backend):
     easydist_setup(backend)
@@ -41,6 +43,7 @@ def test_identity_2(backend):
     assert not platform.allclose(global_tensor, combination_tensor)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_identity_3(backend):
     easydist_setup(backend)

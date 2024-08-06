@@ -141,7 +141,6 @@ class PipelineStage(RuntimeMixin):
 
         # communication infra
         self._init_communication(node_metas)
-        # self._init_batch_isend_irecv()
 
         # runtime states
         self._init_runtime_states()
@@ -235,41 +234,6 @@ class PipelineStage(RuntimeMixin):
                                                               self.bw_node,
                                                               is_forward=False)
             self.bw_grad_send_info = self._create_send_info(self.bw_node, is_forward=False)
-
-    def _init_batch_isend_irecv(self):
-        '''
-        See batch_isend_irecv in torch.distributed for more details:
-            .. note:: Note that when this API is used with the NCCL PG backend, users must set
-                the current GPU device with `torch.cuda.set_device`, otherwise it will
-                lead to unexpected hang issues.
-
-            In addition, if this API is the first collective call in the ``group``
-            passed to ``dist.P2POp``, all ranks of the ``group`` must participate in
-            this API call; otherwise, the behavior is undefined. If this API call is
-            not the first collective call in the ``group``, batched P2P operations
-            involving only a subset of ranks of the ``group`` are allowed.
-        '''
-        torch.cuda.set_device(self.device)
-        succeesor = self.stage_index_to_group_rank[(self.stage_idx + 1) % self.num_stages]
-        succeesor_global = succeesor if self.pp_group is None else dist.get_global_rank(
-            self.pp_group, succeesor)
-        succeesor_recv = torch.zeros(1, device=self.device)
-        ancessor = self.stage_index_to_group_rank[(self.stage_idx - 1) % self.num_stages]
-        ancessor_global = ancessor if self.pp_group is None else dist.get_global_rank(
-            self.pp_group, ancessor)
-        ancessor_recv = torch.zeros(1, device=self.device)
-        send_tensor = torch.zeros(1, device=self.device) + self.stage_idx
-        ops = [
-            dist.P2POp(dist.isend, send_tensor, succeesor_global, self.pp_group),
-            dist.P2POp(dist.isend, send_tensor, ancessor_global, self.pp_group),
-            dist.P2POp(dist.irecv, succeesor_recv, succeesor_global, self.pp_group),
-            dist.P2POp(dist.irecv, ancessor_recv, ancessor_global, self.pp_group)
-        ]
-        works = dist.batch_isend_irecv(ops)
-        for work in works:
-            work.wait()
-        assert succeesor_recv.item() == (self.stage_idx + 1) % self.num_stages
-        assert ancessor_recv.item() == (self.stage_idx - 1) % self.num_stages
 
     def _init_runtime_states(self):
         self.cur_fw_send_chunk = None
@@ -528,13 +492,13 @@ class PipelineStage(RuntimeMixin):
 
         return self.outputs_batch
 
-    def optimstate_dict(self, all_gather=False):
+    def optimstate_dict(self, all_gather=True) -> Dict[str, Any]:
         if all_gather:
             return self._all_gather_optimstate_dict()
         else:
             return self.compiled_stage.optimizer_state_dict()
 
-    def state_dict(self, all_gather=False):
+    def state_dict(self, all_gather=True) -> Dict[str, Any]:
         if all_gather:
             return self._all_gather_state_dict()
         else:
@@ -546,7 +510,7 @@ class PipelineStage(RuntimeMixin):
     def load_optimizer_state_dict(self, state_dict, strict=True):
         self.compiled_stage.load_optimizer_state_dict(state_dict, strict=strict)
 
-    def _all_gather_state_dict(self):
+    def _all_gather_state_dict(self) -> Dict[str, Any]:
         state_dicts = [None for _ in range(self.num_stages)]
         state_dict = self.compiled_stage.state_dict()  # gather spmd
         dist.all_gather_object(state_dicts,
@@ -554,7 +518,7 @@ class PipelineStage(RuntimeMixin):
                             group=self.pp_group)
         return reduce(lambda a, b: {**a, **b}, state_dicts)
 
-    def _all_gather_optimstate_dict(self):
+    def _all_gather_optimstate_dict(self) -> Dict[str, Any]:
         optimizer_state_dicts = [None for _ in range(self.num_stages)]
         optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
         dist.all_gather_object(

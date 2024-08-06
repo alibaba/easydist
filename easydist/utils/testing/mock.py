@@ -12,8 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-ALL_PLATFORM = ["torch", "jax", "tvm"]
-
 
 class MockDeviceMesh:
 
