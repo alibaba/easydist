@@ -489,8 +489,6 @@ def _compile_auto(func,
         params = dict(module.named_parameters())
         buffers = dict(module.named_buffers())
 
-        #print(f"initial params: {params}")
-        #print(f"initial buffers: {buffers}")
         if isinstance(init_helper, SetParaInitHelper):
             init_helper.module = module
 
