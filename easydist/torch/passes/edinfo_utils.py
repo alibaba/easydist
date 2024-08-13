@@ -22,7 +22,7 @@ from easydist.torch.utils import EDInfo, EDNodeType, create_meta_from_node
 from easydist.torch.passes.sharding import CREATE_ATEN_OP, COMM_FUNCS
 
 
-def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, meta_info) -> torch.fx.GraphModule:
+def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, shape_info) -> torch.fx.GraphModule:
 
     for node in fx_module.graph.nodes:
 
@@ -40,8 +40,8 @@ def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, meta_info) -> 
             if op_name in sharding_info:
 
                 def _gen_meta(arg: Node):
-                    return torch.empty(meta_info[arg.name]["shape"],
-                                       dtype=meta_info[arg.name]["dtype"],
+                    return torch.empty(shape_info[arg.name]["shape"],
+                                       dtype=shape_info[arg.name]["dtype"],
                                        device="meta")
 
                 args_meta = pytree.tree_map_only(Node, _gen_meta, node.args)
@@ -55,8 +55,8 @@ def create_edinfo(fx_module: torch.fx.GraphModule, sharding_info, meta_info) -> 
             if hasattr(node, "meta") and 'val' in node.meta:
                 node_sharding_info = None
                 if node.op in sharding_info:
-                    arg_meta_tensor = torch.empty(meta_info[node.name]["shape"],
-                                                  dtype=meta_info[node.name]["dtype"],
+                    arg_meta_tensor = torch.empty(shape_info[node.name]["shape"],
+                                                  dtype=shape_info[node.name]["dtype"],
                                                   device="meta")
                     args_meta = str(arg_meta_tensor)
                     if args_meta in sharding_info[node.op]:

@@ -26,7 +26,7 @@ from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 import easydist.config as mdconfig
-from easydist.autoflow import AutoFlowSolver
+from easydist.autoflow import AutoFlowSolver1D
 from easydist.metashard import metair
 
 from .device_mesh import set_device_mesh, get_device_mesh
@@ -195,7 +195,7 @@ def get_opt_strategy(func, *args, **kwargs):
         rich.print(meta_graph)
 
     device_mesh = get_device_mesh()
-    solver = AutoFlowSolver(device_mesh.device_ids.shape)
+    solver = AutoFlowSolver1D(device_mesh.device_ids.shape)
 
     if mdconfig.enable_graph_coarsen:
         logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")

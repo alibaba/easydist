@@ -146,11 +146,8 @@ def test_main():
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
-    state_dict_list = train_step.compiled_func.state_dict(0)
+    state_dict = train_step.compiled_func.state_dict(0)
     if rank == 0:
-        state_dict = {}
-        for st in state_dict_list:
-            state_dict.update(st)
         torch.save(state_dict, os.path.join(ckpt_dir, 'resnet.pth'))
 
 

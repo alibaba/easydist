@@ -1314,7 +1314,7 @@ def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSP
 
     for i, (current, target) in sorted_placements:
         my_coordinate = device_mesh.get_coordinate()
-        num_chunks = device_mesh.size(dim=i)
+        num_chunks = device_mesh.size(mesh_dim=i)
 
         if current == target:
             continue

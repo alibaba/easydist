@@ -12,6 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from .solver import AutoFlowSolver
+from .solver import AutoFlowSolver1D
 
-__all__ = ["AutoFlowSolver"]
+__all__ = ["AutoFlowSolver1D"]

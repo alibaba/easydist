@@ -78,7 +78,7 @@ tile_context_length = 15
 nvlink_processor_usage = 0.15
 
 # Scheduling communication
-comm_optimization = True
+comm_optimization = os.environ.get("COMM_OPTIMIZATION", "True").upper() in ["1", "TRUE"]
 # 'general', 'odd_even'
 rcpsp_method = 'general'
 rcpsp_iter_round = 1 # odd_even rounds
@@ -105,3 +105,5 @@ dump_mem_usage_graph = os.environ.get("DUMP_MEM_USAGE_GRAPH", "False").upper() i
 # runtime trace
 enable_runtime_trace = os.environ.get("ENABLE_RUNTIME_TRACE", "False").upper() in ["1", "TRUE"]
 
+# whether to allow solver find 1d solution when using nd device mesh
+allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper() in ["1", "TRUE"]

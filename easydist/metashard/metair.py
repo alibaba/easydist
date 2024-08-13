@@ -16,16 +16,14 @@ from __future__ import annotations
 import copy
 import os
 import logging
-from typing import List
+from typing import Dict, List, Optional, Tuple
 from functools import reduce
 
-from easydist.metashard.combination import ReduceOp
 from easydist.platform import get_backend
 import easydist.config as mdconfig
+from easydist.torch.device_mesh import get_device_mesh
 
 logger = logging.getLogger(__name__)
-
-DEVICE_MESH_1D = -1
 
 
 class SPMD:
@@ -65,7 +63,7 @@ class SPMD:
 class VarSPMDStrategy:
 
     def __init__(self, *var_spmd_strategy) -> None:
-        self.var_spmd_strategy = list(var_spmd_strategy)
+        self.var_spmd_strategy : List[SPMD] = list(var_spmd_strategy)
 
     def __getitem__(self, idx) -> SPMD:
         return self.var_spmd_strategy[idx]
@@ -89,12 +87,15 @@ class VarSPMDStrategy:
 
     def __repr__(self) -> str:
         return self.__str__()
+    
+    def __iter__(self):
+        return iter(self.var_spmd_strategy)
 
 
 class VarSPMDStrategyGroup:
 
     def __init__(self, *var_spmd_strategy_group) -> None:
-        self.var_spmd_strategy_group = list(var_spmd_strategy_group)
+        self.var_spmd_strategy_group : List[VarSPMDStrategy] = list(var_spmd_strategy_group)
 
     def append(self, var_spmd_strategy: VarSPMDStrategy) -> None:
         self.var_spmd_strategy_group.append(var_spmd_strategy)
@@ -113,6 +114,9 @@ class VarSPMDStrategyGroup:
 
     def __getitem__(self, idx) -> VarSPMDStrategy:
         return self.var_spmd_strategy_group[idx]
+
+    def __setitem__(self, idx, value: VarSPMDStrategy) -> None:
+        self.var_spmd_strategy_group[idx] = value
 
     def __len__(self) -> str:
         return self.var_spmd_strategy_group.__len__()
@@ -168,7 +172,7 @@ class NodeSPMDStrategyPool:
         return len(self.strategies)
 
     def __str__(self) -> str:
-        return f"{self.strategies})"
+        return f"({self.strategies})"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -206,7 +210,8 @@ def combination_to_sharding_strategy(comm_anns, all_replicate=False):
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.SHARD, comm_ann.keywords)))
         elif func_name == "reduce":
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.PARTIAL, comm_ann.keywords)))
-
+        else:
+            raise RuntimeError(f"got {func_name} in combination_ann")
     return spmd_strategy
 
 
@@ -358,7 +363,7 @@ class MetaNode:
         assert self.strtg_pool
         return self.strtg_pool.get_strtg(idx)
 
-    def get_strtg_pool(self) -> NodeSPMDStrategyPool:
+    def get_strtg_pool(self, opt_strtg_per_dim: List[Dict]) -> NodeSPMDStrategyPool:
         if self.strtg_pool is not None:
             return self.strtg_pool
 
@@ -372,9 +377,15 @@ class MetaNode:
             self.strtg_pool = NodeSPMDStrategyPool()
             return self.strtg_pool
 
-        for comm_ann in comm_anns:
-            in_strtg_group = get_sharding_strategy(sharding_anns, comm_ann)
-            out_strtg_group = combination_to_sharding_strategy(comm_anns[comm_ann])
+        for shard_idx in comm_anns:
+            in_strtg_group = get_sharding_strategy(sharding_anns, shard_idx)    
+            out_strtg_group = combination_to_sharding_strategy(comm_anns[shard_idx])
+            # skip the possible solution when it has appeared in previous dim solution
+            if (
+                not mdconfig.allow_1d_fallback_sol
+                and any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_dim)
+            ):
+                continue
             strategy_list_1d.append(NodeSPMDStrategy(in_strtg_group, out_strtg_group))
 
         if all(op not in self.op_name for op in _heavy_ops) or len(comm_anns) == 0:
@@ -408,48 +419,14 @@ class MetaNode:
         #         del strategy_list[del_idx]
 
         self.strtg_pool = NodeSPMDStrategyPool()
-        if DEVICE_MESH_1D == -1:
-            for idx1, s1 in enumerate(strategy_list_1d):
-                for idx2, s2 in enumerate(strategy_list_1d):
-                    # [Shard(i), Shard(i)] is not support for pytorch dtensor runtime
-                    if get_backend() == "torch":
-                        if any(i.state == SPMD.SHARD for i in s1.in_strtg_group) and idx1 == idx2:
-                            continue
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i, j in zip(s1.in_strtg_group, s2.in_strtg_group):
-                        invars_strategy.append(i + j)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i, j in zip(s1.out_strtg_group, s2.out_strtg_group):
-                        outvars_strategy.append(i + j)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-        else:
-            replicate_ = VarSPMDStrategy(SPMD(SPMD.REPLICATE))
-            for s in strategy_list_1d:
-                if DEVICE_MESH_1D == 0:
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i in s.in_strtg_group:
-                        invars_strategy.append(replicate_ + i)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i in s.out_strtg_group:
-                        outvars_strategy.append(replicate_ + i)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-                elif DEVICE_MESH_1D == 1:
-                    invars_strategy = VarSPMDStrategyGroup()
-                    for i in s.in_strtg_group:
-                        invars_strategy.append(i + replicate_)
-                    outvars_strategy = VarSPMDStrategyGroup()
-                    for i in s.out_strtg_group:
-                        outvars_strategy.append(i + replicate_)
-                    self.strtg_pool.add_strategy(
-                        NodeSPMDStrategy(invars_strategy, outvars_strategy))
-                else:
-                    exit(-1)
+
+        for strategy in strategy_list_1d:
+            self.strtg_pool.add_strategy(strategy)
 
         if mdconfig.log_level <= logging.DEBUG:
             print("node: %s" % self.name.__str__())
             print(self.strtg_pool)
+
         return self.strtg_pool
 
     def __str__(self) -> str:
@@ -584,7 +561,6 @@ class ClusterStrategyPool:
                     invar_strtg = nd_strtg.get_invar_strtg(invar_idx)
                     nd_io_strtg.add_in_strategy(invar_idx, invar_strtg)
 
-                
             for outvar_idx in range(len(nd.outvars)):
                 outvar_strtg = nd_strtg.get_outvar_strtg(outvar_idx)
                 nd_io_strtg.add_out_strategy(outvar_idx, outvar_strtg)
@@ -630,7 +606,7 @@ class MetaNodeCluster:
         meta_node.cluster_id = self.unique_id
 
     def back_build_strategy(self, nd: MetaNode, nd_strtg_idx: int,
-                            cluster_strtg: ClusterStrategy) -> bool:
+                            cluster_strtg: ClusterStrategy, opt_strtg_per_dim: List[Dict]) -> bool:
         succ = True
         for invar_idx, invar in enumerate(nd.invars):
             if not invar:
@@ -652,19 +628,19 @@ class MetaNodeCluster:
             nd_strtg = nd.strtg_pool.get_strtg(nd_strtg_idx)
             expected_var_strtg = nd_strtg.get_invar_strtg(invar_idx)
 
-            up_nd_strtg_pool = up_node.get_strtg_pool()
+            up_nd_strtg_pool = up_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
             up_nd_strtg_idx = up_nd_strtg_pool.find_matched_out(idx_for_up, expected_var_strtg)
             if up_nd_strtg_idx >= 0:
                 up_nd_strtg = up_nd_strtg_pool.get_strtg(up_nd_strtg_idx)
                 cluster_strtg.set_node_strategy(up_node.unique_id, up_nd_strtg_idx, up_nd_strtg)
-                if not self.back_build_strategy(up_node, up_nd_strtg_idx, cluster_strtg):
+                if not self.back_build_strategy(up_node, up_nd_strtg_idx, cluster_strtg, opt_strtg_per_dim):
                     succ = False
             else:
                 succ = False
 
         return succ
 
-    def finalize(self) -> None:
+    def finalize(self, opt_strtg_per_dim: List[Dict]) -> None:
         for node in self.nodes.values():
             if node.invars:
                 for idx, invar in enumerate(node.invars):
@@ -705,14 +681,14 @@ class MetaNodeCluster:
 
         # build strategy candidates for cluster
         self.strategy_pool = ClusterStrategyPool(self)
-        out_strtg_pool = out_node.get_strtg_pool()
+        out_strtg_pool = out_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
 
         for out_strtg_idx in range(out_strtg_pool.strtg_num()):
             cluster_strtg = ClusterStrategy()
             out_strtg = out_node.get_strtg(out_strtg_idx)
             cluster_strtg.set_node_strategy(out_node.unique_id, out_strtg_idx, out_strtg)
 
-            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg):
+            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg, opt_strtg_per_dim):
                 assert len(cluster_strtg.node_strategies) == len(self.nodes)
                 self.strategy_pool.add_strategy(cluster_strtg)
             else:
@@ -801,12 +777,12 @@ class MetaGraph:
 
         return liveness_list
 
-    def build_fine_grain_clusters(self):
+    def build_fine_grain_clusters(self, opt_strtg_per_dim: List[Dict]):
         cluster_id = 0
         for node in self.op_list:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             cluster.add_node(node)
-            cluster.finalize()
+            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
@@ -857,10 +833,9 @@ class MetaGraph:
         for in_var in nd.invars:
             if in_var and in_var.up_node:
                 if in_var.up_node.unique_id not in root_ids:
-                    #print("recursive build cone from %s" % str(in_var.up_node))
                     self.build_cone_cluster(in_var.up_node, root_ids, cluster)
 
-    def build_cone_clusters(self):
+    def build_cone_clusters(self, opt_strtg_per_dim: List[Dict]):
         cone_roots = self.find_cone_roots()
         logger.debug("root num: %d" % len(cone_roots))
         logger.debug(cone_roots)
@@ -873,15 +848,15 @@ class MetaGraph:
         for cone_root in cone_roots:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             self.build_cone_cluster(cone_root, root_ids, cluster)
-            cluster.finalize()
+            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
-    def coarsen(self, coarsen_level: int):
+    def coarsen(self, coarsen_level: int, opt_strtg_per_dim: List[Dict]):
         if coarsen_level == 0:
-            self.build_fine_grain_clusters()
+            self.build_fine_grain_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
         elif coarsen_level == 1:
-            self.build_cone_clusters()
+            self.build_cone_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
         else:
             print("Lansong 2do: support more aggressive coarsening")
             # call cone cluster building instead
@@ -899,7 +874,7 @@ class MetaGraph:
                 f.write(self.__str__())
             logger.info(f"MetaIR dump into {filename}")
 
-    def get_input_strategy(self, opt_strategy):
+    def get_input_strategy(self, opt_strategy, device_mesh: Tuple[int, ...]):
 
         partial_strategy = {}
         for op in self.op_list:
@@ -916,7 +891,7 @@ class MetaGraph:
             if var.name in partial_strategy:
                 partial_strategy_list.append(partial_strategy[var.name])
             else:
-                partial_strategy_list.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE)))
+                partial_strategy_list.append(VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(len(device_mesh))]))
 
         return partial_strategy_list
 

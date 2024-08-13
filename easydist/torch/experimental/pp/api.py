@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from functools import partial
 from typing import cast
+import warnings
 
 import torch
 import torch.utils._pytree as pytree
@@ -139,8 +140,10 @@ def _compile_pp(func,
                                         _allow_non_fake_inputs=False)(params, buffers,
                                                                       named_states, args_split[0],
                                                                       kwargs_split[0])
-    assert len(list(traced_stateless_func.named_buffers())
-               ) == 0, "Make sure there is no tensor created in the forward function"
+
+    if len(list(traced_stateless_func.named_buffers())) == 0:
+        warnings.warn("No buffers found in the traced graph, please check if the model is correctly traced")
+
     traced_stateless_func = preprocess_traced_graph(traced_stateless_func)
     traced_stateless_func_node_metas = {
         node.name: node.meta

@@ -1,4 +1,4 @@
-# ENABLE_COMPILE_CACHE=1 torchrun --nproc_per_node 4 examples/torch/simple_model.py
+# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/simple_model.py --mode train
 import argparse
 import copy
 import logging
@@ -170,7 +170,6 @@ def main():
     args = parser.parse_args()
 
     # setting up easydist and torch.distributed
-    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
 
     torch.distributed.init_process_group(backend="nccl")
@@ -178,8 +177,8 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    mesh = torch.arange(world_size).reshape(1, -1)
-    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1"]))
+    mesh = torch.arange(world_size).reshape(2, 2, 2)
+    set_device_mesh(DeviceMesh("cuda", mesh, mesh_dim_names=["spmd0", "spmd1", "spmd2"]))
 
     if args.mode == "train":
         train_example(fake_init=args.fake_init,

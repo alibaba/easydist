@@ -25,8 +25,6 @@ if torch.__version__ >= (2, 3):
 else:
     from torch.distributed._tensor import mesh_resources
 
-from easydist.metashard import metair
-
 logger = logging.getLogger(__name__)
 
 class NDDeviceMesh(DeviceMesh):
@@ -118,11 +116,6 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
     if default_binding:
         for bind_func in __DEFAULT_BINDINGS:
             bind_func(__GLOBAL_ND_DEVICEMESH)
-
-    if "spmd0" in torch_mesh.mesh_dim_names and torch_mesh['spmd0'].size() == 1:
-        metair.DEVICE_MESH_1D = 0
-    elif "spmd1" in torch_mesh.mesh_dim_names and torch_mesh['spmd1'].size() == 1:
-        metair.DEVICE_MESH_1D = 1
 
     logger.info(f"set_device_mesh: {torch_mesh}")
 

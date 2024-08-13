@@ -12,12 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 
+import operator
+from typing import Dict, List, Optional
 import torch
 from torch.fx.node import Node, _get_qualified_name
 from torch.distributed._tensor import distribute_tensor
 import torch.utils._pytree as pytree
 
-from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar
+from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar, VarSPMDStrategy
+from easydist.torch.device_mesh import get_device_mesh
 from easydist.utils import rsetattr, rgetattr
 from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
@@ -47,16 +50,37 @@ def materialize(x, device):
 
 
 def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding_info,
-                     meta_info) -> MetaGraph:
+                     shape_info, opt_strtg_per_dim: List[Dict]) -> MetaGraph:
     meta_graph = MetaGraph(fx_module)
     meta_node_map = {}
     meta_var_map = {}
     MetaNode.clear_id_counter()
     MetaVar.clear_id_counter()
     output_names = []
+
+    def apply_previous_sharding(shape_info, node, opt_strtg_per_dim):
+        shape = list(shape_info[node.name]["shape"])
+        if len(shape) == 0:  # for scalar tensor
+            return torch.Size(shape)
+        node_name = node.name
+        spmd_mesh = get_device_mesh("spmd")
+
+        for device_num, dim_strtg in zip(spmd_mesh.mesh.shape, opt_strtg_per_dim):
+            if node.target is operator.getitem: # getitem is not node in meta graph
+                assert len(dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]) == 1, "var should have single input and single output"
+                spmd_strtg = dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]
+            else:
+                assert len(dim_strtg[node_name]['strategy'].out_strtg_group) == 1, "var should have single input and single output"
+                spmd_strtg = dim_strtg[node_name]['strategy'].out_strtg_group[0]
+            assert len(spmd_strtg) == 1, "per dim strategy should be empty"
+            spmd = spmd_strtg[0]
+            if spmd.is_shard():
+                shape[spmd.args['dim']] = (shape[spmd.args['dim']] + device_num - 1) // device_num  # ceil
+
+        return torch.Size(shape)
+
     # 1. create MetaVar for each output of fx graph node except list or tuple
     #    and create MetaNode for each fx graph node except getitem
-
     for node in fx_module.graph.nodes:
         if node.op == "call_function":
             # 1.1. create MetaVar
@@ -64,8 +88,8 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             compact_out_idx_tbl = []
             compact_out_idx = 0
             # NOTE: list and tuple are followed by getitem
-            if isinstance(meta_info[node.name], list) or isinstance(meta_info[node.name], tuple):
-                for idx, var_meta in enumerate(meta_info[node.name]):
+            if isinstance(shape_info[node.name], list) or isinstance(shape_info[node.name], tuple):
+                for idx, var_meta in enumerate(shape_info[node.name]):
                     if var_meta is not None and var_meta != {}:
                         compact_out_idx_tbl.append(compact_out_idx)
                         compact_out_idx = compact_out_idx + 1
@@ -77,9 +101,14 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
                     outvars = [None] * compact_out_idx
             else:
                 compact_out_idx_tbl = [0]
+                # apply previous sharding over the var
+                # if node.target is operator.getitem:
+                #     shape = apply_previous_sharding(shape_info, node.args[0], opt_strtg_per_dim)
+                # else:
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
                 meta_var = MetaVar(name=node.name,
-                                   shape=meta_info[node.name]["shape"],
-                                   dtype=ABSTRACT_DTYPE[meta_info[node.name]["dtype"]])
+                                   shape=shape,
+                                   dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
 
                 meta_var_map[node.name] = meta_var
                 outvars.append(meta_var)
@@ -94,8 +123,8 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             if op_name in sharding_info:
 
                 def _gen_meta(arg: Node):
-                    return torch.empty(meta_info[arg.name]["shape"],
-                                        dtype=meta_info[arg.name]["dtype"],
+                    return torch.empty(shape_info[arg.name]["shape"],
+                                        dtype=shape_info[arg.name]["dtype"],
                                         device="meta")
 
                 args_meta = pytree.tree_map_only(Node, _gen_meta, node.args)
@@ -124,19 +153,20 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             meta_node_map[node.name] = meta_node
             meta_graph.add_node(meta_node)
         elif node.op in ["placeholder", "get_attr"]:
-            if meta_info[node.name] != {}:
+            if shape_info[node.name] != {}:
                 # 1.1. create MetaVar
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
                 meta_var = MetaVar(name=node.name,
-                                   shape=meta_info[node.name]["shape"],
-                                   dtype=ABSTRACT_DTYPE[meta_info[node.name]["dtype"]])
+                                   shape=shape,
+                                   dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
 
                 meta_var_map[node.name] = meta_var
 
                 # 1.2. create MetaNode
                 node_sharding_info = None
                 if node.op in sharding_info:
-                    arg_meta_tensor = torch.empty(meta_info[node.name]["shape"],
-                                                  dtype=meta_info[node.name]["dtype"],
+                    arg_meta_tensor = torch.empty(shape_info[node.name]["shape"],
+                                                  dtype=shape_info[node.name]["dtype"],
                                                   device="meta")
                     args_meta = str(arg_meta_tensor)
                     if args_meta in sharding_info[node.op]:
@@ -187,7 +217,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
         state_io_map[meta_graph.input_list[i]] = meta_graph.output_list[i]
     meta_graph.state_io_map = state_io_map
 
-    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level)
+    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level, opt_strtg_per_dim=opt_strtg_per_dim)
 
     return meta_graph
 

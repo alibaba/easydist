@@ -24,10 +24,9 @@ def set_device_mesh(device_mesh):
     JAX_DEVICE_MESH = device_mesh
 
     mesh_shape = device_mesh.device_ids.shape
-    if mesh_shape[0] == 1:
-        metair.DEVICE_MESH_1D = 0
-    elif mesh_shape[1] == 1:
-        metair.DEVICE_MESH_1D = 1
+
+    if len(mesh_shape) > 1:
+        raise ValueError("Only support 1D mesh now")
 
 
 def get_device_mesh():
