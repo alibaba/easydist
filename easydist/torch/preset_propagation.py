@@ -318,7 +318,7 @@ def meta_empty_like(args, kwargs):
 
 
 @register_meta_spmd(aten.add_.Tensor)
-def meta_empty_like(args, kwargs):
+def meta_add_(args, kwargs):
     tensor_shape = args[0].shape
 
     world_size = get_device_mesh('spmd').size()
