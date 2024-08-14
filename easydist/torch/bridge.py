@@ -69,9 +69,11 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             if node.target is operator.getitem: # getitem is not node in meta graph
                 assert len(dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]) == 1, "var should have single input and single output"
                 spmd_strtg = dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]
-            else:
+            elif node_name in dim_strtg:  # some ops like torch.ops.aten.scalar_tensor.default have no invars, thus no strategy (see MetaNode.get_strtg_pool)
                 assert len(dim_strtg[node_name]['strategy'].out_strtg_group) == 1, "var should have single input and single output"
                 spmd_strtg = dim_strtg[node_name]['strategy'].out_strtg_group[0]
+            else:
+                continue
             assert len(spmd_strtg) == 1, "per dim strategy should be empty"
             spmd = spmd_strtg[0]
             if spmd.is_shard():

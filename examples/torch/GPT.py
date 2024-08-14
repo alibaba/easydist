@@ -1,4 +1,4 @@
-# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/GPT.py --mode train
+# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/GPT.py
 import argparse
 import copy
 import os

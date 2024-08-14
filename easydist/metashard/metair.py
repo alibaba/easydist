@@ -388,7 +388,7 @@ class MetaNode:
                 continue
             strategy_list_1d.append(NodeSPMDStrategy(in_strtg_group, out_strtg_group))
 
-        if all(op not in self.op_name for op in _heavy_ops) or len(comm_anns) == 0:
+        if all(op not in self.op_name for op in _heavy_ops) or len(strategy_list_1d) == 0:
             strategy_list_1d.append(self._replicate_strategy())
 
         # (FIXME) modify stratgy here, need remove
