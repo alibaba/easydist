@@ -76,11 +76,8 @@ def _wrap(fn, port, rank, nprocs, args, error_file):
     # _prctl_pr_set_pdeathsig(signal.SIGINT)
 
     try:
-        try:
-            import torch.distributed as dist
-            dist.init_process_group(backend="nccl", init_method=f"tcp://localhost:{port}", rank=rank, world_size=nprocs)
-        except:
-            warnings.warn("Need to manually initalize distributed environment")
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl", init_method=f"tcp://localhost:{port}", rank=rank, world_size=nprocs)
         fn(*args)
     except KeyboardInterrupt:
         pass  # SIGINT; Killed by parent, do nothing
@@ -247,7 +244,7 @@ def start_processes(
         pass
 
 
-def spawn(fn, args=(), nprocs=1, join=True, daemon=False, start_method="spawn", port=29600):
+def spawn(fn, args=(), nprocs=1, join=True, daemon=False, port=12345):
     r"""Spawns ``nprocs`` processes that run ``fn`` with ``args``.
 
     If one of the processes exits with a non-zero exit status, the
@@ -280,11 +277,4 @@ def spawn(fn, args=(), nprocs=1, join=True, daemon=False, start_method="spawn", 
         :class:`~ProcessContext` if ``join`` is ``False``
 
     """
-    if start_method != "spawn":
-        msg = (
-            "This method only supports start_method=spawn (got: %s).\n"
-            "To use a different start_method use:\n\t\t"
-            " torch.multiprocessing.start_processes(...)" % start_method
-        )
-        warnings.warn(msg)
     return start_processes(fn, port, args, nprocs, join, daemon, start_method="spawn")

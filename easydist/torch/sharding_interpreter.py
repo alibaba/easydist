@@ -82,7 +82,9 @@ def to_real(tensor, size=None):
         elif torch.is_floating_point(tensor):
             return torch.rand(size, dtype=tensor.dtype, device=device)
         else:
-            return torch.randint(low=torch.iinfo(tensor.dtype).min, high=torch.iinfo(tensor.dtype).max, size=size, dtype=tensor.dtype, device=device)
+            # NOTE: some ops have constraints on the range of integer tensor (e.g. NLL loss)
+            # and it will crash the kernel when sampling integer from a larger range.
+            return torch.randint(high=2, size=size, dtype=tensor.dtype, device=device)
     return tensor
 
 

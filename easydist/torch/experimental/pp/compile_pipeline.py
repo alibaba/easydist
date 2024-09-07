@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, ca
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from torch.distributed._tensor import DTensor
 from torch.fx._symbolic_trace import _Patcher
 
 from easydist.metashard.metair import SPMD, VarSPMDStrategy
@@ -890,7 +891,6 @@ def compile_pipeline(
     strict=True  # report error if not all params and buffers are used
 ) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
     is_backward_called = get_backward_flag()
-    is_step_called = get_step_flag()
 
     input_nodes_flatten = tuple(ph.name for ph in traced_stateless_func.graph.nodes
                                 if ph.op == 'placeholder')
@@ -1249,10 +1249,10 @@ def compile_pipeline(
 
     g.output(g.call_function(gather_outputs))
 
-    def eliminate_dead_node():
+    def eliminate_dead_code():
         raise RuntimeError("This method should be called since the graph doesn't have output node")
 
-    setattr(g, 'eliminate_dead_node', eliminate_dead_node)
+    setattr(g, 'eliminate_dead_code', eliminate_dead_code)
     local_gm = fx.GraphModule({}, g)
 
     return compiled_meta, compiled_stages, local_gm, erased_tensor_keys
@@ -1282,50 +1282,6 @@ def construct_forward(compiled_stages, submod_idx, g, env, name_to_stage_idx):
 
 # TODO @botbw: better way of doing this
 def do_spmd_comm(tensor, src_specs: List[VarSPMDStrategy], tgt_specs: List[VarSPMDStrategy]):
-    if src_specs == tgt_specs:
-        return tensor
-
-    sorted_placements = list(enumerate(zip(src_specs, tgt_specs)))
     device_mesh = get_device_mesh('spmd')
-    result = tensor
-
-    spmd_axis_namelist = get_device_mesh()._binding['spmd']
-    if len(spmd_axis_namelist) != 2:
-        raise NotImplementedError("only support DeviceMesh with 2D SPMD axis (`spmd1` and `spmd2`)")
-
-    for i, (current, target) in sorted_placements:
-        my_coordinate = device_mesh.get_coordinate()
-        num_chunks = device_mesh.size(mesh_dim=i)
-
-        if current == target:
-            continue
-
-        submesh = get_device_mesh(spmd_axis_namelist[i])
-        ranks = submesh.mesh.flatten().tolist()
-
-        if target.is_shard():
-            if current.is_replicate():
-                result = scatter_wrapper(result, num_chunks, target.dim, my_coordinate[i])
-            elif current.is_shard():
-                # all_to_all
-                result = all_to_all_start(result, current.dim, target.dim, num_chunks,
-                                            my_coordinate[i], ranks)
-                result = all_to_all_end(result, current.dim, target.dim, num_chunks,
-                                        my_coordinate[i], ranks)
-            elif current.is_partial():
-                # reduce_scatter
-                reduceOp = reduce_map[current.args["ops"]]
-                # make sure contiguous
-                result = reduce_scatter_start(result, reduceOp, target.dim, ranks)
-                result = reduce_scatter_end(result, reduceOp, target.dim, ranks)
-        elif target.is_replicate():
-            if current.is_shard():
-                # make sure contiguous
-                result = all_gather_start(result, current.dim, ranks)
-                result = all_gather_end(result, current.dim, ranks)
-            elif current.is_partial():
-                # insert all_reduce here
-                reduceOp = reduce_map[current.args["ops"]]
-                result = all_reduce_start(result, reduceOp, ranks)
-                result = all_reduce_end(result, reduceOp, ranks)
-    return result
+    dtensor = DTensor.from_local(tensor, device_mesh, src_specs)
+    return dtensor.redistribute(device_mesh, tgt_specs).to_local()

@@ -55,7 +55,7 @@ criterion = torch.nn.CrossEntropyLoss()
 @easydist_compile(tracing_mode="fake",
                   cuda_graph=False,
                   schedule_cls=ScheduleDAPPLE,
-                  num_chunks=4)
+                  num_chunks=16)
 def train_step(input, label, model, opt):
     opt.zero_grad()
     out = model(input)
@@ -64,6 +64,19 @@ def train_step(input, label, model, opt):
     opt.step()
     return out, loss
 
+def validation(module, valid_dataloader):
+    rank = dist.get_rank()
+    module.eval()
+    correct_cnt = 0
+    all_cnt = 0
+    for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
+        x_batch = x_batch.to(f'cuda:{rank}')
+        y_batch = y_batch.to(f'cuda:{rank}')
+        out = module(x_batch)
+        preds = out.argmax(-1)
+        correct_cnt += (preds == y_batch).sum()
+        all_cnt += len(y_batch)
+    print(f'valid accuracy: {correct_cnt / all_cnt}')
 
 def test_main():
     seed(42)
@@ -75,15 +88,14 @@ def test_main():
     torch.cuda.set_device(rank)
 
     set_device_mesh(
-        DeviceMesh("cuda", [[[0, 2], [1, 3]]],
-                   mesh_dim_names=["spmd0", "spmd1", "pp"]))
-    mesh = get_device_mesh()
+        DeviceMesh("cuda", [[0, 2], [1, 3]],
+                   mesh_dim_names=["spmd", "pp"]))
     device = torch.device('cuda')
 
     module = resnet18().train().to(device)
     module.fc = torch.nn.Linear(512, 10).to(device)
 
-    annotate_split_points(module, {'layer2.0'})
+    annotate_split_points(module, {'layer3.0'})
 
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
@@ -119,6 +131,9 @@ def test_main():
             correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
             loss_sum += loss.mean().item()
 
+        if rank == 0:
+            print(f"loss_mean: {loss_sum.mean().item()} acc: {correct_cnt / all_cnt}")
+
     print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(cur_dir, 'ckpt')
@@ -131,24 +146,16 @@ def test_main():
 
     dist.barrier()
 
-    torch_model = resnet18().train().to(device)
-    torch_model.fc = torch.nn.Linear(512, 10).to(device)
-    torch_model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'resnet.pth')))
+    if rank == world_size - 1:
+        torch_model = resnet18().train().to(device)
+        torch_model.fc = torch.nn.Linear(512, 10).to(device)
+        torch_model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'resnet.pth')))
+        validation(torch_model, valid_dataloader)
 
-    def validation(module, valid_dataloader, epoch):
-        module.eval()
-        correct_cnt = 0
-        all_cnt = 0
-        for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
-            x_batch = x_batch.to(f'cuda:{rank}')
-            y_batch = y_batch.to(f'cuda:{rank}')
-            out = module(x_batch)
-            preds = out.argmax(-1)
-            correct_cnt += (preds == y_batch).sum()
-            all_cnt += len(y_batch)
-        print(f'valid accuracy: {correct_cnt / all_cnt}')
+    dist.barrier()
 
-    validation(torch_model, valid_dataloader)
+    if rank == 0:
+        os.remove(os.path.join(ckpt_dir, 'resnet.pth'))
 
 
 if __name__ == '__main__':

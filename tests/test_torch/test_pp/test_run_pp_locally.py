@@ -27,6 +27,7 @@ from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_poin
                                                              graph_outputs_to_func_outputs)
 from easydist.torch.compile import compile_train_step
 from easydist.torch.experimental.pp.runtime import ScheduleGPipe
+from benchmark.torch.model import GPT
 
 from transformers import OpenAIGPTModel, OpenAIGPTConfig, AutoModel, LlamaModel, LlamaConfig, GPT2Model, GPT2Config, BertConfig, BertModel
 
@@ -130,6 +131,10 @@ def gen_rand_input_foo():
 def gen_rand_input_imagenet():
     return torch.rand(16, 3, 224, 224)
 
+def gen_fix_len_embed(hidden_dim):
+    def inner():
+        return torch.ones(16, 512, hidden_dim, device='cuda')
+    return inner
 
 def factory_gen_rand_input_ids(vocab_size):
 
@@ -201,8 +206,6 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
     for k in buffers_compiled.keys():
         torch.testing.assert_allclose(buffers_torch[k], buffers_compiled[k])
 
-
-@pytest.mark.skip
 @pytest.mark.torch
 @pytest.mark.parametrize("module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func", [
     (Foo, {}, {'norm'}, gen_rand_input_foo, train_step),
@@ -252,7 +255,7 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
 def test_vision(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func):
     inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func)
 
-@pytest.mark.skip
+
 @pytest.mark.torch
 @pytest.mark.parametrize("module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func", [
     (OpenAIGPTModel, (OpenAIGPTConfig(n_layer=4),), {
@@ -260,21 +263,11 @@ def test_vision(module_cls, module_init_args, split_ann_or_policy, rand_input_ge
         'h.1',
         'h.2',
     }, factory_gen_rand_input_ids(40478), train_step_gpt),
-    # (BertModel, (BertConfig(num_hidden_layers=4),), {
-    #     'encoder.layer.0',
-    #     'encoder.layer.1',
-    #     'encoder.layer.2',
-    # }, factory_gen_rand_input_ids(30522), train_step_gpt),
-    # (GPT2Model, (GPT2Config(n_layer=4),), {
-    #     'h.0',
-    #     'h.1',
-    #     'h.2',
-    # }, factory_gen_rand_input_ids(50257), train_step_gpt),
-    # (LlamaModel, (LlamaConfig(num_hidden_layers=4),), {
-    #     'layers.0',
-    #     'layers.1',
-    #     'layers.2',
-    # }, factory_gen_rand_input_ids(50257), train_step_gpt),
+    (GPT, (4, 32, 4), {
+        'blocks.0',
+        'blocks.1',
+        'blocks.2'
+    }, gen_fix_len_embed(32), train_step)
 ])
 def test_split_language(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func):
     inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func)

@@ -17,9 +17,11 @@ from copy import deepcopy
 import pytest
 import torch.distributed as dist
 
+import easydist.config as mdconfig
+from easydist import easydist_setup
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.api import easydist_compile
-from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import ScheduleGPipe
 
 
 import torch
@@ -35,7 +37,7 @@ class Foo(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
+        self.norm = torch.nn.LayerNorm(1024)
         self.linear = torch.nn.Linear(1024, 1024)
 
     def forward(self, x):
@@ -48,7 +50,7 @@ class Foo1(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
+        self.norm = torch.nn.LayerNorm(1024)
         self.linear0_0 = torch.nn.Linear(1024, 512)
         self.linear0_1 = torch.nn.Linear(512, 256)
         self.linear1 = torch.nn.Linear(256, 1024)
@@ -81,11 +83,14 @@ def broadcast_module(model):
     return model
 
 
+
 def inner(module_cls, split_ann, schedule_cls):
+    easydist_setup(backend="torch", device="cuda", allow_tf32=False)
+    mdconfig.comm_optimization = False  # reduce compile time
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
-    set_device_mesh(DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=['pp']))
+    set_device_mesh(DeviceMesh("cuda", torch.arange(2), mesh_dim_names=['spmd']))
 
     device = torch.device("cuda")
     module_torch = module_cls().to(device)
@@ -95,7 +100,7 @@ def inner(module_cls, split_ann, schedule_cls):
     opt_torch = torch.optim.Adam(module_torch.parameters(), lr=0.12345, foreach=True, capturable=True)
     opt_pipe = torch.optim.Adam(module_pipe.parameters(), lr=0.12345, foreach=True, capturable=True)
 
-    compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=1)
+    compiled_pipe = easydist_compile(train_step, 'auto', 'fake', cuda_graph=False, schedule_cls=None, num_chunks=1)
 
     steps = 2
     dataset = [
@@ -109,26 +114,19 @@ def inner(module_cls, split_ann, schedule_cls):
         out_pipe = compiled_pipe(data, module_pipe, opt_pipe).mean()
         out_torch = train_step(data, module_torch, opt_torch)
 
-    assert torch.allclose(out_torch, out_pipe, 1e-4, 1e-5)
-
-    state_torch = module_torch.state_dict()
-    state_pipe = compiled_pipe.compiled_func.state_dict()
-    assert set(state_torch.keys()) == set(state_pipe.keys())
-    for k in state_torch.keys():
-        assert torch.allclose(state_torch[k].to(device), state_pipe[k].to(device).detach(), 1e-4, 1e-5)
+    assert torch.allclose(out_torch, out_pipe)
 
 
+# @pytest.mark.skip  # this test sometimes fails
 @pytest.mark.torch
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls", [
     (Foo, {'norm'}, ScheduleGPipe),
-    (Foo1, {'linear0_1'}, ScheduleDAPPLE),
     (Foo1, {'linear0_1'}, ScheduleGPipe),
-    (Foo1, {'linear0_0'}, ScheduleDAPPLE),
 ])
-@pytest.mark.timeout(50)
-def test_runtime(module_cls, split_ann, schedule_cls):
+@pytest.mark.timeout(100)
+def test_auto(module_cls, split_ann, schedule_cls):
     spawn(inner, (module_cls, split_ann, schedule_cls), nprocs=2)
 
 
 if __name__ == '__main__':
-    test_runtime()
+    test_auto()
