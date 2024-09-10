@@ -29,7 +29,7 @@ def broadcast_module(model):
     return model
 
 GPT_CASE = GPTCase(
-    num_layers=1,
+    num_layers=4,
     hidden_dim=1024,
     num_heads=32,
     seq_size=128

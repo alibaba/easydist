@@ -14,6 +14,7 @@
 
 import operator
 import logging
+from copy import deepcopy
 from typing import Dict, List, Tuple
 
 import torch
@@ -302,35 +303,40 @@ def _replicate_then_shard(tup: Tuple[int, SPMD, SPMD]) -> int:
 
 
 def _gen_transform_infos(
-    src_placements: List[SPMD],
-    dst_placements: List[SPMD],
+    src_placements: VarSPMDStrategy,
+    dst_placements: VarSPMDStrategy,
 ) -> List[Tuple[int, SPMD, SPMD]]:
-    src_dim_counts: Dict[int, int] = {}
-    dst_dim_counts: Dict[int, int] = {}
+    cur_placements = deepcopy(src_placements.var_spmd_strategy)
     transform_infos: List[Tuple[int, SPMD, SPMD]] = []
-    mesh_ndim = len(src_placements)
 
-    for i, (src, dst) in enumerate(zip(src_placements, dst_placements)):
-        # detect mis-aligned sharding and build logical shapes
-        if src.is_shard():
-            src_dim_counts[src.args['dim']] = src_dim_counts.get(src.args['dim'], 0) + 1
+    for i in reversed(range(len(cur_placements))):
+        cur = cur_placements[i]
+        dst = dst_placements[i]
 
         if dst.is_shard():
-            dst_dim_counts[dst.args['dim']] = dst_dim_counts.get(dst.args['dim'], 0) + 1
+            current_mesh_sharding, target_mesh_sharding = [], []
+            for j, (s, p) in enumerate(zip(cur_placements, dst_placements)):
+                if j >= i:
+                    break
+                if s.is_shard() and s.args['dim'] == dst.args['dim']:
+                    current_mesh_sharding.append(j)
+                if p.is_shard() and p.args['dim'] == dst.args['dim']:
+                    target_mesh_sharding.append(j)
 
-        if (
-            src.is_shard()
-            and dst.is_shard()
-            and (mesh_ndim > 1 or src_dim_counts[src.args['dim']] != dst_dim_counts[dst.args['dim']])
-        ):
-            # decompose Shard(i) -> Shard(j) into Shard(i) -> Replicate() -> Shard(j)
-            transform_infos.append((i, src, SPMD(SPMD.REPLICATE)))
-            transform_infos.append((i, SPMD(SPMD.REPLICATE), dst))
-        else:
-            transform_infos.append((i, src, dst))
+            if current_mesh_sharding != target_mesh_sharding:
+                dst = SPMD(SPMD.REPLICATE)
 
-    # sort the pairs by first perform replication then sharding
-    transform_infos.sort(key=_replicate_then_shard)
+            if cur != dst:
+                transform_infos.append((i, cur, dst))
+                cur_placements[i] = dst
+
+    for i, (cur, dst) in enumerate(zip(cur_placements, dst_placements)):
+        if cur != dst:
+            transform_infos.append(
+                (i, cur, dst)
+            )
+            cur_placements[i] = dst
+
     return transform_infos
 
 
