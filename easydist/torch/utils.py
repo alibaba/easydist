@@ -98,36 +98,36 @@ class EDInfo:
         return self.node_type == EDNodeType.COMPUTATION
 
     def get_sharded_meta(self):
-        shared_meta = copy.copy(self.ori_meta)
+        sharded_meta = copy.copy(self.ori_meta)
 
         if self.strategy is None:
-            return shared_meta
+            return sharded_meta
 
         spmd_mesh = get_device_mesh('spmd')
 
-        if isinstance(shared_meta['val'], torch.Tensor):
-            global_out_shape = shared_meta['val'].shape
+        if isinstance(sharded_meta['val'], torch.Tensor):
+            global_out_shape = sharded_meta['val'].shape
             shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(0)]
             local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
-            shared_meta['val'] = torch.ops.aten.new_empty.default(shared_meta['val'],
+            sharded_meta['val'] = torch.ops.aten.new_empty.default(sharded_meta['val'],
                                                                   local_out_shape)
-            if 'tensor_meta' in shared_meta:
-                shared_meta['tensor_meta'] = _extract_tensor_metadata(self.ori_meta['val'])
+            if 'tensor_meta' in sharded_meta:
+                sharded_meta['tensor_meta'] = _extract_tensor_metadata(self.ori_meta['val'])
 
-        if isinstance(shared_meta['val'], tuple) or isinstance(shared_meta['val'], list):
-            shared_meta['val'] = list(shared_meta['val'])
-            for idx in range(len(shared_meta['val'])):
-                if shared_meta['val'][idx] is None:
+        if isinstance(sharded_meta['val'], tuple) or isinstance(sharded_meta['val'], list):
+            sharded_meta['val'] = list(sharded_meta['val'])
+            for idx in range(len(sharded_meta['val'])):
+                if sharded_meta['val'][idx] is None:
                     continue
-                global_out_shape = shared_meta['val'][idx].shape
+                global_out_shape = sharded_meta['val'][idx].shape
                 shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(idx)]
                 local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh,
                                                       shard_out)
-                shared_meta['val'][idx] = torch.ops.aten.new_empty.default(
-                    shared_meta['val'][idx], local_out_shape)
-            shared_meta['val'] = tuple(shared_meta['val'])
+                sharded_meta['val'][idx] = torch.ops.aten.new_empty.default(
+                    sharded_meta['val'][idx], local_out_shape)
+            sharded_meta['val'] = tuple(sharded_meta['val'])
 
-        return shared_meta
+        return sharded_meta
 
 
 @contextmanager

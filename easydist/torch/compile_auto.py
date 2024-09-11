@@ -165,14 +165,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             return global_strtg
 
         opt_strategy = reduce(reduce_fn, opt_strtg_per_dim)
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print(opt_strategy)
-
         sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
-
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print(sharding_strategy)
-
         args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
@@ -183,6 +176,10 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
+
+    if mdconfig.log_level <= logging.DEBUG:
+        rich.print("opt_strategy", opt_strategy)
+        rich.print("sharding_strategy", sharding_strategy)
 
     return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
 

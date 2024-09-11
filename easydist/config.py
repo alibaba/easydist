@@ -107,3 +107,7 @@ enable_runtime_trace = os.environ.get("ENABLE_RUNTIME_TRACE", "False").upper() i
 
 # whether to allow solver find 1d solution when using nd device mesh
 allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper() in ["1", "TRUE"]
+
+# whether to allow p2p comm during dtensor placement transform
+# NOTE: this is still under experiment and might introduce extra memory consumption
+experimental_p2p_sharding_transform = os.environ.get("EXPERIMENTAL_P2P_SHARDING_TRANSFORM", "False").upper() in ["1", "TRUE"]
