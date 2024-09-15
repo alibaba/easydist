@@ -52,8 +52,7 @@ def train_step(input, label, model, opt):
 def validation(module, valid_dataloader):
     rank = dist.get_rank()
     module.eval()
-    correct_cnt = 0
-    all_cnt = 0
+    correct_cnt, all_cnt = 0, 0
     for x_batch, y_batch in tqdm(valid_dataloader, dynamic_ncols=True):
         x_batch = x_batch.to(f'cuda:{rank}')
         y_batch = y_batch.to(f'cuda:{rank}')
@@ -85,7 +84,7 @@ def test_main():
     opt = torch.optim.Adam(module.parameters(), foreach=True, capturable=True)
     # opt = torch.optim.SGD(module.parameters(), lr=0.001, foreach=True)
 
-    batch_size = 64
+    batch_size = 128
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
@@ -102,42 +101,42 @@ def test_main():
                                                    batch_size=batch_size)
 
     epochs = 5
-    for epoch in range(epochs):
+    for _ in range(epochs):
         all_cnt, correct_cnt, loss_sum = 0, 0, 0
         for x_batch, y_batch in (tqdm(train_dataloader, dynamic_ncols=True) if rank == 0
                                     else train_dataloader):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
             if x_batch.size(0) != batch_size:  # TODO need to solve this
                 continue
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
             out, loss = train_step(x_batch, y_batch, module, opt)
             all_cnt += len(out)
             preds = out.argmax(-1)
-            correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
+            correct_cnt += (preds.to(device) == y_batch.to(device)).sum()
             loss_sum += loss.mean().item()
 
         if rank == 0:
-            print(f"loss_mean: {loss_sum.mean().item()} acc: {correct_cnt / all_cnt}")
+            print(f"loss_sum: {loss_sum} train acc: {correct_cnt / all_cnt}")
+
+        # run validation with torch model
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        ckpt_dir = os.path.join(cur_dir, 'ckpt')
+        if not os.path.exists(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        state_dict = train_step.compiled_func.state_dict(True)
+
+        if rank == 0:
+            torch.save(state_dict, os.path.join(ckpt_dir, 'resnet.pth'))
+
+        dist.barrier()
+        if rank == world_size - 1:
+            torch_model = resnet18().train().to(device)
+            torch_model.fc = torch.nn.Linear(512, 10).to(device)
+            torch_model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'resnet.pth')))
+            validation(torch_model, valid_dataloader)
+        dist.barrier()
 
     print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    ckpt_dir = os.path.join(cur_dir, 'ckpt')
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    state_dict = train_step.compiled_func.state_dict(True)
-
-    if rank == 0:
-        torch.save(state_dict, os.path.join(ckpt_dir, 'resnet.pth'))
-
-    dist.barrier()
-
-    if rank == world_size - 1:
-        torch_model = resnet18().train().to(device)
-        torch_model.fc = torch.nn.Linear(512, 10).to(device)
-        torch_model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'resnet.pth')))
-        validation(torch_model, valid_dataloader)
-
-    dist.barrier()
 
     if rank == 0:
         os.remove(os.path.join(ckpt_dir, 'resnet.pth'))

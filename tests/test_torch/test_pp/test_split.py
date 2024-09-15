@@ -184,13 +184,13 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
                                                                                  outputs,
                                                                                  strict=False)
 
-    torch.testing.assert_allclose(returns_torch, return_compiled)
+    assert torch.allclose(returns_torch, return_compiled)
 
     for k in params_compiled.keys():
-        torch.testing.assert_allclose(params_torch[k], params_compiled[k])
+        assert torch.allclose(params_torch[k], params_compiled[k])
 
     for k in buffers_compiled.keys():
-        torch.testing.assert_allclose(buffers_torch[k], buffers_compiled[k])
+        assert torch.allclose(buffers_torch[k], buffers_compiled[k])
 
 @pytest.mark.torch
 @pytest.mark.parametrize("module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func", [

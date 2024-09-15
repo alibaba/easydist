@@ -123,5 +123,3 @@ def fix_node_order(fx_module: fx.GraphModule):  # TODO @botbw: reorder the whole
     _link_nodes(fx_module, nodes)
     fx_module.recompile()
     return fx_module
-
-
