@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
+from easydist.torch.utils import seed
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
@@ -47,21 +48,6 @@ class Foo(torch.nn.Module):
         x = self.layer3(x + res)
         return x
 
-
-def seed(seed=42):
-    # Set seed for PyTorch
-    torch.manual_seed(seed)
-    # torch.use_deterministic_algorithms(True)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # Set seed for numpy
-    np.random.seed(seed)
-    # Set seed for built-in Python
-    random.seed(seed)
-    # Set(seed) for each of the random number generators in python:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 def main(schedule_cls):
     rank = dist.get_rank()
@@ -114,10 +100,6 @@ def main(schedule_cls):
 
 @pytest.mark.torch
 @pytest.mark.parametrize("schedule_cls", [ScheduleGPipe, ScheduleDAPPLE])
-@pytest.mark.timeout(150)
+@pytest.mark.timeout(50)
 def test_reslink(schedule_cls):
     spawn(main, (schedule_cls,), nprocs=4)
-
-if __name__ == '__main__':
-    test_reslink()
-

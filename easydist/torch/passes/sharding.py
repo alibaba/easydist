@@ -590,7 +590,7 @@ def do_p2p_comm_wrapper(global_shape: torch.Size, src_placements: VarSPMDStrateg
     return inner
 
 
-def _gen_transform_infos(
+def _gen_transform_infos_greedy(
     src_placements: VarSPMDStrategy,
     dst_placements: VarSPMDStrategy,
 ) -> List[Tuple[int, SPMD, SPMD]]:
@@ -627,6 +627,57 @@ def _gen_transform_infos(
 
     return transform_infos
 
+def _replicate_then_shard(tup: Tuple[int, SPMD, SPMD]) -> int:
+    """
+    This is a helper function to allow reordering _TransformInfo list. The high level
+    idea is that we want to reorder the sharding redistributions so that the DTensor
+    redistribution is consistent with its full tensor. This is built on top of two simple
+    assumptions:
+    1. Replication happens from inner to outer dimension. i.e. Shard -> Replicate
+    2. Sharding happens from outer to inner dimension, i.e. Replicate -> Shard
+
+    So we always put the replication first and put sharding later.
+    """
+    mesh_dim, src, dst = tup
+    if (dst.is_replicate() or dst.is_partial()) and src.is_shard():
+        return -mesh_dim
+    elif (src.is_replicate() or src.is_partial()) and dst.is_shard():
+        return mesh_dim
+    else:
+        return 0
+
+
+def _gen_transform_infos(
+    src_placements: List[SPMD],
+    dst_placements: List[SPMD],
+) -> List[Tuple[int, SPMD, SPMD]]:
+    src_dim_counts: Dict[int, int] = {}
+    dst_dim_counts: Dict[int, int] = {}
+    transform_infos: List[Tuple[int, SPMD, SPMD]] = []
+    mesh_ndim = len(src_placements)
+
+    for i, (src, dst) in enumerate(zip(src_placements, dst_placements)):
+        # detect mis-aligned sharding and build logical shapes
+        if src.is_shard():
+            src_dim_counts[src.args['dim']] = src_dim_counts.get(src.args['dim'], 0) + 1
+
+        if dst.is_shard():
+            dst_dim_counts[dst.args['dim']] = dst_dim_counts.get(dst.args['dim'], 0) + 1
+
+        if (
+            src.is_shard()
+            and dst.is_shard()
+            and (mesh_ndim > 1 or src_dim_counts[src.args['dim']] != dst_dim_counts[dst.args['dim']])
+        ):
+            # decompose Shard(i) -> Shard(j) into Shard(i) -> Replicate() -> Shard(j)
+            transform_infos.append((i, src, SPMD(SPMD.REPLICATE)))
+            transform_infos.append((i, SPMD(SPMD.REPLICATE), dst))
+        else:
+            transform_infos.append((i, src, dst))
+
+    # sort the pairs by first perform replication then sharding
+    transform_infos.sort(key=_replicate_then_shard)
+    return transform_infos
 
 def insert_comm_node(fx_module: torch.fx.GraphModule,
                      node,
@@ -641,10 +692,13 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
     my_coordinate = spmd_mesh.get_coordinate()
     global_shape = var_.meta['val'].shape
 
-    if mdconfig.experimental_p2p_sharding_transform:
-        transform_infos, src_specs = _gen_immediate_transform_infos(src_specs, tgt_specs)
-    else:
+    if mdconfig.experimental_p2p_sharding_transform == 0:
         transform_infos = _gen_transform_infos(src_specs, tgt_specs)
+    elif mdconfig.experimental_p2p_sharding_transform == 1:
+        transform_infos = _gen_transform_infos_greedy(src_specs, tgt_specs)
+    else:
+        assert mdconfig.experimental_p2p_sharding_transform == 2
+        transform_infos, src_specs = _gen_immediate_transform_infos(src_specs, tgt_specs)
 
     for i, current, target in transform_infos:
         num_chunks = spmd_mesh.size(mesh_dim=i)
@@ -716,7 +770,7 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                     node.replace_input_with(var_, all_reduce_end_node)
                     var_ = all_reduce_end_node
 
-    if mdconfig.experimental_p2p_sharding_transform and src_specs != tgt_specs:
+    if mdconfig.experimental_p2p_sharding_transform == 2 and src_specs != tgt_specs:
         with fx_module.graph.inserting_before(node):
             p2p_node = fx_module.graph.call_function(
                 do_p2p_comm_wrapper(global_shape, src_specs, tgt_specs, rank),

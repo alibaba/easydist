@@ -76,7 +76,7 @@ def train_example():
     assert torch.allclose(torch_step_1_result,
                             md_step_1_result), f"GPT model training test failed. {torch_step_1_result} {md_step_1_result}"
     assert torch.allclose(torch_step_2_result,
-                            md_step_2_result), f"GPT model training test failed."
+                            md_step_2_result), f"GPT model training test failed. {torch_step_1_result} {md_step_1_result}"
 
     print("GPT model training example pass.")
 

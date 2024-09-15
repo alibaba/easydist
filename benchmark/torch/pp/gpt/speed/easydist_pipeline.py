@@ -32,27 +32,12 @@ from benchmark.bench_case import GPTCase
 from benchmark.torch.model.gpt import GPT, SequentialLowCommGPT
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
+from easydist.torch.utils import seed
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
                                                              split_into_equal_size)
 from torch.profiler import profile, ProfilerActivity
-
-
-def seed(seed=42):
-    # Set seed for PyTorch
-    torch.manual_seed(seed)
-    # torch.use_deterministic_algorithms(True)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # Set seed for numpy
-    np.random.seed(seed)
-    # Set seed for built-in Python
-    random.seed(seed)
-    # Set(seed) for each of the random number generators in python:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 criterion = torch.nn.CrossEntropyLoss()

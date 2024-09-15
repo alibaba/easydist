@@ -159,7 +159,8 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
-    
+
+
 class LowCommGPTLayer(GPTLayer):
     def __init__(self,
                  dim: int,

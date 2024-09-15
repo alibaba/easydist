@@ -15,6 +15,8 @@
 import hashlib
 from contextlib import contextmanager
 import copy
+import numpy as np
+import random
 from typing import Any, Dict
 from enum import Enum
 from dataclasses import dataclass
@@ -235,3 +237,17 @@ def extract_tensor_meta_info(tensor: torch.Tensor):
 
     return meta_info
 
+def seed(seed=42):
+    # Set seed for PyTorch
+    torch.manual_seed(seed)
+    # torch.use_deterministic_algorithms(True)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    # Set seed for numpy
+    np.random.seed(seed)
+    # Set seed for built-in Python
+    random.seed(seed)
+    # Set(seed) for each of the random number generators in python:
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False

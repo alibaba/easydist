@@ -110,4 +110,5 @@ allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper()
 
 # whether to allow p2p comm during dtensor placement transform
 # NOTE: this is still under experiment and might introduce extra memory consumption
-experimental_p2p_sharding_transform = os.environ.get("EXPERIMENTAL_P2P_SHARDING_TRANSFORM", "False").upper() in ["1", "TRUE"]
+experimental_p2p_sharding_transform = int(os.environ.get("EXPERIMENTAL_P2P_SHARDING_TRANSFORM", "0"))
+assert experimental_p2p_sharding_transform in [0, 1, 2]

@@ -25,26 +25,12 @@ from torchvision.models import (alexnet, densenet121, efficientnet_b0, resnet18,
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
                                                              compile_pipeline,
                                                              graph_outputs_to_func_outputs)
+from easydist.torch.utils import seed
 from easydist.torch.compile import compile_train_step
 from easydist.torch.experimental.pp.runtime import ScheduleGPipe
 from benchmark.torch.model import GPT
 
 from transformers import OpenAIGPTModel, OpenAIGPTConfig, AutoModel, LlamaModel, LlamaConfig, GPT2Model, GPT2Config, BertConfig, BertModel
-
-
-def seed(seed=42):
-    # Set seed for PyTorch
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # Set seed for numpy
-    np.random.seed(seed)
-    # Set seed for built-in Python
-    random.seed(seed)
-    # Set(seed) for each of the random number generators in python:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 class Foo(torch.nn.Module):
@@ -223,7 +209,7 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
         'features.denseblock4.denselayer1.relu1',
         'features',
     }, gen_rand_input_imagenet, train_step),
-    # (efficientnet_b0, {}, {  # NOTE: somehow failed
+    # (efficientnet_b0, {}, {  # TODO: @botbw: failed after updating pytorch
     #     'features.2.0.block.1',
     #     'features.4.1.block.3',
     #     'features.6.1.block.3',
@@ -271,7 +257,3 @@ def test_vision(module_cls, module_init_args, split_ann_or_policy, rand_input_ge
 ])
 def test_split_language(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func):
     inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_method, train_step_func)
-
-if __name__ == '__main__':
-    test_vision()
-    test_split_language()

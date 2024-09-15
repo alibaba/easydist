@@ -388,7 +388,7 @@ class CompiledStage:
             if (output_name in self.fw_func_returns) \
                 or (self.has_bw() and output_name in self.activation_nodes) \
                     or (output_name in self.compiled_meta.returns_nodes_flatten) \
-                        or (output_name in self.compiled_meta.output2input_buffers): # TODO @botbw: simplify this
+                        or (output_name in self.compiled_meta.output2input_buffers):
                 if output_name in self.fw_func_returns:  # output in next stages
                     ret[output_name] = output
                 if self.has_bw() and output_name in self.activation_nodes:  # output in activations
@@ -590,6 +590,9 @@ class CompiledStage:
             }
 
     def optimizer_state_dict(self) -> Dict[str, Any]:
+        if not self.has_step():
+            return {}
+
         optim_state = defaultdict(dict)
         if self.compiled_meta.optimstates_strategies:
             for name, state in self.step_gm.injected_states[StateType.OPTIMSTATES].items():
@@ -782,7 +785,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: Set[str]
                         kwargs[kwarg_name] = kwarg
 
                 assert len(set(list_args_kwargs_mask)
-                           ) == 1, "input list of foreach operators should have the same mask"
+                           ) == 1, f"Input list of foreach operators should have the same mask, but found {list_args_kwargs_mask} {node} {node.args} {node.kwargs}"
 
                 env[node.name] = new_graph.create_node(op='call_function',
                                                        name=node.name,
@@ -833,7 +836,7 @@ def _extract_step_subgraph_from_args(ed_gm: EDGraphModule, inputs_spec: Set[str]
                 if len(args) != len(node.args) or len(kwargs) != len(node.kwargs):
                     assert (not any(isinstance(arg, torch.fx.Node) for arg in args)) and (
                         not any(isinstance(kwarg, torch.fx.Node) for kwarg in kwargs.values())
-                    ), "This node shall be completed removed since it has no tensor args and kwargs"
+                    ), f"This node shall be completed removed since it has no tensor args and kwargs {node} {args} {kwargs}"
                 else:
                     env[node.name] = new_graph.create_node(op='call_function',
                                                            name=node.name,
@@ -965,16 +968,19 @@ def compile_pipeline(
     assert part_cnt <= 2, f"part_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {part_cnt}"
     input_grads_unflatten = {}
     input_grads_to_output_grads = {}
-    if hasattr(splited_global, 'submod_1'):
+
+    if hasattr(splited_global, 'submod_1'):  # if step graph is present
         phs = [node for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         num_params = len(params_nodes_unflatten)
-        input_grads_unflatten = pytree.tree_unflatten(
-            [ph.name for ph in phs[num_params:num_params * 2]], output_grads_spec)
+        input_grads_unflatten = pytree.tree_unflatten([ph.name for ph in phs[num_params:num_params * 2]], output_grads_spec)
         input_grads_to_output_grads = {
             input_grad: output_grad
             for input_grad, output_grad in zip([ph.name for ph in phs[num_params:num_params *
                                                                       2]], output_grads_flatten)
         }
+    else:
+        input_grads_unflatten = output_grads_unflatten
+        input_grads_to_output_grads = {output_grad: output_grad for output_grad in output_grads_flatten}
 
     save_graphviz_dot(splited_global, "splited_global")
     states_used_by = defaultdict(list)
@@ -1154,7 +1160,7 @@ def compile_pipeline(
                     compiled_stages.append(compiled_stage)
                 assert len(
                     step_gm_global.injected_states[StateType.OPTIMSTATES]
-                ) == 0, "All states of step_gm_global should have been injected to step_gm"
+                ) == 0, f"All states of step_gm_global should have been injected to step_gm, but found {step_gm_global.injected_states[StateType.OPTIMSTATES]}"
                 current_stateful_fw_bw = None
             is_fwbw = not is_fwbw
 

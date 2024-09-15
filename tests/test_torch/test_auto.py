@@ -21,7 +21,7 @@ import easydist.config as mdconfig
 from easydist import easydist_setup
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.api import easydist_compile
-from easydist.torch.experimental.pp.runtime import ScheduleGPipe
+from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 
 
 import torch
@@ -32,6 +32,7 @@ from torch.distributed._tensor import DeviceMesh
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points)
 from easydist.utils.testing import spawn
 
+from tests.test_torch.test_utils import train_step, train_step_chunked, broadcast_module
 
 class Foo(torch.nn.Module):
 
@@ -51,56 +52,42 @@ class Foo1(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.norm = torch.nn.LayerNorm(1024)
-        self.linear0_0 = torch.nn.Linear(1024, 512)
-        self.linear0_1 = torch.nn.Linear(512, 256)
-        self.linear1 = torch.nn.Linear(256, 1024)
+        self.linear0 = torch.nn.Linear(1024, 512)
+        self.linear1 = torch.nn.Linear(512, 256)
+        self.linear2 = torch.nn.Linear(256, 128)
+        self.linear3 = torch.nn.Linear(128, 1024)
 
     def forward(self, x):
         x = self.norm(x)
-        x0 = self.linear0_0(x)
-        x0 = self.linear0_1(x0)
-        x1 = self.linear1(x0)
-        y = x + x1
-        return y.relu()
+        x = self.linear0(x)
+        x = self.linear1(x)
+        x = self.linear2(x)
+        x = self.linear3(x)
+        return x.relu()
 
 
-def train_step(input, model, opt):
-    out = model(input)
-    loss = out.mean()
-    loss.backward()
-    opt.step()
-    opt.zero_grad()
-    return loss
-
-
-def broadcast_module(model):
-    _sync_module_states(model,
-                        _get_default_group(),
-                        broadcast_bucket_size=int(250 * 1024 * 1024),
-                        src=0,
-                        params_and_buffers_to_ignore=set())
-
-    return model
-
-
-
-def inner(module_cls, split_ann, schedule_cls):
+def inner(module_cls, split_ann, schedule_cls, pp_size):
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
     mdconfig.comm_optimization = False  # reduce compile time
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
-    set_device_mesh(DeviceMesh("cuda", torch.arange(2), mesh_dim_names=['spmd']))
+    set_device_mesh(DeviceMesh("cuda", torch.arange(4).reshape(pp_size, -1), mesh_dim_names=['pp', 'spmd']))
 
     device = torch.device("cuda")
     module_torch = module_cls().to(device)
     module_torch = broadcast_module(module_torch)
     module_pipe = deepcopy(module_torch)
-    annotate_split_points(module_pipe, split_ann)
+    if split_ann is not None and schedule_cls is not None:
+        annotate_split_points(module_pipe, split_ann)
     opt_torch = torch.optim.Adam(module_torch.parameters(), lr=0.12345, foreach=True, capturable=True)
     opt_pipe = torch.optim.Adam(module_pipe.parameters(), lr=0.12345, foreach=True, capturable=True)
 
-    compiled_pipe = easydist_compile(train_step, 'auto', 'fake', cuda_graph=False, schedule_cls=None, num_chunks=1)
+    num_chunks = world_size * 8
+    if pp_size == world_size:  # TODO @botbw: auto should behave like pp when pp_size == world_size
+        compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks)
+    else:
+        compiled_pipe = easydist_compile(train_step, 'auto', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks)
 
     steps = 2
     dataset = [
@@ -112,20 +99,24 @@ def inner(module_cls, split_ann, schedule_cls):
 
     for data in dataset:
         out_pipe = compiled_pipe(data, module_pipe, opt_pipe).mean()
-        out_torch = train_step(data, module_torch, opt_torch)
+        if split_ann is not None and schedule_cls is not None:
+            out_torch = train_step_chunked(data, module_torch, opt_torch, num_chunks).mean()
+        else:
+            out_torch = train_step(data, module_torch, opt_torch).mean()
 
-    assert torch.allclose(out_torch, out_pipe)
+        assert torch.allclose(out_torch.to(device), out_pipe.to(device))
 
 
-# @pytest.mark.skip  # this test sometimes fails
 @pytest.mark.torch
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls", [
-    (Foo, {'norm'}, ScheduleGPipe),
-    (Foo1, {'linear0_1'}, ScheduleGPipe),
+@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, pp_size", [
+    (Foo, None, None, 1),
+    (Foo, {'norm'}, ScheduleDAPPLE, 2),
+    (Foo1, {'linear1'}, ScheduleDAPPLE, 2),
+    (Foo1, {'norm', 'linear0', 'linear1'}, ScheduleDAPPLE, 4),
 ])
 @pytest.mark.timeout(100)
-def test_auto(module_cls, split_ann, schedule_cls):
-    spawn(inner, (module_cls, split_ann, schedule_cls), nprocs=2)
+def test_auto(module_cls, split_ann, schedule_cls, pp_size):
+    spawn(inner, (module_cls, split_ann, schedule_cls, pp_size), nprocs=4)
 
 
 if __name__ == '__main__':

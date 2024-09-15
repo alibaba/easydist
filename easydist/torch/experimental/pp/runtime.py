@@ -27,7 +27,7 @@ from torch.profiler import record_function
 from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
 
-from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage,
+from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage, StateType,
                                                              graph_outputs_to_func_outputs)
 from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer,
                                                        TensorChunkSpec, merge_chunks,
@@ -343,7 +343,7 @@ class PipelineStage(RuntimeMixin):
         for rank, ph_list in recv_info.items():
             for ph in ph_list:
                 if isinstance(ph, RecevPlaceholder):
-                    composite_kwargs[ph.input_name] = ph.buffer
+                    composite_kwargs[ph.input_name] = ph.buffer.clone()  # NOTE: need clone here so that all micro-batches use different memory
                 else:
                     composite_kwargs[ph.input_name] = chunk_kwargs[ph.input_name]
 
@@ -407,7 +407,7 @@ class PipelineStage(RuntimeMixin):
                 if k in grads_nodes:
                     to_pop.append(k)
                     if k in self.grads:
-                        self.grads[k] += v
+                        self.grads[k].add_(v)
                     else:
                         self.grads[k] = v
             for k in to_pop:
@@ -425,6 +425,9 @@ class PipelineStage(RuntimeMixin):
 
     def step(self):
         self.compiled_stage.step(self.outputs_batch)
+
+        for p in self.compiled_stage.fw_gm.injected_states[StateType.PARAMS].values():
+            p.grad = None
 
     def clear_runtime_states(self):
         self.cur_fw_send_chunk = None
@@ -483,10 +486,14 @@ class PipelineStage(RuntimeMixin):
             rets.append(rets_chunk)
 
         rets = merge_chunks(rets, self.returns_nodes_chunk_spec)
+
         if self.accumulate_grads_inplace:
             grads = self.grads
         else:
             grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
+
+        for param, grad in zip(params.values(), grads.values()):
+            param.grad = grad
 
         self.outputs_batch.update({**params, **buffers, **optimstates, **grads, **rets})
 
@@ -544,7 +551,6 @@ class PipelineStage(RuntimeMixin):
                 if v is not None:
                     all_returns[k] = v
         ret = graph_outputs_to_func_outputs(self.compiled_meta, all_returns, strict=False)[-1]
-        ret = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), ret)
         return ret
 
     def __call__(self, *args, **kwargs) -> None:
@@ -586,7 +592,6 @@ def print_tensor_dict(chunk, di):
         print(f'{k} size {v.size()} mean {v.float().mean()}')
 
 
-# TODO @botbw: refactor to mixin
 class Schedule(RuntimeMixin):
 
     def __init__(self, pipeline_stage: PipelineStage):

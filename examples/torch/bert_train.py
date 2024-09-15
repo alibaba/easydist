@@ -27,6 +27,7 @@ from torch.distributed._tensor import DeviceMesh
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
+from easydist.torch.utils import seed
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
@@ -36,22 +37,6 @@ from easydist.torch.experimental.pp.compile_pipeline import (
 from torchtext.datasets import IMDB, AG_NEWS
 
 from transformers import BertForSequenceClassification, BertTokenizer
-
-
-def seed(seed=42):
-    # Set seed for PyTorch
-    torch.manual_seed(seed)
-    # torch.use_deterministic_algorithms(True)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # Set seed for numpy
-    np.random.seed(seed)
-    # Set seed for built-in Python
-    random.seed(seed)
-    # Set(seed) for each of the random number generators in python:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def train_bert():

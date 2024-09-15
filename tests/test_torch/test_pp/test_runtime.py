@@ -17,71 +17,23 @@ from copy import deepcopy
 import pytest
 import torch.distributed as dist
 
+
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.api import easydist_compile
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 
 
 import torch
-from torch.distributed.distributed_c10d import _get_default_group
-from torch.distributed.utils import _sync_module_states
 from torch.distributed._tensor import DeviceMesh
 
 from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points)
+from easydist.torch.utils import seed
 from easydist.utils.testing import spawn
 
+from tests.test_torch.test_utils import train_step, train_step_chunked, broadcast_module, Foo
 
-class Foo(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x = self.linear(x)
-        return x.relu()
-
-
-class Foo1(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear0_0 = torch.nn.Linear(1024, 512)
-        self.linear0_1 = torch.nn.Linear(512, 256)
-        self.linear1 = torch.nn.Linear(256, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x0 = self.linear0_0(x)
-        x0 = self.linear0_1(x0)
-        x1 = self.linear1(x0)
-        y = x + x1
-        return y.relu()
-
-
-def train_step(input, model, opt):
-    out = model(input)
-    loss = out.mean()
-    loss.backward()
-    opt.step()
-    opt.zero_grad()
-    return loss
-
-
-def broadcast_module(model):
-    _sync_module_states(model,
-                        _get_default_group(),
-                        broadcast_bucket_size=int(250 * 1024 * 1024),
-                        src=0,
-                        params_and_buffers_to_ignore=set())
-
-    return model
-
-
-def inner(module_cls, split_ann, schedule_cls):
+def inner(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
+    seed()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
@@ -92,43 +44,58 @@ def inner(module_cls, split_ann, schedule_cls):
     module_torch = broadcast_module(module_torch)
     module_pipe = deepcopy(module_torch)
     annotate_split_points(module_pipe, split_ann)
-    opt_torch = torch.optim.Adam(module_torch.parameters(), lr=0.12345, foreach=True, capturable=True)
-    opt_pipe = torch.optim.Adam(module_pipe.parameters(), lr=0.12345, foreach=True, capturable=True)
+    if optim == 'adam':
+        opt_torch = torch.optim.Adam(module_torch.parameters(), lr=1e-5, foreach=True, capturable=True)
+        opt_pipe = torch.optim.Adam(module_pipe.parameters(), lr=1e-5, foreach=True, capturable=True)
+    elif optim =='sgd':
+        opt_torch = torch.optim.SGD(module_torch.parameters(), lr=1e-5, foreach=True, momentum=0.9)
+        opt_pipe = torch.optim.SGD(module_pipe.parameters(), lr=1e-5, foreach=True, momentum=0.9)
+    else:
+        raise RuntimeError("Unknown optimizer")
 
-    compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=1)
+    num_chunks = world_size * 8
+    compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks, strict=False)
 
     steps = 2
     dataset = [
-        torch.randn(1024, 1024, device=device)
+        torch.randn(32, 512, 128, device=device)
         for _ in range(steps)
     ]
+
     for data in dataset:
         dist.broadcast(data, src=0)
 
-    for data in dataset:
-        out_pipe = compiled_pipe(data, module_pipe, opt_pipe).mean()
-        out_torch = train_step(data, module_torch, opt_torch)
+    for _, data in enumerate(dataset):
+        out_torch = train_step_chunked(data, module_torch, opt_torch, num_chunks).mean()
 
-    assert torch.allclose(out_torch, out_pipe, 1e-4, 1e-5)
+        if use_native_optimizer:
+            out_pipe = compiled_pipe(data, module_pipe, None).mean()
+            opt_pipe.step()
+            opt_pipe.zero_grad()
+        else:
+            out_pipe = compiled_pipe(data, module_pipe, opt_pipe).mean()
+
+        assert torch.allclose(out_torch.to(device), out_pipe.to(device), rtol=1e-5, atol=1e-8)
 
     state_torch = module_torch.state_dict()
     state_pipe = compiled_pipe.compiled_func.state_dict()
     assert set(state_torch.keys()) == set(state_pipe.keys())
     for k in state_torch.keys():
-        assert torch.allclose(state_torch[k].to(device), state_pipe[k].to(device).detach(), 1e-4, 1e-5)
+        assert torch.allclose(state_pipe[k].to(device), state_torch[k].to(device), rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.torch
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls", [
-    (Foo, {'norm'}, ScheduleGPipe),
-    (Foo1, {'linear0_1'}, ScheduleDAPPLE),
-    (Foo1, {'linear0_1'}, ScheduleGPipe),
-    (Foo1, {'linear0_0'}, ScheduleDAPPLE),
+@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, use_native_optimizer", [
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'adam', True),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'adam', False),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'sgd', True),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'sgd', False),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'adam', True),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'adam', False),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'sgd', True),
+    (Foo, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'sgd', False),
+
 ])
 @pytest.mark.timeout(50)
-def test_runtime(module_cls, split_ann, schedule_cls):
-    spawn(inner, (module_cls, split_ann, schedule_cls), nprocs=2)
-
-
-if __name__ == '__main__':
-    test_runtime()
+def test_runtime(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
+    spawn(inner, (module_cls, split_ann, schedule_cls, optim, use_native_optimizer), nprocs=4, port=12344)

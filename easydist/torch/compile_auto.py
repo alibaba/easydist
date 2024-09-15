@@ -465,9 +465,10 @@ def _compile_auto(func,
                   return_to_all_stages=True,
                   accumulate_grads_inplace=True,
                   strict=True) -> Union[PipelineStage, Any]:
-    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
-                                                             args_chunk_spec, kwargs_chunk_spec)
-    args, kwargs = args_split[0], kwargs_split[0]
+    if schedule_cls is not None:
+        args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                                args_chunk_spec, kwargs_chunk_spec)
+        args, kwargs = args_split[0], kwargs_split[0]
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
