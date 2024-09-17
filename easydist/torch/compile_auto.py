@@ -54,7 +54,7 @@ from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
-from easydist.torch.compile import compile_train_step, stateless_func
+from easydist.torch.compile import ed_compile_func, stateless_func
 from easydist.torch.utils import (_enable_compile, _sharding_ann_env, extract_tensor_meta_info)
 from easydist.utils.testing.mock import TorchMockDeviceMesh
 from easydist.torch.mem_allocation_info import OutVar
@@ -479,10 +479,8 @@ def _compile_auto(func,
             assert opt is None, "Only support single Optimizer in args now"
             opt = arg
 
-    params, buffers, named_states, state_tensor_num, traced_graph = compile_train_step(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt)
+    params, buffers, named_states, state_tensor_num, traced_graph = ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt)
     traced_graph = preprocess_traced_graph(traced_graph)
-
-    save_graphviz_dot(traced_graph, 'traced_graph')
 
     if mdconfig.dump_fx_graph:
         print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
@@ -651,14 +649,12 @@ def _compile_auto(func,
         }
         sharded_gm = fix_node_order(sharded_gm)
         stateless_func_args = (params, buffers, named_states, args, kwargs)
-        save_graphviz_dot(sharded_gm, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
             sharded_gm,
             pp_size,
             stateless_func_args,
-            phs_stragegies=args_strategy,
+            tensors_spmd_strategies=args_strategy,
             strict=strict)
-        save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(
             schedule_cls=schedule_cls,
             local_gm=pp_local_gm,

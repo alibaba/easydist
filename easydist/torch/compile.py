@@ -1,11 +1,12 @@
 import warnings
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher
+from easydist.torch.experimental.pp.split_utils import SplitPatcher
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from functools import partial
 from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
 from easydist.torch.init_helper import SetParaInitHelper
 from easydist.torch.utils import _enable_compile, _rematerialize_optimizer
 
@@ -35,7 +36,7 @@ def stateless_func(func, module, opt, params, buffers, named_states, args, kwarg
     return params, buffers, named_states, grads, ret
 
 
-def compile_train_step(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt):
+def ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt):
     params, buffers = {}, {}
     if module is not None:
         params = dict(module.named_parameters())
@@ -85,5 +86,7 @@ def compile_train_step(func, tracing_mode, init_helper, args, kwargs, schedule_c
 
     traced_graph.graph.eliminate_dead_code()
     traced_graph.recompile()
+
+    save_graphviz_dot(traced_graph, 'traced_graph')
 
     return params,buffers,named_states,state_tensor_num,traced_graph
