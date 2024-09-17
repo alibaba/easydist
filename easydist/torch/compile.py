@@ -82,7 +82,7 @@ def ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls,
                                                              kwargs)
 
     if len(list(traced_graph.named_buffers())) != 0:
-        warnings.warn("No buffer should be found in the traced graph, please check if the model is correctly traced")
+        warnings.warn(f"No buffer should be found in the traced graph, please check if the model is correctly traced, found {dict(traced_graph.named_buffers())}")
 
     traced_graph.graph.eliminate_dead_code()
     traced_graph.recompile()

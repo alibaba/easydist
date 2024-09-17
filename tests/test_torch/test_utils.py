@@ -2,6 +2,8 @@ import torch
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
 
+from easydist.utils import rgetattr, rsetattr
+
 from benchmark.torch.model.gpt import GPT
 
 
@@ -53,3 +55,25 @@ class Foo(GPT):
                     attention_dropout=0,
                     dropout=0.,
                     dtype=torch.float32)
+
+
+def get_module_opt_states(module, opt):
+    params = dict(module.named_parameters())
+    buffers = dict(module.named_buffers())
+    named_states = {}
+    # assign grad and warm up optimizer
+    for name in dict(module.named_parameters()):
+        with torch.no_grad():
+            rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+
+    opt.step()
+    opt.zero_grad(True)
+
+    for n, p in params.items():
+        if p in opt.state:
+            named_states[n] = opt.state[p]  # type: ignore[index]
+            # if step in state, reduce one for warmup step.
+            if 'step' in named_states[n]:
+                named_states[n]['step'] -= 1
+
+    return params, buffers, named_states

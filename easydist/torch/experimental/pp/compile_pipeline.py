@@ -351,23 +351,22 @@ class CompiledStage:
                     (compiled_meta.input_params_map.inv(node_name), state_type)
                 ) for node_name in stage_param_nodes for state_type in compiled_meta.optim_state_types
             )
-            self.tensors_to_save_step = stage_optim_input_grads
+            self.optim_grads = stage_optim_input_grads
             self.step_func_args = (stage_optim_input_params | stage_optim_input_grads) | stage_optim_input_states
             self.stage_step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_func_args)
             save_graphviz_dot(self.stage_step_gm.gm, self.fw_gm.name + '(step)')
 
     @torch.no_grad
-    def forward(self, saved_tensors_bw: Optional[Dict]=None, saved_tensors_step: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
+    def forward(self, saved_tensors_bw: Optional[Dict]=None, grads: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
         assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
 
-        if saved_tensors_bw is None or saved_tensors_step is None or returns_chunk is None:  # for local run
-            assert saved_tensors_bw is None and saved_tensors_step is None and returns_chunk is None
+        if saved_tensors_bw is None or grads is None or returns_chunk is None:  # for local run
+            assert saved_tensors_bw is None and grads is None and returns_chunk is None
             self.saved_tensors_bw = {}
-            self.saved_tensors_step = {}
-            self.returns = {}
             self.grads = {}
+            self.returns = {}
             saved_tensors_bw = self.saved_tensors_bw
-            saved_tensors_step = self.saved_tensors_step
+            grads = self.grads
             returns_chunk = self.returns
 
         kwargs4gm = {}
@@ -384,8 +383,8 @@ class CompiledStage:
             if self.has_bw and arg_name in self.tensors_to_save_bw:
                 saved_tensors_bw[arg_name] = kwargs4gm[arg_name]
 
-            if self.has_step and arg_name in self.tensors_to_save_step:
-                saved_tensors_step[arg_name] = kwargs4gm[arg_name]
+            if self.has_step and arg_name in self.optim_grads:
+                grads[arg_name] = kwargs4gm[arg_name]
 
         with torch.profiler.record_function("actual_compute"):
             output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
@@ -411,23 +410,22 @@ class CompiledStage:
             if self.has_bw and output_name in self.tensors_to_save_bw:
                 saved_tensors_bw[output_name] = output
 
-            if self.has_step and output_name in self.tensors_to_save_step:
-                saved_tensors_step[arg_name] = output
+            if self.has_step and output_name in self.optim_grads:
+                grads[arg_name] = output
 
         return ret
 
     @torch.no_grad
-    def backward(self, saved_tensors_bw: Optional[Dict]=None, saved_tensors_step: Optional[Dict]=None, grads_chunk: Optional[Dict]=None, **kwargs):
+    def backward(self, saved_tensors_bw: Optional[Dict]=None, grads: Optional[Dict]=None, **kwargs):
         if not self.has_bw:
             raise NotImplementedError("This compiled stage doesn't contain bw_gm")
 
         assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
 
-        if saved_tensors_bw is None or saved_tensors_step is None or grads_chunk is None:  # for local run
-            assert saved_tensors_bw is None and saved_tensors_step is None and grads_chunk is None
+        if saved_tensors_bw is None or grads is None:  # for local run
+            assert saved_tensors_bw is None and grads is None
             saved_tensors_bw = self.saved_tensors_bw
-            saved_tensors_step = self.saved_tensors_step
-            grads_chunk = self.grads
+            grads = self.grads
 
         kwargs4gm = {}
         for arg_name in self.bw_gm.inputs_spec:
@@ -438,8 +436,8 @@ class CompiledStage:
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
 
-            if self.has_step and arg_name in self.tensors_to_save_step:
-                saved_tensors_step[arg_name] = kwargs4gm[arg_name]
+            if self.has_step and arg_name in self.optim_grads:
+                grads[arg_name] = kwargs4gm[arg_name]
 
         assert len(saved_tensors_bw) == 0, f"all backward args should be used, but found {saved_tensors_bw} {len(saved_tensors_bw)}"
         with torch.profiler.record_function("actual_compute"):
@@ -452,25 +450,23 @@ class CompiledStage:
         for output_name, output in zip(self.bw_gm.outputs_spec, output_gm):
             if output_name in self.bw_func_returns:
                 ret[output_name] = output
-            else:
-                grads_chunk[output_name] = output
-
-            if self.has_step and output_name in self.tensors_to_save_step:
-                saved_tensors_step[output_name] = output
+            elif self.has_step:
+                assert output_name in self.optim_grads
+                grads[output_name] = output
 
         return ret
 
     @torch.no_grad
-    def step(self, grads_batch: Optional[Dict]=None):
+    def step(self, grads: Optional[Dict]=None):
         if not self.has_step:
             raise NotImplementedError("This compiled stage doesn't contain step_gm")
 
-        if grads_batch is None:
-            grads_batch = self.grads
+        if grads is None:
+            grads = self.grads
 
         with torch.profiler.record_function("actual_compute"):
-            output_gm = self.stage_step_gm(**grads_batch, **self.stage_step_gm.node_states[StateType.OPTIMSTATES], **self.fw_gm.node_states[StateType.PARAMS])
-        grads_batch.clear()
+            output_gm = self.stage_step_gm(**grads, **self.stage_step_gm.node_states[StateType.OPTIMSTATES], **self.fw_gm.node_states[StateType.PARAMS])
+        grads.clear()
 
         for output_name, output in zip(self.stage_step_gm.outputs_spec, output_gm):
             if output_name in self.compiled_meta.output_params_map.inv_keys():  # updated params
@@ -482,7 +478,7 @@ class CompiledStage:
                 input_name = self.compiled_meta.input_optimstates_map.get(
                     self.compiled_meta.output_optimstates_map.inv(output_name)
                 )
-                self.fw_gm.node_states[StateType.OPTIMSTATES][input_name] = output
+                self.stage_step_gm.node_states[StateType.OPTIMSTATES][input_name] = output
 
         return None
 
@@ -776,7 +772,7 @@ def compile_pipeline(
     stateless_func_args,  # args for stateless function
     tensors_spmd_strategies: Optional[List[VarSPMDStrategy]] = None,
     strict=True  # report error if not all params and buffers are used
-) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule]:
+) -> Tuple[CompiledMeta, List[CompiledStage], fx.GraphModule, Set[str]]:
     '''
     This method split a graph module into multiple submodule according to split nodes traced in graph.
     It's specialized to deal with func:
@@ -1087,20 +1083,9 @@ def compile_pipeline(
             submod_idx += 1
 
     def gather_outputs():
-        outputs = reduce(
-            lambda cur, stage: {
-                **cur,
-                **stage.returns,
-                **stage.grads,
-                **compiled_meta.input_to_output_params_map.map_dict_key(stage.fw_gm.node_states[StateType.PARAMS]),
-                **compiled_meta.input_to_output_buffers_map.map_dict_key(stage.fw_gm.node_states[StateType.BUFFERS]),
-                **compiled_meta.input_to_output_optimstates_map.map_dict_key(stage.stage_step_gm.node_states[StateType.OPTIMSTATES])
-            },
-            compiled_stages,
-            {}
-        )
-        outputs = [outputs[node_name] for node_name in compiled_meta.output_nodes_flatten]
-        return pytree.tree_unflatten(outputs, compiled_meta.out_spec)[-1]
+        outputs = reduce(lambda cur, stage: {**cur,  **stage.returns}, compiled_stages, {})
+        outputs = [outputs[node_name] for node_name in compiled_meta.return_nodes_flatten]
+        return pytree.tree_unflatten(outputs, compiled_meta.return_nodes_spec)
 
     def eliminate_dead_code():
         raise RuntimeError("This method should be called since the graph doesn't have output node")
