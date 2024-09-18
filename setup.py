@@ -13,8 +13,9 @@
 # ==============================================================================
 
 import os
-import setuptools
 from importlib.machinery import SourceFileLoader
+
+import setuptools
 
 version = (
     SourceFileLoader("easydist.version", os.path.join(
@@ -63,6 +64,11 @@ setuptools.setup(
         "jax": [
             "jax[cuda11_pip]",
             "flax",
+        ],
+        "dev": [
+            "pre-commit",
+            "autoflake",
+            "isort",
         ]
     },
     entry_points = {

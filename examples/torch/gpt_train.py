@@ -1,22 +1,17 @@
-# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/GPT.py
-import argparse
+# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/gpt_train.py
 import copy
 import os
-from contextlib import nullcontext
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed._tensor import DeviceMesh
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
-from torch.utils.checkpoint import checkpoint
-from torch.distributed._tensor import DeviceMesh
 
 from benchmark.bench_case import GPTCase
 from benchmark.torch.model.gpt import GPT
-from easydist import easydist_setup, mdconfig
+from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import set_device_mesh
-from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
 
 
 def broadcast_module(model):
