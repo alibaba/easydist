@@ -139,7 +139,7 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
         dataset.append((rand_input, label))
 
     seed()
-    params_torch, buffers_torch, optimstates_torch = get_module_opt_states(module_torch, opt_torch)
+    params_torch, buffers_torch, optimstates_torch = get_module_opt_states(module_torch, opt_torch, True)
     with torch.no_grad():
         for rand_input, label in dataset:
             args, kwargs = (rand_input, label, module_torch, opt_torch), {}

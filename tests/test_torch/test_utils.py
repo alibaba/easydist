@@ -21,18 +21,25 @@ def fw_bw_step(input, model):
     out = model(input)
     loss = out.mean()
     loss.backward()
-    return out
+    grads = {k: p.grad.clone().detach() for k, p in model.named_parameters()}
+    return out, grads
 
 
-def train_step_chunked(input, model, opt, num_chunks):
-    output = []
+def train_step_chunked(input, model, opt, num_chunks, show_micro_grad=False):
+    output, prev_grads, micro_batch_grads = [], None, []
     for chunk in input.chunk(num_chunks):
-        out = fw_bw_step(chunk, model)
+        out, grads = fw_bw_step(chunk, model)
         output.append(out)
+        if prev_grads is None:
+            micro_batch_grads.append(grads)
+        else:
+            micro_batch_grads.append({k: grads[k] - prev_grads[k] for k in grads})
+        prev_grads = grads
+
     output = torch.concat(output)
     opt.step()
     opt.zero_grad()
-    return output
+    return output, micro_batch_grads, prev_grads
 
 
 def broadcast_module(model):
@@ -45,7 +52,7 @@ def broadcast_module(model):
     return model
 
 
-class Foo(GPT):
+class TEST_GPT(GPT):
     def __init__(self):
         super().__init__(
                     depth=4,
@@ -57,23 +64,25 @@ class Foo(GPT):
                     dtype=torch.float32)
 
 
-def get_module_opt_states(module, opt):
+def get_module_opt_states(module, opt, init_opt_state):
     params = dict(module.named_parameters())
     buffers = dict(module.named_buffers())
     named_states = {}
-    # assign grad and warm up optimizer
-    for name in dict(module.named_parameters()):
-        with torch.no_grad():
-            rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
 
-    opt.step()
-    opt.zero_grad(True)
+    if init_opt_state:
+        # assign grad and warm up optimizer
+        for name in dict(module.named_parameters()):
+            with torch.no_grad():
+                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
+
+        opt.step()
+        opt.zero_grad(True)
 
     for n, p in params.items():
         if p in opt.state:
             named_states[n] = opt.state[p]  # type: ignore[index]
             # if step in state, reduce one for warmup step.
-            if 'step' in named_states[n]:
+            if init_opt_state and 'step' in named_states[n]:
                 named_states[n]['step'] -= 1
 
     return params, buffers, named_states

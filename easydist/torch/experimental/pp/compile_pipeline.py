@@ -42,14 +42,6 @@ from easydist.torch.experimental.pp.split_utils import split_func_with_bw
 
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
-def split_after_forward(module: torch.nn.Module):
-    def hook(module, args, ret):
-        ret_on_new_stage = split(ret)
-        return ret_on_new_stage
-    module.register_forward_hook(hook, prepend=True)
-    return module
-
-
 def annotate_split_points(module: torch.nn.Module, spec: Set[str]):
     if not isinstance(spec, set):
         raise TypeError("spec should be a set of strings")
@@ -225,6 +217,12 @@ def _split_on_size_threshold_with_max_stages(
 
 # ================================= section end ========================================
 
+def split_after_forward(module: torch.nn.Module):
+    def hook(module, args, ret):
+        ret_on_new_stage = split(ret)
+        return ret_on_new_stage
+    module.register_forward_hook(hook, prepend=True)
+    return module
 
 class StateType(Enum):
     PARAMS = "params"
@@ -278,9 +276,6 @@ class CompiledMeta:
 
     # spmd strategy
     tensors_spmd_strategies: Dict[str, List[Placement]]
-
-    # runtime
-    send_recv_stage_idx: Dict[str, int]
 
     # input node to output node mapping
     input_to_output_params_map: OneToOneMap=None
@@ -357,37 +352,32 @@ class CompiledStage:
             save_graphviz_dot(self.stage_step_gm.gm, self.fw_gm.name + '(step)')
 
     @torch.no_grad
-    def forward(self, saved_tensors_bw: Optional[Dict]=None, grads: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
+    def forward(self, saved_tensors_bw: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
         assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
 
-        if saved_tensors_bw is None or grads is None or returns_chunk is None:  # for local run
-            assert saved_tensors_bw is None and grads is None and returns_chunk is None
+        if saved_tensors_bw is None or returns_chunk is None:  # for local run
+            assert saved_tensors_bw is None and returns_chunk is None
             self.saved_tensors_bw = {}
-            self.grads = {}
             self.returns = {}
             saved_tensors_bw = self.saved_tensors_bw
-            grads = self.grads
             returns_chunk = self.returns
 
-        kwargs4gm = {}
+        kwargs_gm = {}
         for arg_name in self.fw_gm.inputs_spec:
             if arg_name in kwargs:
-                kwargs4gm[arg_name] = kwargs.pop(arg_name)
+                kwargs_gm[arg_name] = kwargs.pop(arg_name)
             elif arg_name in self.fw_gm.node_states[StateType.PARAMS]:  # params
-                kwargs4gm[arg_name] = self.fw_gm.node_states[StateType.PARAMS][arg_name]
+                kwargs_gm[arg_name] = self.fw_gm.node_states[StateType.PARAMS][arg_name]
             elif arg_name in self.fw_gm.node_states[StateType.BUFFERS]:  # buffers
-                kwargs4gm[arg_name] = self.fw_gm.node_states[StateType.BUFFERS][arg_name]
+                kwargs_gm[arg_name] = self.fw_gm.node_states[StateType.BUFFERS][arg_name]
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
 
             if self.has_bw and arg_name in self.tensors_to_save_bw:
-                saved_tensors_bw[arg_name] = kwargs4gm[arg_name]
-
-            if self.has_step and arg_name in self.optim_grads:
-                grads[arg_name] = kwargs4gm[arg_name]
+                saved_tensors_bw[arg_name] = kwargs_gm[arg_name]
 
         with torch.profiler.record_function("actual_compute"):
-            output_from_gm = _to_tuple(self.fw_gm(**kwargs4gm))
+            output_from_gm = _to_tuple(self.fw_gm(**kwargs_gm))
 
         ret = {}
         assert len(output_from_gm) == len(
@@ -410,9 +400,6 @@ class CompiledStage:
             if self.has_bw and output_name in self.tensors_to_save_bw:
                 saved_tensors_bw[output_name] = output
 
-            if self.has_step and output_name in self.optim_grads:
-                grads[arg_name] = output
-
         return ret
 
     @torch.no_grad
@@ -424,24 +411,22 @@ class CompiledStage:
 
         if saved_tensors_bw is None or grads is None:  # for local run
             assert saved_tensors_bw is None and grads is None
+            self.grads = {}
             saved_tensors_bw = self.saved_tensors_bw
             grads = self.grads
 
-        kwargs4gm = {}
+        kwargs_gm = {}
         for arg_name in self.bw_gm.inputs_spec:
             if arg_name in kwargs:
-                kwargs4gm[arg_name] = kwargs.pop(arg_name)
+                kwargs_gm[arg_name] = kwargs.pop(arg_name)
             elif arg_name in saved_tensors_bw:
-                kwargs4gm[arg_name] = saved_tensors_bw.pop(arg_name)
+                kwargs_gm[arg_name] = saved_tensors_bw.pop(arg_name)
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
 
-            if self.has_step and arg_name in self.optim_grads:
-                grads[arg_name] = kwargs4gm[arg_name]
-
         assert len(saved_tensors_bw) == 0, f"all backward args should be used, but found {saved_tensors_bw} {len(saved_tensors_bw)}"
         with torch.profiler.record_function("actual_compute"):
-            output_gm = _to_tuple(self.bw_gm(**kwargs4gm))
+            output_gm = _to_tuple(self.bw_gm(**kwargs_gm))
 
         ret = {}
         assert len(output_gm) == len(
@@ -450,8 +435,7 @@ class CompiledStage:
         for output_name, output in zip(self.bw_gm.outputs_spec, output_gm):
             if output_name in self.bw_func_returns:
                 ret[output_name] = output
-            elif self.has_step:
-                assert output_name in self.optim_grads
+            else:
                 grads[output_name] = output
 
         return ret
@@ -473,12 +457,12 @@ class CompiledStage:
                 input_name = self.compiled_meta.input_params_map.get(
                     self.compiled_meta.output_params_map.inv(output_name)
                 )
-                self.fw_gm.node_states[StateType.PARAMS][input_name] = output
+                self.fw_gm.node_states[StateType.PARAMS][input_name] = output  # this is updated in place when there is no comm node
             elif output_name in self.compiled_meta.output_optimstates_map.inv_keys():  # updated optim states
                 input_name = self.compiled_meta.input_optimstates_map.get(
                     self.compiled_meta.output_optimstates_map.inv(output_name)
                 )
-                self.stage_step_gm.node_states[StateType.OPTIMSTATES][input_name] = output
+                self.stage_step_gm.node_states[StateType.OPTIMSTATES][input_name] = output # this is updated in place when there is no comm node
 
         return None
 
@@ -573,7 +557,7 @@ class CompiledStage:
 
     def _optimizer_state_dict(self) -> Dict[str, Any]:
         if not self.has_step:
-            return {}
+            raise RuntimeError(f"Optimizer wasn't compiled")
         optim_state = defaultdict(dict)
         if self.compiled_meta.tensors_spmd_strategies:
             for node_name, tensor in self.stage_step_gm.node_states[StateType.OPTIMSTATES].items():
@@ -851,8 +835,7 @@ def compile_pipeline(
     assert global_partition_cnt <= 2 and global_partition_cnt == len(list(splited_global.children())), f"global_partition_cnt should be 1 (fw or fw_bw) or 2 (fw_bw + step), but found {global_partition_cnt}"
     states_used_by = defaultdict(list)
 
-    send_recv_stage_idx = {}
-    def _extract_output(node, stage_idx=None):
+    def _extract_output(node):
         # process output
         outputs_spec = []
         call_module_users = defaultdict(set)
@@ -863,8 +846,6 @@ def compile_pipeline(
             assert all(getitem_users), "Output shoule be tuple, which can be infered by ed_split_module"
             for gi in node.users:
                 outputs_spec.append(gi.name)
-                if stage_idx is not None:
-                    send_recv_stage_idx[gi.name] = stage_idx
                 for gi_user in gi.users:
                     if gi_user.op == 'call_module':
                         call_module_users[gi.name].add(gi_user.name)
@@ -872,8 +853,6 @@ def compile_pipeline(
             assert len(node.users) == 1, "Output should be tensor"
             user = next(iter(node.users))
             outputs_spec.append(user.name)
-            if stage_idx is not None:
-                send_recv_stage_idx[gi.name] = stage_idx
             for uuser in user.users:
                 if uuser.op == 'call_module':
                     call_module_users[user.name].add(uuser.name)
@@ -889,7 +868,6 @@ def compile_pipeline(
             inputs_spec.append(arg.name)
             inputs_users.append({user.name for user in arg.users})
             states_used_by[arg.name].append(node.name)
-            send_recv_stage_idx[arg.name] = stage_idx
             try:
                 if arg.name in input_params_map.inv_keys():
                     injected_states[StateType.PARAMS][arg.name] = params.pop(input_params_map.inv(arg.name))
@@ -904,7 +882,7 @@ def compile_pipeline(
                 )
 
         # process output
-        outputs_spec, call_module_users = _extract_output(node, stage_idx)
+        outputs_spec, call_module_users = _extract_output(node)
 
         return EDGraphModule(submod, SubmodType.FW, inputs_spec, injected_states, outputs_spec,
                              call_module_users, node.target)
@@ -917,9 +895,8 @@ def compile_pipeline(
             inputs_spec.append(arg.name)
             inputs_users.append({user.name for user in arg.users})
             states_used_by[arg.name].append(node.name)
-            send_recv_stage_idx[arg.name] = stage_idx
         # process output
-        outputs_spec, call_module_users = _extract_output(node, stage_idx)
+        outputs_spec, call_module_users = _extract_output(node)
         injected_states = StateType.get_empty_dict()
         return EDGraphModule(submod, SubmodType.BW, inputs_spec, injected_states, outputs_spec,
                              call_module_users, node.target)
@@ -972,9 +949,11 @@ def compile_pipeline(
                 stateful_fw_bw.append(_extract_bw_submod(n, submod, stage_idx))
             submod_idx += 1
 
-    step_graph_gm = getattr(splited_global, 'submod_1', None)
-    if step_graph_gm:
-        step_gm_global = _extract_step_submod([n for n in splited_global.graph.nodes if n.name == 'submod_1'][0], step_graph_gm)
+    step_gm_global = getattr(splited_global, 'submod_1', None)
+    input_node_to_step_input_params = OneToOneMap.from_dict({})
+    input_node_to_step_input_grads = OneToOneMap.from_dict({})
+    if step_gm_global:
+        step_gm_global = _extract_step_submod([n for n in splited_global.graph.nodes if n.name == 'submod_1'][0], step_gm_global)
         step_gm_phs = [node.name for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         input_params_nodes_flatten, _ = pytree.tree_flatten(input_params_nodes_unflatten)
         num_params = len(input_params_nodes_flatten) 
@@ -1006,7 +985,6 @@ def compile_pipeline(
         tensors_spmd_strategies=tensors_spmd_strategies,
         return_nodes_flatten=return_nodes_flatten,
         return_nodes_spec=return_nodes_spec,
-        send_recv_stage_idx=send_recv_stage_idx
     )
 
     compiled_stages: List[CompiledStage] = []
@@ -1048,34 +1026,34 @@ def compile_pipeline(
             if (not has_backward) or (submod_idx < nstages):  # forward
                 stage_idx = submod_idx
                 stage = compiled_stages[stage_idx]
-                node_name = f'stage_{stage_idx}_fw'
-                out_maybe_tuple = g.create_node(
-                    name=node_name,
+                out_dict = g.create_node(
+                    name=f'stage_{stage_idx}_fw',
                     op='call_function',
                     target=stage.forward,
                     kwargs={arg_name: env[arg_name]
                             for arg_name in stage.fw_func_args})
+                out_dict.meta['stage_idx'] = stage_idx
                 for output in stage.fw_func_returns:
                     env[output] = g.create_node(name=output,
                                                 op='call_function',
                                                 target=operator.getitem,
-                                                args=(out_maybe_tuple, output))
+                                                args=(out_dict, output))
             else:  # backward
                 stage_idx = 2 * nstages - submod_idx - 1
                 stage = compiled_stages[stage_idx]
-                node_name = f'stage_{stage_idx}_bw'
-                out_maybe_tuple = g.create_node(
-                    name=node_name,
+                out_dict = g.create_node(
+                    name=f'stage_{stage_idx}_bw',
                     op='call_function',
                     target=stage.backward,
                     kwargs={arg_name: env[arg_name]
                             for arg_name in stage.bw_func_args})
-                for output in stage.bw_gm.call_module_users:
+                out_dict.meta['stage_idx'] = stage_idx
+                for output in stage.bw_func_returns:
                     if not output in output_nodes_flatten:
                         env[output] = g.create_node(name=output,
                                                     op='call_function',
                                                     target=operator.getitem,
-                                                    args=(out_maybe_tuple, output))
+                                                    args=(out_dict, output))
                 if stage.has_step:
                     g.create_node(name=f'stage_{stage_idx}_step',
                                     op='call_function',

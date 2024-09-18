@@ -129,9 +129,9 @@ class PipelineStage(RuntimeMixin):
 
         self.pp_rank = dist.get_rank(pp_group)
         self.num_stages = compiled_meta.nstages
-        self.send_recv_stage_idx = compiled_meta.send_recv_stage_idx  # TODO refactor this mapping?
         self.graph = sharded_graph
         self.return_to_all_stages = return_to_all_stages
+        accumulate_grads_inplace = False
         self.accumulate_grads_inplace = accumulate_grads_inplace
 
         if dist.get_world_size(self.pp_group) > self.num_stages:
@@ -240,27 +240,30 @@ class PipelineStage(RuntimeMixin):
         self.cur_bw_chunk_id = 0
         self.kwargs_chunks = [{} for _ in range(self.num_chunks)]
         self.saved_tensors_bw_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
-        self.saved_tensors_step_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.returns_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         self.grads_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         if self.accumulate_grads_inplace:
             self.grads = {}
 
     def reset_and_check_runtime_states(self):
+
+        def clear_single(chunks_list):
+            for chunk in chunks_list:
+                chunk.clear()
+        def check_single(chunks_list):
+            for chunk in chunks_list:
+                assert len(chunk) == 0
+
         self.cur_fw_send_chunk = None
         self.cur_bw_send_chunk = None
         self.cur_fw_chunk_id = 0
         self.cur_bw_chunk_id = 0
 
-        for to_check in [
-            self.returns_chunks,
-            self.saved_tensors_bw_chunks,
-            self.saved_tensors_step_chunks,
-            self.returns_chunks,
-            self.grads_chunks
-        ]:
-            for chunk in to_check:
-                assert len(chunk) == 0, "Activations should be cleared" 
+        clear_single(self.kwargs_chunks)
+
+        check_single(self.returns_chunks)
+        check_single(self.saved_tensors_bw_chunks)
+        check_single(self.grads_chunks)
 
         if self.accumulate_grads_inplace:
             assert len(self.grads) == 0
@@ -273,7 +276,7 @@ class PipelineStage(RuntimeMixin):
             out_str = user.args[-1]
             assert isinstance(out_str, str)
             for gi_user in user.users:
-                dst_rank = self.send_recv_stage_idx[gi_user.name]
+                dst_rank = gi_user.meta['stage_idx']
                 to_sort.append((dst_rank, out_str))
         if is_forward:
             to_sort.sort(key=lambda x:
@@ -310,15 +313,15 @@ class PipelineStage(RuntimeMixin):
         is_forward: bool,
     ) -> Dict[int, List[Placeholder]]:
         to_sort = []
-        for _, recv in node.kwargs.items():
-            if recv.op == "placeholder":
-                to_sort.append((-1, recv.name))
+        for gi_input in node.kwargs.values():
+            if gi_input.op == "placeholder":
+                to_sort.append((-1, gi_input.name))
                 continue
-            example_value = node_metas[recv.name]["val"]
-            src_rank = self.send_recv_stage_idx[recv.name]
+            example_value = node_metas[gi_input.name]["val"]
+            src_rank = gi_input.args[0].meta['stage_idx']
             global_src_rank = src_rank if self.pp_group is None else dist.get_global_rank(
                 self.pp_group, src_rank)
-            to_sort.append((global_src_rank, recv.name, example_value))
+            to_sort.append((global_src_rank, gi_input.name, example_value))
 
         if is_forward:
             # receive lower rank first and in alphabetical order
@@ -385,8 +388,9 @@ class PipelineStage(RuntimeMixin):
         # Compute forward
         self.cur_fw_send_chunk = self.compiled_stage.forward(
             self.saved_tensors_bw_chunks[self.cur_fw_chunk_id],
-            self.saved_tensors_step_chunks[self.cur_fw_chunk_id],
-            self.returns_chunks[self.cur_fw_chunk_id], **composite_kwargs_chunk)
+            self.returns_chunks[self.cur_fw_chunk_id],
+            **composite_kwargs_chunk
+        )
         # Update runtime states
         self.cur_fw_chunk_id += 1
 
@@ -417,16 +421,17 @@ class PipelineStage(RuntimeMixin):
         # Compute backward
         self.cur_bw_send_chunk = self.compiled_stage.backward(
             self.saved_tensors_bw_chunks[self.cur_bw_chunk_id],
-            self.saved_tensors_step_chunks[self.cur_fw_chunk_id],
-            self.grads_chunks[self.cur_bw_chunk_id], **composite_kwargs_chunk)
+            self.grads_chunks[self.cur_bw_chunk_id],
+            **composite_kwargs_chunk
+        )
 
         if self.accumulate_grads_inplace:
-            for grad_node in self.compiled_meta.input_node_to_step_input_grads.inv_keys():
-                grad = self.returns_chunks.pop(grad_node)
+            for grad_node, grad in self.grads_chunks[self.cur_bw_chunk_id].items():
                 if grad_node in self.grads:
                     self.grads[grad_node].add_(grad)
                 else:
                     self.grads[grad_node] = grad
+            self.grads_chunks[self.cur_bw_chunk_id].clear()
 
         # Update runtime states
         self.cur_bw_chunk_id += 1
@@ -461,55 +466,73 @@ class PipelineStage(RuntimeMixin):
             for chunk in self.grads_chunks:
                 chunk.clear()
 
-        for node_name in self.compiled_meta.output_grads_map.inv_keys():  # set grad for usage of native optimizer
-            self.compiled_stage.fw_gm.node_states[StateType.PARAMS][node_name] = self.grads[node_name]
+        if not hasattr(self, "output_grad_to_param"):  # cache the mapping
+            self.output_grad_to_param = self.compiled_meta.output_grads_map.inverse().apply(self.compiled_meta.input_params_map)
+
+        for grad_name, grad in self.grads.items():
+            self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
+                self.output_grad_to_param.get(grad_name)
+            ].grad = grad
 
     @torch.no_grad
     def merge_chunked_returns(self) -> Tuple[Any, ...]:
-        rets = merge_chunks(self.return_chunks, self.returns_nodes_chunk_spec)
+        for chunk in self.returns_chunks:
+            for node_name in self.returns_nodes_chunk_spec:
+                chunk[node_name] = chunk.get(node_name, None)
 
-        for chunk in self.return_chunks:
+        returns = merge_chunks(self.returns_chunks, self.returns_nodes_chunk_spec)
+
+        for chunk in self.returns_chunks:
             chunk.clear()
 
         returns_all_gather = [None for _ in range(self.num_stages)]
-        dist.all_gather_object(returns_all_gather, rets, group=self.pp_group)
+        dist.all_gather_object(returns_all_gather, returns, group=self.pp_group)
 
-        return pytree.tree_unflatten(reduce(lambda a, b: {**a, **b}), self.compiled_meta.return_nodes_spec)
+        returns_dict = {}
+        for returns in returns_all_gather:
+            for k, v, in returns.items():
+                if v is not None:
+                    returns_dict[k] = v
+        return_tensors = [returns_dict[node_name] for node_name in self.compiled_meta.return_nodes_flatten]
 
-    def optimstate_dict(self, all_gather=True) -> Dict[str, Any]:
+        return pytree.tree_unflatten(return_tensors, self.compiled_meta.return_nodes_spec)
+
+    def _all_gather_inner(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        state_dicts = [None for _ in range(self.num_stages)]
+        dist.all_gather_object(state_dicts,
+                            state_dict,
+                            group=self.pp_group)
+        return reduce(lambda a, b: {**a, **b}, state_dicts)
+
+    def _optimstate_state_dict(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage._optimizer_state_dict()
         if all_gather:
-            return self._all_gather_optimstate_dict()
-        else:
-            return self.compiled_stage.optimizer_state_dict()
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
 
     def state_dict(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.state_dict()
         if all_gather:
-            return self._all_gather_state_dict()
-        else:
-            return self.compiled_stage.state_dict()
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
+
+    def named_parameters(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.named_parameters()
+        if all_gather:
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
+
+    def named_buffers(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.named_buffers()
+        if all_gather:
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
 
     def load_state_dict(self, state_dict, strict=True):
         self.compiled_stage.load_state_dict(state_dict, strict=strict)
 
     def load_optimizer_state_dict(self, state_dict, strict=True):
         self.compiled_stage.load_optimizer_state_dict(state_dict, strict=strict)
-
-    def _all_gather_state_dict(self) -> Dict[str, Any]:
-        state_dicts = [None for _ in range(self.num_stages)]
-        state_dict = self.compiled_stage.state_dict()  # gather spmd
-        dist.all_gather_object(state_dicts,
-                            state_dict,
-                            group=self.pp_group)
-        return reduce(lambda a, b: {**a, **b}, state_dicts)
-
-    def _all_gather_optimstate_dict(self) -> Dict[str, Any]:
-        optimizer_state_dicts = [None for _ in range(self.num_stages)]
-        optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
-        dist.all_gather_object(
-            optimizer_state_dicts,
-            optimizer_state_dict,
-            group=self.pp_group)
-        return reduce(lambda a, b: {**a, **b}, optimizer_state_dicts)
 
 
     def __call__(self, *args, **kwargs) -> None:
