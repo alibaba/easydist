@@ -348,9 +348,6 @@ class SplitPatcher(_Patcher):
                             optimizer, named_states, params) if optimizer else nullcontext():
                     orig_step(optimizer, *args, **kwargs)
 
-                for n, p in params.items():  # need to split on grads
-                    p.grad = grads[n]
-
                 set_updated_params_states(params, named_states)
                 set_step_flag(True)
 

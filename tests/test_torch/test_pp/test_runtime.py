@@ -26,49 +26,19 @@ from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 import torch
 from torch.distributed._tensor import DeviceMesh
 
+from easydist import easydist_setup
 from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
 from easydist.torch.utils import seed
 from easydist.utils.testing import spawn
 
-from tests.test_torch.test_utils import get_module_opt_states, train_step, train_step_chunked, broadcast_module, TEST_GPT
-
-
-class Foo1(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x = self.linear(x)
-        return x.relu()
-
-
-class Foo2(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear0_0 = torch.nn.Linear(1024, 512)
-        self.linear0_1 = torch.nn.Linear(512, 256)
-        self.linear1 = torch.nn.Linear(256, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x0 = self.linear0_0(x)
-        x0 = self.linear0_1(x0)
-        x1 = self.linear1(x0)
-        y = x + x1
-        return y.relu()
-
+from tests.test_torch.test_utils import get_module_opt_states, train_step, train_step_chunked, broadcast_module, TEST_GPT, TEST_GPT_CASE, Foo, Foo1
 
 BATCH_SIZE = 48
 
 
 def inner(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
     seed()
+    easydist_setup(backend="torch", device="cuda", allow_tf32=False)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
@@ -93,12 +63,12 @@ def inner(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
 
     num_chunks = world_size * 4
     assert BATCH_SIZE % num_chunks == 0, f"only support fix micro batch size {BATCH_SIZE=} {num_chunks=}"
-    compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks, strict=False)
+    compiled_pipe = easydist_compile(train_step, 'pp', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks, strict=True)
 
-    steps = 50
+    steps = 5
     if module_cls is TEST_GPT:
         dataset = [
-            torch.randn(BATCH_SIZE, 512, 128, device=device)
+            torch.randn(BATCH_SIZE, TEST_GPT_CASE.seq_size, TEST_GPT_CASE.hidden_dim, device=device)
             for _ in range(steps)
         ]
     else:
@@ -128,7 +98,7 @@ def inner(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
         if use_native_optimizer:
             _, _, optimstates_compiled = get_module_opt_states(module_pipe, opt_pipe, False)
         else:
-            optimstates_compiled = compiled_pipe.compiled_func._optimstate_state_dict()
+            optimstates_compiled = compiled_pipe.compiled_func._optimizer_state_dict()
         for k in buffers_torch:
             assert torch.allclose(buffers_torch[k], buffers_compiled[k].to(device), rtol=rtol, atol=atol)
         for k in params_torch:
@@ -139,15 +109,16 @@ def inner(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
 
 
 @pytest.mark.torch
+@pytest.mark.world_2
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, use_native_optimizer", [
-    (Foo1, {'norm'}, ScheduleGPipe, 'adam', True),
-    (Foo1, {'norm'}, ScheduleGPipe, 'adam', False),
-    (Foo1, {'norm'}, ScheduleGPipe, 'sgd', True),
-    (Foo1, {'norm'}, ScheduleGPipe, 'sgd', False),
-    (Foo1, {'norm'}, ScheduleDAPPLE, 'adam', True),
-    (Foo1, {'norm'}, ScheduleDAPPLE, 'adam', False),
-    (Foo1, {'norm'}, ScheduleDAPPLE, 'sgd', True),
-    (Foo1, {'norm'}, ScheduleDAPPLE, 'sgd', False),
+    (Foo, {'norm'}, ScheduleGPipe, 'adam', True),
+    (Foo, {'norm'}, ScheduleGPipe, 'adam', False),
+    (Foo, {'norm'}, ScheduleGPipe, 'sgd', True),
+    (Foo, {'norm'}, ScheduleGPipe, 'sgd', False),
+    (Foo, {'norm'}, ScheduleDAPPLE, 'adam', True),
+    (Foo, {'norm'}, ScheduleDAPPLE, 'adam', False),
+    (Foo, {'norm'}, ScheduleDAPPLE, 'sgd', True),
+    (Foo, {'norm'}, ScheduleDAPPLE, 'sgd', False),
 ])
 @pytest.mark.timeout(100)
 def test_runtime_world_2(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
@@ -155,15 +126,16 @@ def test_runtime_world_2(module_cls, split_ann, schedule_cls, optim, use_native_
 
 
 @pytest.mark.torch
+@pytest.mark.world_3
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, use_native_optimizer", [
-    (Foo2, {'norm', 'linear0_1',}, ScheduleGPipe, 'adam', True),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleGPipe, 'adam', False),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleGPipe, 'sgd', True),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleGPipe, 'sgd', False),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'adam', True),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'adam', False),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'sgd', True),
-    (Foo2, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'sgd', False),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleGPipe, 'adam', True),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleGPipe, 'adam', False),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleGPipe, 'sgd', True),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleGPipe, 'sgd', False),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'adam', True),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'adam', False),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'sgd', True),
+    (Foo1, {'norm', 'linear0_1',}, ScheduleDAPPLE, 'sgd', False),
 ])
 @pytest.mark.timeout(100)
 def test_runtime_world_3(module_cls, split_ann, schedule_cls, optim, use_native_optimizer):
@@ -171,6 +143,7 @@ def test_runtime_world_3(module_cls, split_ann, schedule_cls, optim, use_native_
 
 
 @pytest.mark.torch
+@pytest.mark.world_4
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, use_native_optimizer", [
     (TEST_GPT, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'adam', True),
     (TEST_GPT, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleGPipe, 'adam', False),

@@ -131,7 +131,6 @@ class PipelineStage(RuntimeMixin):
         self.num_stages = compiled_meta.nstages
         self.graph = sharded_graph
         self.return_to_all_stages = return_to_all_stages
-        accumulate_grads_inplace = False
         self.accumulate_grads_inplace = accumulate_grads_inplace
 
         if dist.get_world_size(self.pp_group) > self.num_stages:
@@ -466,13 +465,17 @@ class PipelineStage(RuntimeMixin):
             for chunk in self.grads_chunks:
                 chunk.clear()
 
-        if not hasattr(self, "output_grad_to_param"):  # cache the mapping
-            self.output_grad_to_param = self.compiled_meta.output_grads_map.inverse().apply(self.compiled_meta.input_params_map)
-
-        for grad_name, grad in self.grads.items():
-            self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
-                self.output_grad_to_param.get(grad_name)
-            ].grad = grad
+        if self.step_node is not None:
+            for grad_name, grad in self.grads.items():
+                self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
+                    self.compiled_meta.input_node_to_step_input_grads.inv(grad_name)
+                ].grad = grad
+        else:
+            for grad_name, grad in self.grads.items():
+                self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
+                    self.compiled_meta.input_params_map.get(self.compiled_meta.output_grads_map.inv(grad_name))
+                ].grad = grad
+            self.grads.clear()  # no step gm, assign grads and clear it
 
     @torch.no_grad
     def merge_chunked_returns(self) -> Tuple[Any, ...]:
@@ -504,7 +507,7 @@ class PipelineStage(RuntimeMixin):
                             group=self.pp_group)
         return reduce(lambda a, b: {**a, **b}, state_dicts)
 
-    def _optimstate_state_dict(self, all_gather=True) -> Dict[str, Any]:
+    def _optimizer_state_dict(self, all_gather=True) -> Dict[str, Any]:
         state_dict = self.compiled_stage._optimizer_state_dict()
         if all_gather:
             state_dict = self._all_gather_inner(state_dict)

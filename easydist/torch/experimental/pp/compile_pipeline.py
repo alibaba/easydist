@@ -44,7 +44,7 @@ from easydist.torch.experimental.pp.split_utils import split_func_with_bw
 
 def annotate_split_points(module: torch.nn.Module, spec: Set[str]):
     if not isinstance(spec, set):
-        raise TypeError("spec should be a set of strings")
+        raise TypeError(f"spec should be a set of strings, found {type(spec)=} {spec=}")
 
     # TODO: make this implementation out-of-place?
     for qualname in iter(spec):
@@ -928,7 +928,7 @@ def compile_pipeline(
     has_backward = get_backward_flag()
     fw_and_bw_gm, stage_cnt = split_by(
                     splited_global.submod_0, torch.ops.easydist.fw_bw_split.default)
-
+    save_graphviz_dot(fw_and_bw_gm, 'fw_and_bw_gm')
     if not (stage_cnt == (nstages * 2 if has_backward else nstages)):
         raise RuntimeError(
             f"Backward is called and there should be 2 * {nstages} submodule (found {stage_cnt}), please check split annotation or report this bug" if has_backward
@@ -953,6 +953,7 @@ def compile_pipeline(
     input_node_to_step_input_params = OneToOneMap.from_dict({})
     input_node_to_step_input_grads = OneToOneMap.from_dict({})
     if step_gm_global:
+        save_graphviz_dot(step_gm_global, 'step_gm_global')
         step_gm_global = _extract_step_submod([n for n in splited_global.graph.nodes if n.name == 'submod_1'][0], step_gm_global)
         step_gm_phs = [node.name for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         input_params_nodes_flatten, _ = pytree.tree_flatten(input_params_nodes_unflatten)

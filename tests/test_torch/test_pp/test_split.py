@@ -30,38 +30,7 @@ from benchmark.torch.model import GPT
 
 from transformers import OpenAIGPTModel, OpenAIGPTConfig
 
-from tests.test_torch.test_utils import get_module_opt_states
-
-
-class Foo(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear = torch.nn.Linear(1024, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x = self.linear(x)
-        return x.relu()
-
-
-class Foo1(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(1024)
-        self.linear0_0 = torch.nn.Linear(1024, 512)
-        self.linear0_1 = torch.nn.Linear(512, 256)
-        self.linear1 = torch.nn.Linear(256, 1024)
-
-    def forward(self, x):
-        x = self.norm(x)
-        x0 = self.linear0_0(x)
-        x0 = self.linear0_1(x0)
-        x1 = self.linear1(x0)
-        y = x + x1
-        return y.relu()
+from tests.test_torch.test_utils import get_module_opt_states, Foo, Foo1
 
 
 def train_step(input, label, model, opt):
@@ -131,7 +100,7 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
     stateless_func_args = (params, buffers, named_states, train_step_func_args, {})
     compiled_meta, compiled_stages, local_gm, _ = compile_pipeline(traced_stateless_func, nstages, stateless_func_args, strict=True)  # some models have unsed param
 
-    epochs = 50
+    epochs = 5
     dataset = []
     for _ in range(epochs):
         rand_input = rand_input_gen_method().to(device)

@@ -18,7 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial, reduce
-from typing import Any, Union, Set, Dict, List, Tuple
+from typing import Any, Union, Set, Dict, List, Tuple, Callable
 
 import rich
 import intervaltree
@@ -464,7 +464,7 @@ def _compile_auto(func,
                   num_chunks=1,
                   return_to_all_stages=True,
                   accumulate_grads_inplace=True,
-                  strict=True) -> Union[PipelineStage, Any]:
+                  strict=True) -> Callable:
     if schedule_cls is not None:
         args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
                                                                 args_chunk_spec, kwargs_chunk_spec)
@@ -764,6 +764,15 @@ def _compile_auto(func,
 
         def named_parameters(self):
             return params
+
+        def buffers(self):
+            return buffers.values()
+
+        def named_buffers(self):
+            return buffers
+
+        def _optimizer_state_dict(self):
+            return named_states
 
     # release all cuda memory from module here
     # the param maintain in the local of compiled function.

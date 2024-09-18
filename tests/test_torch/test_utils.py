@@ -5,7 +5,7 @@ from torch.distributed.utils import _sync_module_states
 from easydist.utils import rgetattr, rsetattr
 
 from benchmark.torch.model.gpt import GPT
-
+from benchmark.bench_case import GPTCase
 
 def train_step(input, model, opt):
     out = model(input)
@@ -52,16 +52,20 @@ def broadcast_module(model):
     return model
 
 
+TEST_GPT_CASE = GPTCase(
+    num_layers=4,
+    hidden_dim=128,
+    num_heads=4,
+    seq_size=128
+)
+
 class TEST_GPT(GPT):
     def __init__(self):
         super().__init__(
-                    depth=4,
-                    dim=128,
-                    num_heads=4,
-                    mlp_ratio=4,
-                    attention_dropout=0,
-                    dropout=0.,
-                    dtype=torch.float32)
+            depth=TEST_GPT_CASE.num_layers,
+            dim=TEST_GPT_CASE.hidden_dim,
+            num_heads=TEST_GPT_CASE.num_heads
+        )
 
 
 def get_module_opt_states(module, opt, init_opt_state):
@@ -86,3 +90,34 @@ def get_module_opt_states(module, opt, init_opt_state):
                 named_states[n]['step'] -= 1
 
     return params, buffers, named_states
+
+
+class Foo(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.norm = torch.nn.BatchNorm1d(1024)
+        self.linear = torch.nn.Linear(1024, 1024)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.linear(x)
+        return x
+
+
+class Foo1(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.norm = torch.nn.BatchNorm1d(1024)
+        self.linear0_0 = torch.nn.Linear(1024, 512)
+        self.linear0_1 = torch.nn.Linear(512, 256)
+        self.linear1 = torch.nn.Linear(256, 1024)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x0 = self.linear0_0(x)
+        x0 = self.linear0_1(x0)
+        x1 = self.linear1(x0)
+        y = x + x1
+        return y

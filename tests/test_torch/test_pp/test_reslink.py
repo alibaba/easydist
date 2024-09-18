@@ -94,11 +94,10 @@ def main(schedule_cls):
     for _ in range(epochs):
         for x_batch, y_batch in tqdm(train_dataloader,
                                         dynamic_ncols=True) if rank == 0 else train_dataloader:
-            if x_batch.size(0) != batch_size:  # TODO need to solve this
-                continue
             _ = train_step(x_batch, y_batch, module, opt)
 
 @pytest.mark.torch
+@pytest.mark.world_4
 @pytest.mark.parametrize("schedule_cls", [ScheduleGPipe, ScheduleDAPPLE])
 @pytest.mark.timeout(50)
 def test_reslink(schedule_cls):
