@@ -12,8 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import logging
+import os
 from pathlib import Path
 
 
@@ -108,7 +108,10 @@ enable_runtime_trace = os.environ.get("ENABLE_RUNTIME_TRACE", "False").upper() i
 # whether to allow solver find 1d solution when using nd device mesh
 allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper() in ["1", "TRUE"]
 
-# whether to allow p2p comm during dtensor placement transform
 # NOTE: this is still under experiment and might introduce extra memory consumption
+# 0: Replicate-then-shard transform
+# 1: 2-pass greedy transform
+# 2: P2P transform
 experimental_p2p_sharding_transform = int(os.environ.get("EXPERIMENTAL_P2P_SHARDING_TRANSFORM", "0"))
-assert experimental_p2p_sharding_transform in [0, 1, 2]
+if experimental_p2p_sharding_transform not in [0, 1, 2]:
+    raise RuntimeError(f"Expected EXPERIMENTAL_P2P_SHARDING_TRANSFORM in [0, 1, 2], found {experimental_p2p_sharding_transform}")
