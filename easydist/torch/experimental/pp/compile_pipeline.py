@@ -15,10 +15,10 @@
 import logging
 import operator
 import textwrap
-from functools import reduce
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
+from functools import reduce
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -27,18 +27,33 @@ import torch.utils._pytree as pytree
 from torch.distributed._tensor import Replicate
 from torch.distributed._tensor.placement_types import Placement
 
-from easydist.metashard.metair import SPMD, VarSPMDStrategy
+from easydist.metashard.metair import VarSPMDStrategy
 from easydist.torch.experimental.pp.ed_split_module import ed_split_module
-from easydist.torch.experimental.pp.split_utils import get_backward_flag, get_step_flag, split
-from easydist.torch.experimental.pp.utils import do_spmd_comm, ordered_gi_users, save_graphviz_dot, _to_tuple, OneToOneMap
+from easydist.torch.experimental.pp.split_utils import (
+    get_backward_flag,
+    split,
+    split_func_with_bw,
+)
+from easydist.torch.experimental.pp.utils import (
+    OneToOneMap,
+    _to_tuple,
+    do_spmd_comm,
+    ordered_gi_users,
+    save_graphviz_dot,
+)
 from easydist.utils import rgetattr, rsetattr
-from easydist.torch.experimental.pp.split_utils import split_func_with_bw
-
 
 # ================================= section start ========================================
 # Functions in this section are modified from
 # https://github.com/pytorch/PiPPy/blob/e9e2d5f0164a2e5d952a1424a3926da543365801/pippy/IR.py#L1206
 
+
+def split_after_forward(module: torch.nn.Module):
+    def hook(module, args, ret):
+        ret_on_new_stage = split(ret)
+        return ret_on_new_stage
+    module.register_forward_hook(hook, prepend=True)
+    return module
 
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
@@ -217,12 +232,6 @@ def _split_on_size_threshold_with_max_stages(
 
 # ================================= section end ========================================
 
-def split_after_forward(module: torch.nn.Module):
-    def hook(module, args, ret):
-        ret_on_new_stage = split(ret)
-        return ret_on_new_stage
-    module.register_forward_hook(hook, prepend=True)
-    return module
 
 class StateType(Enum):
     PARAMS = "params"
@@ -957,7 +966,7 @@ def compile_pipeline(
         step_gm_global = _extract_step_submod([n for n in splited_global.graph.nodes if n.name == 'submod_1'][0], step_gm_global)
         step_gm_phs = [node.name for node in splited_global.submod_1.graph.nodes if node.op == 'placeholder']
         input_params_nodes_flatten, _ = pytree.tree_flatten(input_params_nodes_unflatten)
-        num_params = len(input_params_nodes_flatten) 
+        num_params = len(input_params_nodes_flatten)
         input_node_to_step_input_params = OneToOneMap.from_dict({
             input_node_name: step_node_name for input_node_name, step_node_name in zip(input_params_nodes_flatten, step_gm_phs[:num_params])
         })
@@ -1003,12 +1012,12 @@ def compile_pipeline(
     if len(erased_tensor_keys) > 0:
         debugging_info = textwrap.dedent(f"""
             Some states will be erased, please make sure this is intended behaviour
-            Erased: 
-                Params: 
+            Erased:
+                Params:
                     {' '.join(params)}
-                Buffers: 
+                Buffers:
                     {' '.join(buffers)}
-                Optimstates: 
+                Optimstates:
                     {' '.join(k for k, v in optimstates.items() if len(v) > 0)}
             """)
         if strict:
