@@ -1,14 +1,14 @@
 from typing import Any
 
 import torch
-import torch.utils._pytree as pytree
 import torch.distributed as dist
+import torch.utils._pytree as pytree
 
 from easydist.torch.compile import ed_compile_func
 from easydist.torch.experimental.pp.compile_pipeline import compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
-from easydist.torch.experimental.pp.utils import save_graphviz_dot
+
 
 def _compile_pp(func,
                 tracing_mode,
@@ -75,7 +75,7 @@ def _compile_pp(func,
                 return ret
 
             def run_with_graph(self, graph, *args: Any, **kwargs: Any) -> Any:
-                outputs = self.graph(*args, **kwargs)
+                outputs = graph(*args, **kwargs)
                 ret = pytree.tree_unflatten(outputs, compiled_meta.out_spec)[-1]
                 return ret
 
