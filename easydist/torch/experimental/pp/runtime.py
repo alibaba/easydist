@@ -12,25 +12,31 @@
 # limitations under the License.
 # ==============================================================================
 
-from collections import defaultdict
 import logging
 import operator
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from functools import reduce
-from tkinter import Place
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
 import torch.fx as fx
-from torch.profiler import record_function
-from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
+from torch._subclasses.fake_tensor import FakeTensor
 
-from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage, StateType)
-from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer,
-                                                       TensorChunkSpec, merge_chunks,
-                                                       split_args_kwargs_into_chunks)
+from easydist.torch.experimental.pp.compile_pipeline import (
+    CompiledMeta,
+    CompiledStage,
+    StateType,
+)
+from easydist.torch.experimental.pp.microbatch import (
+    DEFAULT_CHUNK_DIM,
+    CustomReducer,
+    TensorChunkSpec,
+    merge_chunks,
+    split_args_kwargs_into_chunks,
+)
 from easydist.torch.init_helper import materialize_zero
 
 logger = logging.getLogger(__name__)
@@ -90,7 +96,7 @@ class RuntimeMixin(ABC):
     @abstractmethod
     def backward_compute_one_chunk(self) -> None:
         raise NotImplementedError
-    
+
     @abstractmethod
     def backward_send_one_chunk(self) -> List[dist.Work]:
         raise NotImplementedError
@@ -468,12 +474,12 @@ class PipelineStage(RuntimeMixin):
         if self.step_node is not None:
             for grad_name, grad in self.grads.items():
                 self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
-                    self.compiled_meta.input_node_to_step_input_grads.inv(grad_name)
+                    self.compiled_meta.input_node_to_step_input_grads.inv_get(grad_name)
                 ].grad = grad
         else:
             for grad_name, grad in self.grads.items():
                 self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
-                    self.compiled_meta.input_params_map.get(self.compiled_meta.output_grads_map.inv(grad_name))
+                    self.compiled_meta.input_params_map.get(self.compiled_meta.output_grads_map.inv_get(grad_name))
                 ].grad = grad
             self.grads.clear()  # no step gm, assign grads and clear it
 
@@ -599,25 +605,25 @@ class Schedule(RuntimeMixin):
 
     def forward_send_one_chunk(self) -> List[dist.Work]:
         return self.pipeline_stage.forward_send_one_chunk()
-    
+
     def forward_compute_one_chunk(self):
         return self.pipeline_stage.forward_compute_one_chunk()
-    
+
     def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         return self.pipeline_stage.forward_recv_one_chunk(wait=wait)
-    
+
     def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         return self.pipeline_stage.backward_recv_one_chunk(wait=wait)
-    
+
     def backward_compute_one_chunk(self):
         return self.pipeline_stage.backward_compute_one_chunk()
-    
+
     def backward_send_one_chunk(self) -> List[dist.Work]:
         return self.pipeline_stage.backward_send_one_chunk()
 
     def merge_and_assign_chunked_grads(self) -> Dict[str, Any]:
         return self.pipeline_stage.merge_and_assign_chunked_grads()
-    
+
     def step(self):
         return self.pipeline_stage.step()
 

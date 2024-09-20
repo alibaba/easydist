@@ -352,7 +352,7 @@ class CompiledStage:
             )
             stage_optim_input_states = set(
                 compiled_meta.input_optimstates_map.get(
-                    (compiled_meta.input_params_map.inv(node_name), state_type)
+                    (compiled_meta.input_params_map.inv_get(node_name), state_type)
                 ) for node_name in stage_param_nodes for state_type in compiled_meta.optim_state_types
             )
             self.optim_grads = stage_optim_input_grads
@@ -402,7 +402,7 @@ class CompiledStage:
 
             if output_name in self.compiled_meta.output_buffers_map.inv_keys():  # updated buffers
                 input_name = self.compiled_meta.input_buffers_map.get(
-                    self.compiled_meta.output_buffers_map.inv(output_name)
+                    self.compiled_meta.output_buffers_map.inv_get(output_name)
                 )
                 self.fw_gm.node_states[StateType.BUFFERS][input_name] = output
 
@@ -464,12 +464,12 @@ class CompiledStage:
         for output_name, output in zip(self.stage_step_gm.outputs_spec, output_gm):
             if output_name in self.compiled_meta.output_params_map.inv_keys():  # updated params
                 input_name = self.compiled_meta.input_params_map.get(
-                    self.compiled_meta.output_params_map.inv(output_name)
+                    self.compiled_meta.output_params_map.inv_get(output_name)
                 )
                 self.fw_gm.node_states[StateType.PARAMS][input_name] = output  # this is updated in place when there is no comm node
             elif output_name in self.compiled_meta.output_optimstates_map.inv_keys():  # updated optim states
                 input_name = self.compiled_meta.input_optimstates_map.get(
-                    self.compiled_meta.output_optimstates_map.inv(output_name)
+                    self.compiled_meta.output_optimstates_map.inv_get(output_name)
                 )
                 self.stage_step_gm.node_states[StateType.OPTIMSTATES][input_name] = output # this is updated in place when there is no comm node
 
@@ -536,12 +536,12 @@ class CompiledStage:
                 src_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
                 tgt_specs = [Replicate()] * len(src_specs)
                 tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
-                torch_name = self.compiled_meta.input_params_map.inv(node_name)
+                torch_name = self.compiled_meta.input_params_map.inv_get(node_name)
                 params[torch_name] = tensor
             return params
         else:
             return {
-                self.compiled_meta.input_params_map.inv(node_name): tensor
+                self.compiled_meta.input_params_map.inv_get(node_name): tensor
                 for node_name, tensor in self.fw_gm.node_states[StateType.PARAMS].items()
             }
 
@@ -552,12 +552,12 @@ class CompiledStage:
                 src_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
                 tgt_specs = [Replicate()] * len(src_specs)
                 tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
-                torch_name = self.compiled_meta.input_buffers_map.inv(node_name)
+                torch_name = self.compiled_meta.input_buffers_map.inv_get(node_name)
                 buffers[torch_name] = tensor
             return buffers
         else:
             return {
-                self.compiled_meta.input_buffers_map.inv(node_name): tensor
+                self.compiled_meta.input_buffers_map.inv_get(node_name): tensor
                 for node_name, tensor in self.fw_gm.node_states[StateType.BUFFERS].items()
             }
 
@@ -573,11 +573,11 @@ class CompiledStage:
                 src_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
                 tgt_specs = [Replicate()] * len(src_specs)
                 tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
-                torch_name, state_type = self.compiled_meta.input_optimstates_map.inv(node_name)
+                torch_name, state_type = self.compiled_meta.input_optimstates_map.inv_get(node_name)
                 optim_state[torch_name][state_type] = tensor
         else:
             for node_name, tensor in self.stage_step_gm.node_states[StateType.OPTIMSTATES].items():
-                torch_name, state_type = self.compiled_meta.input_optimstates_map.inv(node_name)
+                torch_name, state_type = self.compiled_meta.input_optimstates_map.inv_get(node_name)
                 optim_state[torch_name][state_type] = tensor
 
         return dict(optim_state)
@@ -879,12 +879,12 @@ def compile_pipeline(
             states_used_by[arg.name].append(node.name)
             try:
                 if arg.name in input_params_map.inv_keys():
-                    injected_states[StateType.PARAMS][arg.name] = params.pop(input_params_map.inv(arg.name))
+                    injected_states[StateType.PARAMS][arg.name] = params.pop(input_params_map.inv_get(arg.name))
                 elif arg.name in input_buffers_map.inv_keys():  # inject states to the first submod
                     injected_states[StateType.BUFFERS][arg.name] = buffers.pop(
-                        input_buffers_map.inv(arg.name))
+                        input_buffers_map.inv_get(arg.name))
             except KeyError:
-                name = input_params_map.inv(arg.name) if arg.name in input_params_map.inv_keys() else input_buffers_map.inv(arg.name)
+                name = input_params_map.inv_get(arg.name) if arg.name in input_params_map.inv_keys() else input_buffers_map.inv_get(arg.name)
                 typ = StateType.PARAMS if arg.name in input_params_map.inv_keys() else StateType.BUFFERS
                 raise RuntimeError(
                     f"{typ}: {name} ({arg.name}) is found used by multiple forward submods {states_used_by[arg.name]}"
@@ -921,10 +921,10 @@ def compile_pipeline(
             states_used_by[arg.name].append(node.name)
             if arg.name in input_optimstates_map.inv_keys():  # inject states to the first submod (might be fw_gm or step_gm but not bw_gm)
                 try:
-                    torch_name, state_type = input_optimstates_map.inv(arg.name)
+                    torch_name, state_type = input_optimstates_map.inv_get(arg.name)
                     injected_states[StateType.OPTIMSTATES][arg.name] = optimstates[torch_name].pop(state_type)
                 except KeyError:
-                    torch_name, state_type = input_optimstates_map.inv(arg.name)
+                    torch_name, state_type = input_optimstates_map.inv_get(arg.name)
                     typ = StateType.OPTIMSTATES
                     raise RuntimeError(f"Please report this, {typ}:{torch_name} ({state_type}) is found used by multiple step submods {states_used_by[arg.name]}")
 
@@ -971,7 +971,7 @@ def compile_pipeline(
             input_node_name: step_node_name for input_node_name, step_node_name in zip(input_params_nodes_flatten, step_gm_phs[:num_params])
         })
         input_node_to_step_input_grads = OneToOneMap.from_dict({
-            input_node_to_step_input_params.inv(param_node_name): grad_node_name for param_node_name, grad_node_name in zip(step_gm_phs[:num_params], step_gm_phs[num_params:2*num_params])
+            input_node_to_step_input_params.inv_get(param_node_name): grad_node_name for param_node_name, grad_node_name in zip(step_gm_phs[:num_params], step_gm_phs[num_params:2*num_params])
         })
 
     # meta data

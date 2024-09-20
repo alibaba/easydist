@@ -12,14 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 
-from copy import deepcopy
 import logging
-from typing import Dict, Any, List
+import operator
+from copy import deepcopy
+from typing import Any, Dict, List
+
+import torch.fx as fx
 from torch.distributed._tensor import DTensor
 from torch.distributed._tensor.placement_types import Placement
-import torch.fx as fx
-import operator
 from torch.fx.passes.graph_drawer import FxGraphDrawer
+
 import easydist.config as mdconfig
 from easydist.torch.device_mesh import get_device_mesh
 
@@ -53,7 +55,7 @@ class OneToOneMap:
     def get(self, key: Any) -> Any:
         return self._map[key]
 
-    def inv(self, key: Any) -> Any:
+    def inv_get(self, key: Any) -> Any:
         return self._inv[key]
 
     def add(self, key: Any, value: Any) -> Any:
@@ -93,13 +95,6 @@ class OneToOneMap:
 
     def __repr__(self):
         return f"{self._map=}\n{self._inv=}"
-
-    def intersect(self, other: "OneToOneMap") -> "OneToOneMap":
-        mapping = OneToOneMap()
-        for k, v in self.items():
-            if k in other._map:
-                mapping.add(k, v)
-        return mapping
 
     @staticmethod
     def from_dict(dict: Dict) -> "OneToOneMap":
