@@ -112,6 +112,6 @@ allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper()
 # 0: Replicate-then-shard transform
 # 1: 2-pass greedy transform
 # 2: P2P transform
-experimental_p2p_sharding_transform = int(os.environ.get("EXPERIMENTAL_P2P_SHARDING_TRANSFORM", "0"))
-if experimental_p2p_sharding_transform not in [0, 1, 2]:
-    raise RuntimeError(f"Expected EXPERIMENTAL_P2P_SHARDING_TRANSFORM in [0, 1, 2], found {experimental_p2p_sharding_transform}")
+experimental_sharding_transform = os.environ.get("EXPERIMENTAL_SHARDING_TRANSFORM", "greedy").upper()
+if experimental_sharding_transform not in ['REPLICATE', 'GREEDY', 'P2P']:
+    raise RuntimeError(f"Expected EXPERIMENTAL_SHARDING_TRANSFORM in ['REPLICATE', 'GREEDY', 'P2P'], found {experimental_sharding_transform}")

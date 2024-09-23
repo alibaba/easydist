@@ -12,34 +12,47 @@
 # limitations under the License.
 # ==============================================================================
 
-from collections import defaultdict
-from ctypes import cast
-from dataclasses import dataclass
-from functools import lru_cache, partial
-from itertools import permutations
-import operator
 import logging
+import operator
+from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
+from functools import lru_cache
+from itertools import permutations
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-import torch.utils._pytree as pytree
 import torch.distributed as dist
-from torch.distributed._tensor import DTensor, Replicate
-from torch.distributed._functional_collectives import _expand_group
-from torch.fx.node import Node, _get_qualified_name, map_arg
+import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor
-from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
-                                                    propagate_shape_and_sharding,
-                                                    compute_local_shape)
+from torch.distributed._functional_collectives import _expand_group
+from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed._tensor.ops.view_ops import (
+    compute_local_shape,
+    expand,
+    normalize_sizes,
+    propagate_shape_and_sharding,
+    view_groups,
+)
+from torch.fx.node import Node, map_arg
 
 import easydist.config as mdconfig
+from easydist.metashard.combination import ReduceOp
+from easydist.metashard.metair import (
+    SPMD,
+    NodeSPMDStrategy,
+    VarSPMDStrategy,
+    VarSPMDStrategyGroup,
+)
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
-from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
+from easydist.torch.utils import (
+    EDInfo,
+    EDNodeType,
+    create_meta_from_node,
+    to_torch_spmd,
+)
 from easydist.utils.testing.mock import MockDeviceMesh
-from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
-from easydist.metashard.combination import ReduceOp
 
 logger = logging.getLogger(__name__)
 
@@ -692,12 +705,12 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
     my_coordinate = spmd_mesh.get_coordinate()
     global_shape = var_.meta['val'].shape
 
-    if mdconfig.experimental_p2p_sharding_transform == 0:
+    if mdconfig.experimental_sharding_transform == 'REPLICATE':
         transform_infos = _gen_transform_infos(src_specs, tgt_specs)
-    elif mdconfig.experimental_p2p_sharding_transform == 1:
+    elif mdconfig.experimental_sharding_transform == 'GREEDY':
         transform_infos = _gen_transform_infos_greedy(src_specs, tgt_specs)
     else:
-        assert mdconfig.experimental_p2p_sharding_transform == 2
+        assert mdconfig.experimental_sharding_transform == 'P2P'
         transform_infos, src_specs = _gen_immediate_transform_infos(src_specs, tgt_specs)
 
     for i, current, target in transform_infos:
@@ -770,7 +783,7 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                     node.replace_input_with(var_, all_reduce_end_node)
                     var_ = all_reduce_end_node
 
-    if mdconfig.experimental_p2p_sharding_transform == 2 and src_specs != tgt_specs:
+    if mdconfig.experimental_sharding_transform == 'P2P' and src_specs != tgt_specs:
         with fx_module.graph.inserting_before(node):
             p2p_node = fx_module.graph.call_function(
                 do_p2p_comm_wrapper(global_shape, src_specs, tgt_specs, rank),
@@ -811,7 +824,7 @@ def override_args(node, invars_strategy):
         if shard_out is None:  # no need to reshard
             shard_out = input_dtensor_spec
         local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
-        
+
         node.update_arg(shape_argnum, local_out_shape)
 
 
@@ -844,7 +857,6 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
         elif node.op == 'call_function':
 
             # skip for create ops
-            ops_name = _get_qualified_name(node.target)
             if node.target in CREATE_ATEN_OP:
                 # TODO: only support 2d device mesh here
                 shard_env[node.name] = VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(spme_mesh.ndim)])
