@@ -1,22 +1,17 @@
-# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/GPT.py
-import argparse
+# EASYDIST_LOGLEVEL=INFO torchrun --nproc_per_node 8 examples/torch/gpt_train.py
 import copy
 import os
-from contextlib import nullcontext
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed._tensor import DeviceMesh
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import _sync_module_states
-from torch.utils.checkpoint import checkpoint
-from torch.distributed._tensor import DeviceMesh
 
 from benchmark.bench_case import GPTCase
 from benchmark.torch.model.gpt import GPT
-from easydist import easydist_setup, mdconfig
+from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import set_device_mesh
-from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
 
 
 def broadcast_module(model):
@@ -29,7 +24,7 @@ def broadcast_module(model):
     return model
 
 GPT_CASE = GPTCase(
-    num_layers=1,
+    num_layers=4,
     hidden_dim=1024,
     num_heads=32,
     seq_size=128
@@ -76,7 +71,7 @@ def train_example():
     assert torch.allclose(torch_step_1_result,
                             md_step_1_result), f"GPT model training test failed. {torch_step_1_result} {md_step_1_result}"
     assert torch.allclose(torch_step_2_result,
-                            md_step_2_result), f"GPT model training test failed."
+                            md_step_2_result), f"GPT model training test failed. {torch_step_1_result} {md_step_1_result}"
 
     print("GPT model training example pass.")
 

@@ -21,6 +21,7 @@ from easydist.utils.testing import ALL_PLATFORM
 from easydist import easydist_setup
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather(backend):
     easydist_setup(backend)
@@ -36,6 +37,7 @@ def test_gather(backend):
     assert platform.allclose(global_tensor_2, gather_dim2)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather_halo(backend):
     easydist_setup(backend)
@@ -51,6 +53,7 @@ def test_gather_halo(backend):
     assert platform.allclose(global_tensor_2, gather_halo_2)
 
 
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_gather_chunk(backend):
     easydist_setup(backend)

@@ -27,31 +27,16 @@ from torch.distributed._tensor import DeviceMesh
 
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
+from easydist.torch.utils import seed
 from easydist.torch.device_mesh import set_device_mesh
 from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE
 from easydist.torch.experimental.pp.compile_pipeline import (
     annotate_split_points,
     split_into_equal_size)
 
-from torchtext.datasets import IMDB, AG_NEWS
+from torchtext.datasets import IMDB, AG_NEWS  # pip install torchtext torchdata portalocker
 
 from transformers import BertForSequenceClassification, BertTokenizer
-
-
-def seed(seed=42):
-    # Set seed for PyTorch
-    torch.manual_seed(seed)
-    # torch.use_deterministic_algorithms(True)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # Set seed for numpy
-    np.random.seed(seed)
-    # Set seed for built-in Python
-    random.seed(seed)
-    # Set(seed) for each of the random number generators in python:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def train_bert():
@@ -63,13 +48,16 @@ def train_bert():
     torch.cuda.set_device(rank)
 
     device = torch.device('cuda')
+    set_device_mesh(
+        DeviceMesh("cuda", [0, 1, 2, 3],
+                   mesh_dim_names=["pp"]))
 
     @easydist_compile(
                   parallel_mode='pp',
                   tracing_mode="fake",
                   cuda_graph=False,
                   schedule_cls=ScheduleDAPPLE,
-                  num_chunks=4)
+                  num_chunks=16)
     def train_step(model, input_ids, attn_mask, labels, opt):
         outputs = model(input_ids, attention_mask=attn_mask)
         loss = F.cross_entropy(outputs.logits, labels)
@@ -87,19 +75,19 @@ def train_bert():
     })
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     def tokenize(x):
-        encodings =  tokenizer(x, return_tensors='pt', padding="max_length", max_length=128, truncation=True)
+        encodings =  tokenizer(x, return_tensors='pt', padding="max_length", max_length=256, truncation=True)
         return encodings['input_ids'].to(device), encodings['attention_mask'].to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, foreach=True, capturable=True)
 
-    batch_size = 64
+    batch_size = 128
 
     def get_iters():
         return iter(DataLoader(AG_NEWS(split="train"), batch_size=batch_size, shuffle=True)),\
               iter(DataLoader(AG_NEWS(split="test"), batch_size=batch_size, shuffle=True))
 
     def test(module, valid_dataloader, epoch, state_dict):
-        module.load_state_dict(state_dict)
+        module.load_state_dict(state_dict, strict=False)
         module.eval()
         module.to(device)
         correct_cnt = 0
@@ -121,35 +109,23 @@ def train_bert():
         loss_sum = 0
         for y_batch, x_batch in (tqdm(train_iter, dynamic_ncols=True)
                                  if rank == 0 else train_iter):
+            if y_batch.size(0) != batch_size:
+                continue
             input_ids, attn_mask = tokenize(x_batch)
             y_batch = y_batch.to(device)
             ret = train_step(model, input_ids, attn_mask, y_batch, optimizer)
             out, loss = ret
             all_cnt += len(out)
             preds = out.argmax(-1)
-            correct_cnt += (preds == y_batch.to(f'cuda:{rank}')).sum()
+            correct_cnt += (preds.to(device) == y_batch.to(device)).sum()
             loss_sum += loss.sum()
-        state_dict_list = train_step.compiled_func.state_dict(world_rank=0)
+        state_dict = train_step.compiled_func.state_dict()
         if rank == 0:
             print(f'epoch {epoch} train accuracy: {correct_cnt / all_cnt}, loss sum {loss_sum}, avg loss: {loss_sum / all_cnt}')
-            state_dict = {}
-            for st in state_dict_list:
-                state_dict.update(st)
             test(model, test_iter, epoch, state_dict)
         train_iter, test_iter = get_iters()
 
-
     print(f"rank {rank} peek memory: {torch.cuda.max_memory_allocated()}")
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    ckpt_dir = os.path.join(cur_dir, 'ckpt')
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    state_dict_list = train_step.compiled_func.state_dict(0)
-    if rank == 0:
-        state_dict = {}
-        for st in state_dict_list:
-            state_dict.update(st)
-        torch.save(state_dict, os.path.join(ckpt_dir, 'bert.pth'))
 
 
 if __name__ == '__main__':

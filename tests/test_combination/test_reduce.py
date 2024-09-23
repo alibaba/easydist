@@ -20,7 +20,7 @@ from easydist.metashard.combination import CombinationFunc, ReduceOp
 from easydist.utils.testing import ALL_PLATFORM
 from easydist import easydist_setup
 
-
+@pytest.mark.all_platform
 @pytest.mark.parametrize("backend", ALL_PLATFORM)
 def test_reduce(backend):
     easydist_setup(backend)

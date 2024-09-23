@@ -12,10 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import List, Union, Tuple, Any, Dict, Callable, Sequence, Optional
+from contextlib import nullcontext
+from typing import List, Union, Tuple, Any, Dict, Callable, Sequence, Optional, cast
 
 import torch
 import torch._custom_ops
+
+from easydist.torch.utils import _rematerialize_optimizer
+import torch.utils._pytree as pytree
+from torch.fx._symbolic_trace import _Patcher
+from torch.nn.utils import stateless
 '''
 The valid parameters types are: 
 dict_keys([
@@ -275,6 +281,82 @@ def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tup
 def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
     return tuple(list_after_split(ctx, output))
 
+
+
+class SplitPatcher(_Patcher):
+
+    def __init__(self, module: torch.nn.Module, optimizer: torch.optim.Optimizer):
+        super().__init__()
+        self.module = module
+        self.optimizer = optimizer
+
+    def __enter__(self):
+        patcher = super().__enter__()
+
+        orig_backward = torch.Tensor.backward
+
+        def backward_wrapper(self,
+                             gradient=None,
+                             retain_graph: bool = None,
+                             create_graph: bool = False,
+                             inputs: Optional[Sequence[torch.Tensor]] = None):
+            tensor_list = [self] + (inputs or [])
+            tensor_list = split_func_without_bw(tensor_list)
+            self, inputs = tensor_list[0], tensor_list[1:]
+            if len(inputs) == 0:
+                inputs = None
+            orig_backward(self, gradient, retain_graph, create_graph, inputs)
+            set_backward_flag(True)
+
+        patcher.patch_method(torch.Tensor, 'backward', backward_wrapper, deduplicate=False)
+
+        if self.module:
+            mod_cls = type(self.module)
+            orig_forward = mod_cls.forward
+
+            def forward_wrapper(module, *args, **kwargs):
+                ret = orig_forward(module, *args, **kwargs)
+                return ret
+
+            patcher.patch_method(mod_cls, 'forward', forward_wrapper, deduplicate=False)
+
+        if self.optimizer:
+            opt_cls = type(self.optimizer)
+            orig_step = opt_cls.step
+
+            def step_wrapper(optimizer, *args, **kwargs):
+                params = dict(self.module.named_parameters()) if self.module else {}
+                grads = {n: p.grad for n, p in params.items() if p.grad is not None}
+                named_states = {}
+                for n, p in params.items():
+                    if p in self.optimizer.state:
+                        named_states[n] = self.optimizer.state[p]
+
+                states, spec = pytree.tree_flatten((params, grads, named_states))
+
+                ctx = {}
+                states = list_before_split(ctx, states)
+                states = split_func_optimizier_step(states)
+                states = list_after_split(ctx, states)
+                params, split_grads, named_states = pytree.tree_unflatten(states, spec)
+
+                for n, p in params.items():  # need to split on grads
+                    p.grad = split_grads[n]
+
+                with stateless._reparametrize_module(
+                        cast(torch.nn.Module, self.module), params, tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
+                            optimizer, named_states, params) if optimizer else nullcontext():
+                    orig_step(optimizer, *args, **kwargs)
+
+                set_updated_params_states(params, named_states)
+                set_step_flag(True)
+
+            patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)
+
+        return patcher
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return super().__exit__(exc_type, exc_val, exc_tb)
 
 if __name__ == '__main__':
     a = torch.rand(10, 10, requires_grad=True)

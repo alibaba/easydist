@@ -12,25 +12,47 @@
 # limitations under the License.
 # ==============================================================================
 
-import operator
 import logging
-from typing import Dict, List, Tuple
+import operator
+from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass
+from functools import lru_cache
+from itertools import permutations
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.utils._pytree as pytree
-from torch.distributed._tensor import DTensor, Replicate
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed._functional_collectives import _expand_group
-from torch.fx.node import Node, _get_qualified_name, map_arg
-from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
-                                                    propagate_shape_and_sharding,
-                                                    compute_local_shape)
+from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed._tensor.ops.view_ops import (
+    compute_local_shape,
+    expand,
+    normalize_sizes,
+    propagate_shape_and_sharding,
+    view_groups,
+)
+from torch.fx.node import Node, map_arg
 
+import easydist.config as mdconfig
+from easydist.metashard.combination import ReduceOp
+from easydist.metashard.metair import (
+    SPMD,
+    NodeSPMDStrategy,
+    VarSPMDStrategy,
+    VarSPMDStrategyGroup,
+)
 from easydist.torch.device_mesh import get_device_mesh
 from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
-from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
-from easydist.utils.testing import MockDeviceMesh
-from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
-from easydist.metashard.combination import ReduceOp
+from easydist.torch.utils import (
+    EDInfo,
+    EDNodeType,
+    create_meta_from_node,
+    to_torch_spmd,
+)
+from easydist.utils.testing.mock import MockDeviceMesh
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +323,343 @@ def _replicate_then_shard(tup: Tuple[int, SPMD, SPMD]) -> int:
         return 0
 
 
+@dataclass
+class Partition:
+    '''
+        Tensor partition from a logical view, and the rank that holds it.
+    '''
+    start_coord: Tuple[int, ...]  # start coord of this partition
+    end_coord: Tuple[int, ...]  # end coord of this partition
+    rank: int  # rank that hold this partition
+    partial_coord: Tuple[int, ...]  # partial coord of this partition
+
+    def __post_init__(self):
+        self._hash: Optional[int] = None
+
+    def _hash_impl(self) -> int:
+        return hash((self.start_coord, self.end_coord, self.rank, self.partial_coord))
+
+    def __hash__(self) -> int:
+        # We lazily cache the spec to avoid recomputing the hash upon each
+        # use, where we make sure to update the hash when the `tensor_meta`
+        # changes by overriding `__setattr__`. This must be lazy so that Dynamo
+        # does not try to hash non-singleton `SymInt`s for the stride.
+        if self._hash is None:
+            self._hash = self._hash_impl()
+        return self._hash
+
+    def __repr__(self) -> str:
+        return f"{{{self.start_coord}->{self.end_coord} partial {self.partial_coord} on rank{self.rank}}}"
+
+    def shard(self, tensor_dim: int, shard_num: int, shard_idx: int) -> "Partition":
+        block_size = (self.end_coord[tensor_dim] - self.start_coord[tensor_dim] + shard_num - 1) // shard_num
+        return Partition(
+            self.start_coord[:tensor_dim] + (min(self.start_coord[tensor_dim] + block_size * shard_idx, self.end_coord[tensor_dim]),) + self.start_coord[tensor_dim+1:],
+            self.end_coord[:tensor_dim] + (min(self.start_coord[tensor_dim] + block_size * (shard_idx + 1), self.end_coord[tensor_dim]),) + self.end_coord[tensor_dim+1:],
+            self.rank,
+            self.partial_coord
+        )
+
+    def partial(self, new_partial_idx: int) -> "Partition":
+        return Partition(self.start_coord, self.end_coord, self.rank, self.partial_coord + (new_partial_idx,))
+
+    @staticmethod
+    def from_tensor_spec(placements: VarSPMDStrategy, global_shape: torch.Size) -> Tuple["Partition"]:
+        tensor_mesh = get_device_mesh('spmd').mesh
+
+        unravel = torch.unravel_index(torch.arange(tensor_mesh.numel()), tensor_mesh.shape)
+        rank_to_coord = []
+        for i in range(unravel[0].shape[0]):
+            rank_to_coord.append(
+                tuple(unravel[j][i].item() for j in range(tensor_mesh.ndim))
+            )
+        partitions = [
+            Partition((0,) * len(global_shape), tuple(global_shape), rank, tuple()) for rank in tensor_mesh.flatten().tolist()
+        ]
+
+        for mesh_dim, placement in enumerate(placements):
+            if placement.is_shard():
+                tensor_dim = placement.args['dim']
+                shard_num = tensor_mesh.size(mesh_dim)
+                for partition in partitions:
+                    partitions[partition.rank] = partition.shard(tensor_dim, shard_num, rank_to_coord[partition.rank][mesh_dim])
+            elif placement.is_partial():
+                for partition in partitions:
+                    partitions[partition.rank] = partition.partial(rank_to_coord[partition.rank][mesh_dim])
+        return tuple(partitions)
+
+    def from_src(self, src_partition: "Partition") -> Optional["Partition"]:
+
+        start_coord = tuple(max(s1, s2) for s1, s2 in zip(self.start_coord, src_partition.start_coord))
+        end_coord = tuple(min(e1, e2) for e1, e2 in zip(self.end_coord, src_partition.end_coord))
+        if any(s >= e for s, e in zip(start_coord, end_coord)) or src_partition.partial_coord != self.partial_coord:
+            return None
+
+        return Partition(start_coord, end_coord, src_partition.rank, src_partition.partial_coord)
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def gen_recv_meta(src_partitions: Tuple["Partition"], tgt_partitions: Tuple["Partition"]) -> Dict[int, List["Partition"]]:
+        recv_meta = defaultdict(list)
+        for tgt in tgt_partitions:
+            cache = defaultdict(int)
+            # TODO better load balance strategy
+            for src in sorted(src_partitions, key=lambda x: abs(x.rank - tgt.rank)):
+                intersection = tgt.from_src(src)
+                if intersection is None:
+                    continue
+                cache_str = f"{intersection.start_coord}{intersection.end_coord}"
+                if cache_str not in cache:
+                    recv_meta[tgt.rank].append(intersection)
+                cache[cache_str] += 1
+
+        return recv_meta
+
+    @staticmethod
+    def gen_p2p_utils(src_tensor: torch.Tensor, rank: int, local_src_partition: "Partition", local_dst_partition: "Partition", recv_meta: Dict[int, List["Partition"]]) -> Tuple[List[dist.P2POp], List[dist.P2POp], torch.Tensor, List[Tuple[slice]]]:
+        send_ops = []
+        recv_ops = []
+        recv_slices = []
+        buffer_shape = tuple(e - s for s, e in zip(local_dst_partition.start_coord, local_dst_partition.end_coord))
+
+        recv_buffer = torch.empty(buffer_shape, dtype=src_tensor.dtype, device=src_tensor.device)
+
+        for recv_rank, intersections in recv_meta.items():
+            for intersection in intersections:
+                send_rank = intersection.rank
+                src_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_src_partition.start_coord, intersection.start_coord, intersection.end_coord))
+                tgt_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_dst_partition.start_coord, intersection.start_coord, intersection.end_coord))
+
+                if rank == send_rank == recv_rank:
+                    # assign the static intersection to the buffer
+                    recv_buffer[tgt_slice] = src_tensor[src_slice]
+                    continue
+
+                if rank == send_rank:
+                    src_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_src_partition.start_coord, intersection.start_coord, intersection.end_coord))
+                    # TODO: possible to eliminate contiguous call to reduce mem usage?
+                    send_ops.append(dist.P2POp(dist.isend, src_tensor[src_slice].contiguous(), recv_rank))
+
+                if rank == recv_rank:
+                    tgt_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_dst_partition.start_coord, intersection.start_coord, intersection.end_coord))
+                    # TODO: possible to eliminate contiguous call to reduce mem usage?
+                    recv_ops.append(dist.P2POp(dist.irecv, recv_buffer[tgt_slice].contiguous(), send_rank))
+                    recv_slices.append(tgt_slice)
+
+        # TODO: handle the case where there is no communication, currently sending a dummy tensor
+        if len(send_ops + recv_ops) == 0:
+            # NOTE: recv_buffer, recv_slices will still be empty
+            dummy_tensor = torch.zeros(1, dtype=src_tensor.dtype, device=src_tensor.device)
+            send_ops.append(dist.P2POp(dist.isend, dummy_tensor, rank))
+            recv_ops.append(dist.P2POp(dist.irecv, dummy_tensor, rank))
+
+        return send_ops, recv_ops, recv_buffer, recv_slices
+
+    @staticmethod
+    def fill_recv_buffer(recv_ops: List[dist.P2POp], recv_buffer: torch.Tensor, recv_slices: List[Tuple[slice]]) -> torch.Tensor:
+        for op, slice in zip(recv_ops, recv_slices):
+            if op.op is not dist.irecv:
+                raise ValueError("recv_ops must be irecv")
+            recv_buffer[slice] = op.tensor
+
+        return recv_buffer
+
+
+def _gen_immediate_transform_infos(
+    src_placements: VarSPMDStrategy,
+    dst_placements: VarSPMDStrategy,
+) -> Tuple[List[Tuple[int, SPMD, SPMD]], VarSPMDStrategy]:
+    """
+    Similar to _gen_transform_infos, but only perform simple transformation by dim if it can be achieved by one single collective operation.
+    Consider device dim k:
+        1. R -> R: No-op
+        2. R -> S(i): Safe when num of S(i) are the same in cur_spec[:k] and dst_spec[:k] and no S(i) in cur_spec[k+1:]
+        3. R -> P: Always safe
+
+        4. S(i) -> R: Safe when no S(i) in cur_spec[k+1:]
+        5. S(i) -> S(j): Safe when S(i) meets 4 and S(j) meets 2
+        6. S(i) -> P: Used as S(i) -> R during backward
+
+        7. P -> R: Always safe
+        8. P -> S(i): P -> R -> S(i), safe when 7 and 2 are satisfied
+        9. P -> P: No-op
+
+        10. if P -> S(i) is not executed, do P -> R since P2P cannot handle reduce_scatter
+    """
+    cur_placements = deepcopy(src_placements.var_spmd_strategy)
+    transform_infos: List[Tuple[int, SPMD, SPMD]] = []
+
+    def count_shards(placements: List[SPMD], shard: SPMD) -> int:
+        return sum(1 for p in placements if p.is_shard() and p.args['dim'] == shard.args['dim'])
+
+    max_immediate_transform_cnt = 0
+    best_transform_infos = []
+    best_cur_placements = deepcopy(list(src_placements))
+
+    for seq in permutations(reversed(range(len(src_placements)))):
+        immediate_transform_cnt = 0
+        cur_placements = deepcopy(list(src_placements))
+        transform_infos = []
+        def to_shard(k: int, tgt_shard: SPMD):
+            assert tgt_shard.is_shard()
+            return count_shards(cur_placements[:k], tgt_shard) == count_shards(cur_placements[:k], tgt_shard) and count_shards(cur_placements[k + 1:], tgt_shard) == 0
+
+        def from_shard(k: int, cur_shard: SPMD):
+            assert cur_shard.is_shard()
+            return count_shards(cur_placements[k + 1:], cur_shard) == 0
+
+        for k in seq:
+            cur = cur_placements[k]
+            tgt = dst_placements[k]
+
+            if cur == tgt:
+                continue
+
+            if cur.is_replicate():
+                if tgt.is_shard():
+                    if to_shard(k, tgt):
+                        transform_infos.append(
+                            (k, cur, tgt)
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_partial():
+                    transform_infos.append(
+                        (k, cur, tgt)
+                    )
+                    cur_placements[k] = tgt
+                    immediate_transform_cnt += 1
+            elif cur.is_shard():
+                if tgt.is_replicate():
+                    if from_shard(k, cur):
+                        transform_infos.append(
+                            (k, cur, tgt)
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_shard():
+                    if cur.args['dim'] != tgt.args['dim'] and from_shard(k, cur) and to_shard(k, tgt):
+                        transform_infos.append(
+                            (k, cur, tgt)
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_partial():
+                    if from_shard(k, cur):
+                        transform_infos.append(
+                            (k, cur, tgt)
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+            else:
+                if tgt.is_replicate():
+                    transform_infos.append(
+                        (k, cur, tgt)
+                    )
+                    cur_placements[k] = tgt
+                    immediate_transform_cnt += 1
+                elif tgt.is_shard():
+                    if to_shard(k, tgt):
+                        transform_infos.append(
+                            (k, cur, tgt)
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+
+        if immediate_transform_cnt > max_immediate_transform_cnt:
+            max_immediate_transform_cnt = immediate_transform_cnt
+            best_transform_infos = transform_infos
+            best_cur_placements = cur_placements
+
+    # transform rest P -> S to R -> S since P2P cannot handle reduce_scatter
+    for k, (cur, tgt) in enumerate(zip(best_cur_placements, dst_placements)):
+        if cur.is_partial() and tgt.is_shard():
+            tgt = SPMD(SPMD.REPLICATE)
+            best_transform_infos.append(
+                (k, cur, tgt),
+            )
+            best_cur_placements[k] = tgt
+
+    return best_transform_infos, VarSPMDStrategy(*best_cur_placements)
+
+
+def do_p2p_comm_wrapper(global_shape: torch.Size, src_placements: VarSPMDStrategy, tgt_placements: VarSPMDStrategy, rank: int) -> Callable:
+    src_partitions = Partition.from_tensor_spec(src_placements, global_shape)
+    tgt_partitions = Partition.from_tensor_spec(tgt_placements, global_shape)
+    recv_info = Partition.gen_recv_meta(src_partitions, tgt_partitions)
+
+    def inner(local_tensor: torch.Tensor) -> torch.Tensor:
+        if isinstance(local_tensor, FakeTensor):
+            local_tensor = torch.empty(local_tensor.shape, dtype=local_tensor.dtype, device=local_tensor.device)
+            assert not isinstance(local_tensor, FakeTensor)
+
+        send_ops, recv_ops, local_tensor, recv_slices = Partition.gen_p2p_utils(local_tensor, rank, src_partitions[rank], tgt_partitions[rank], recv_info)
+        works = dist.batch_isend_irecv(send_ops + recv_ops)
+        for work in works:
+            work.wait()
+        local_tensor = Partition.fill_recv_buffer(recv_ops, local_tensor, recv_slices)
+
+        return local_tensor
+    return inner
+
+
+def _gen_transform_infos_greedy(
+    src_placements: VarSPMDStrategy,
+    dst_placements: VarSPMDStrategy,
+) -> List[Tuple[int, SPMD, SPMD]]:
+    cur_placements = deepcopy(src_placements.var_spmd_strategy)
+    transform_infos: List[Tuple[int, SPMD, SPMD]] = []
+
+    for i in reversed(range(len(cur_placements))):
+        cur = cur_placements[i]
+        dst = dst_placements[i]
+
+        if dst.is_shard():
+            current_mesh_sharding, target_mesh_sharding = [], []
+            for j, (s, p) in enumerate(zip(cur_placements, dst_placements)):
+                if j >= i:
+                    break
+                if s.is_shard() and s.args['dim'] == dst.args['dim']:
+                    current_mesh_sharding.append(j)
+                if p.is_shard() and p.args['dim'] == dst.args['dim']:
+                    target_mesh_sharding.append(j)
+
+            if current_mesh_sharding != target_mesh_sharding:
+                dst = SPMD(SPMD.REPLICATE)
+
+            if cur != dst:
+                transform_infos.append((i, cur, dst))
+                cur_placements[i] = dst
+
+    for i, (cur, dst) in enumerate(zip(cur_placements, dst_placements)):
+        if cur != dst:
+            transform_infos.append(
+                (i, cur, dst)
+            )
+            cur_placements[i] = dst
+
+    return transform_infos
+
+def _replicate_then_shard(tup: Tuple[int, SPMD, SPMD]) -> int:
+    """
+    This is a helper function to allow reordering _TransformInfo list. The high level
+    idea is that we want to reorder the sharding redistributions so that the DTensor
+    redistribution is consistent with its full tensor. This is built on top of two simple
+    assumptions:
+    1. Replication happens from inner to outer dimension. i.e. Shard -> Replicate
+    2. Sharding happens from outer to inner dimension, i.e. Replicate -> Shard
+
+    So we always put the replication first and put sharding later.
+    """
+    mesh_dim, src, dst = tup
+    if (dst.is_replicate() or dst.is_partial()) and src.is_shard():
+        return -mesh_dim
+    elif (src.is_replicate() or src.is_partial()) and dst.is_shard():
+        return mesh_dim
+    else:
+        return 0
+
+
 def _gen_transform_infos(
     src_placements: List[SPMD],
     dst_placements: List[SPMD],
@@ -333,7 +692,6 @@ def _gen_transform_infos(
     transform_infos.sort(key=_replicate_then_shard)
     return transform_infos
 
-
 def insert_comm_node(fx_module: torch.fx.GraphModule,
                      node,
                      var_,
@@ -343,11 +701,19 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
     spmd_mesh = get_device_mesh('spmd')
     spmd_axis_namelist = get_device_mesh()._binding['spmd']
+    rank = spmd_mesh.get_rank()
     my_coordinate = spmd_mesh.get_coordinate()
+    global_shape = var_.meta['val'].shape
 
-    sorted_placements = _gen_transform_infos(src_specs, tgt_specs)
+    if mdconfig.experimental_sharding_transform == 'REPLICATE':
+        transform_infos = _gen_transform_infos(src_specs, tgt_specs)
+    elif mdconfig.experimental_sharding_transform == 'GREEDY':
+        transform_infos = _gen_transform_infos_greedy(src_specs, tgt_specs)
+    else:
+        assert mdconfig.experimental_sharding_transform == 'P2P'
+        transform_infos, src_specs = _gen_immediate_transform_infos(src_specs, tgt_specs)
 
-    for i, current, target in sorted_placements:
+    for i, current, target in transform_infos:
         num_chunks = spmd_mesh.size(mesh_dim=i)
         spmd_axis_name = spmd_axis_namelist[i]
 
@@ -417,6 +783,15 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                     node.replace_input_with(var_, all_reduce_end_node)
                     var_ = all_reduce_end_node
 
+    if mdconfig.experimental_sharding_transform == 'P2P' and src_specs != tgt_specs:
+        with fx_module.graph.inserting_before(node):
+            p2p_node = fx_module.graph.call_function(
+                do_p2p_comm_wrapper(global_shape, src_specs, tgt_specs, rank),
+                args=(var_,)
+            )
+            node.replace_input_with(var_, p2p_node)
+            var_ = p2p_node
+
     if copy_innode is not None:
         with fx_module.graph.inserting_before(node):
             copy_node = fx_module.graph.call_function(copy_wrapper, args=(copy_innode, var_))
@@ -449,7 +824,7 @@ def override_args(node, invars_strategy):
         if shard_out is None:  # no need to reshard
             shard_out = input_dtensor_spec
         local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
-        
+
         node.update_arg(shape_argnum, local_out_shape)
 
 
@@ -482,7 +857,6 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
         elif node.op == 'call_function':
 
             # skip for create ops
-            ops_name = _get_qualified_name(node.target)
             if node.target in CREATE_ATEN_OP:
                 # TODO: only support 2d device mesh here
                 shard_env[node.name] = VarSPMDStrategy(*[SPMD(SPMD.REPLICATE) for _ in range(spme_mesh.ndim)])
@@ -554,7 +928,6 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                             copy_innode=all_placeholder_node[in_node.name])
 
     fx_module.recompile()
-
 
     # (TODO) move this part out of this pass
     for node in fx_module.graph.nodes:

@@ -12,26 +12,31 @@
 # limitations under the License.
 # ==============================================================================
 
-from collections import defaultdict
 import logging
 import operator
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from functools import reduce
-from tkinter import Place
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
 import torch.fx as fx
-from torch.profiler import record_function
-from torch._subclasses.fake_tensor import FakeTensor
 import torch.utils._pytree as pytree
+from torch._subclasses.fake_tensor import FakeTensor
 
-from easydist.torch.experimental.pp.compile_pipeline import (CompiledMeta, CompiledStage,
-                                                             graph_outputs_to_func_outputs)
-from easydist.torch.experimental.pp.microbatch import (DEFAULT_CHUNK_DIM, CustomReducer,
-                                                       TensorChunkSpec, merge_chunks,
-                                                       split_args_kwargs_into_chunks)
+from easydist.torch.experimental.pp.compile_pipeline import (
+    CompiledMeta,
+    CompiledStage,
+    StateType,
+)
+from easydist.torch.experimental.pp.microbatch import (
+    DEFAULT_CHUNK_DIM,
+    CustomReducer,
+    TensorChunkSpec,
+    merge_chunks,
+    split_args_kwargs_into_chunks,
+)
 from easydist.torch.init_helper import materialize_zero
 
 logger = logging.getLogger(__name__)
@@ -91,13 +96,13 @@ class RuntimeMixin(ABC):
     @abstractmethod
     def backward_compute_one_chunk(self) -> None:
         raise NotImplementedError
-    
+
     @abstractmethod
     def backward_send_one_chunk(self) -> List[dist.Work]:
         raise NotImplementedError
 
     @abstractmethod
-    def merge_output_chunks(self) -> Dict[str, Any]:
+    def merge_and_assign_chunked_grads(self) -> Dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -130,7 +135,6 @@ class PipelineStage(RuntimeMixin):
 
         self.pp_rank = dist.get_rank(pp_group)
         self.num_stages = compiled_meta.nstages
-        self.node_to_stage_idx = compiled_meta.node_to_stage_idx  # TODO refactor this mapping?
         self.graph = sharded_graph
         self.return_to_all_stages = return_to_all_stages
         self.accumulate_grads_inplace = accumulate_grads_inplace
@@ -141,7 +145,6 @@ class PipelineStage(RuntimeMixin):
 
         # communication infra
         self._init_communication(node_metas)
-        # self._init_batch_isend_irecv()
 
         # runtime states
         self._init_runtime_states()
@@ -200,24 +203,23 @@ class PipelineStage(RuntimeMixin):
     def _init_returns_nodes_spec(self, compiled_meta, returns_chunk_spec):
         returns_nodes_chunk_spec = {}
         returns_chunk_spec = returns_chunk_spec or [TensorChunkSpec(DEFAULT_CHUNK_DIM)] * len(
-            compiled_meta.returns_nodes_flatten)
+            compiled_meta.return_nodes_flatten)
         returns_chunk_spec_flatten, _ = pytree.tree_flatten(returns_chunk_spec)
-        assert len(returns_chunk_spec_flatten) == len(compiled_meta.returns_nodes_flatten)
-        for name, spec in zip(compiled_meta.returns_nodes_flatten, returns_chunk_spec_flatten):
+        assert len(returns_chunk_spec_flatten) == len(compiled_meta.return_nodes_flatten)
+        for name, spec in zip(compiled_meta.return_nodes_flatten, returns_chunk_spec_flatten):
             returns_nodes_chunk_spec[name] = spec
 
         self.returns_nodes_chunk_spec = returns_nodes_chunk_spec
 
     def _init_communication(self, node_metas):
         """
-        Create send/recv infrastructures for activations (during forward) and
-        gradients (during backward)
+        Create send/recv infrastructures for activations (during forward) and gradients (during backward)
         """
         # Create stage id to group rank mapping
         # In interleaved case, `group_rank` is stage index % group size.
         stage_index_to_pp_rank: Dict[int, int] = {}
         pg_world_size = dist.get_world_size(self.pp_group)
-        assert pg_world_size == self.num_stages, "Currently only support 1 rank per stage"  # TODO @botbw
+        assert pg_world_size == self.num_stages, "Currently only support one stage per rank"  # TODO @botbw
         for i in range(self.num_stages):
             # We only support wrapped-around interleaving
             peer_rank = i % pg_world_size
@@ -236,63 +238,50 @@ class PipelineStage(RuntimeMixin):
                                                               is_forward=False)
             self.bw_grad_send_info = self._create_send_info(self.bw_node, is_forward=False)
 
-    def _init_batch_isend_irecv(self):
-        '''
-        See batch_isend_irecv in torch.distributed for more details:
-            .. note:: Note that when this API is used with the NCCL PG backend, users must set
-                the current GPU device with `torch.cuda.set_device`, otherwise it will
-                lead to unexpected hang issues.
-
-            In addition, if this API is the first collective call in the ``group``
-            passed to ``dist.P2POp``, all ranks of the ``group`` must participate in
-            this API call; otherwise, the behavior is undefined. If this API call is
-            not the first collective call in the ``group``, batched P2P operations
-            involving only a subset of ranks of the ``group`` are allowed.
-        '''
-        torch.cuda.set_device(self.device)
-        succeesor = self.stage_index_to_group_rank[(self.stage_idx + 1) % self.num_stages]
-        succeesor_global = succeesor if self.pp_group is None else dist.get_global_rank(
-            self.pp_group, succeesor)
-        succeesor_recv = torch.zeros(1, device=self.device)
-        ancessor = self.stage_index_to_group_rank[(self.stage_idx - 1) % self.num_stages]
-        ancessor_global = ancessor if self.pp_group is None else dist.get_global_rank(
-            self.pp_group, ancessor)
-        ancessor_recv = torch.zeros(1, device=self.device)
-        send_tensor = torch.zeros(1, device=self.device) + self.stage_idx
-        ops = [
-            dist.P2POp(dist.isend, send_tensor, succeesor_global, self.pp_group),
-            dist.P2POp(dist.isend, send_tensor, ancessor_global, self.pp_group),
-            dist.P2POp(dist.irecv, succeesor_recv, succeesor_global, self.pp_group),
-            dist.P2POp(dist.irecv, ancessor_recv, ancessor_global, self.pp_group)
-        ]
-        works = dist.batch_isend_irecv(ops)
-        for work in works:
-            work.wait()
-        assert succeesor_recv.item() == (self.stage_idx + 1) % self.num_stages
-        assert ancessor_recv.item() == (self.stage_idx - 1) % self.num_stages
-
     def _init_runtime_states(self):
         self.cur_fw_send_chunk = None
         self.cur_bw_send_chunk = None
         self.cur_fw_chunk_id = 0
         self.cur_bw_chunk_id = 0
-        self.cur_step_chunk_id = 0
         self.kwargs_chunks = [{} for _ in range(self.num_chunks)]
-        self.activations_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
-        self.outputs_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
-        self.outputs_batch = {}  # Activation send requests of all chunk
+        self.saved_tensors_bw_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
+        self.returns_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
+        self.grads_chunks: List[Dict[str, Any]] = [{} for _ in range(self.num_chunks)]
         if self.accumulate_grads_inplace:
             self.grads = {}
 
+    def reset_and_check_runtime_states(self):
+
+        def clear_single(chunks_list):
+            for chunk in chunks_list:
+                chunk.clear()
+        def check_single(chunks_list):
+            for chunk in chunks_list:
+                assert len(chunk) == 0
+
+        self.cur_fw_send_chunk = None
+        self.cur_bw_send_chunk = None
+        self.cur_fw_chunk_id = 0
+        self.cur_bw_chunk_id = 0
+
+        clear_single(self.kwargs_chunks)
+
+        check_single(self.returns_chunks)
+        check_single(self.saved_tensors_bw_chunks)
+        check_single(self.grads_chunks)
+
+        if self.accumulate_grads_inplace:
+            assert len(self.grads) == 0
+
     def _create_send_info(self, node: fx.Node,
-                          is_forward: bool) -> Dict[int, List[str]]:  # TODO @botbw: simplify
+                          is_forward: bool) -> Dict[int, List[str]]:
         to_sort = []
         for user in node.users:
             assert user.target is operator.getitem, "Output must be a dict"
             out_str = user.args[-1]
             assert isinstance(out_str, str)
             for gi_user in user.users:
-                dst_rank = self.node_to_stage_idx[gi_user.name]
+                dst_rank = gi_user.meta['stage_idx']
                 to_sort.append((dst_rank, out_str))
         if is_forward:
             to_sort.sort(key=lambda x:
@@ -329,15 +318,15 @@ class PipelineStage(RuntimeMixin):
         is_forward: bool,
     ) -> Dict[int, List[Placeholder]]:
         to_sort = []
-        for _, node in node.kwargs.items():
-            if node.op == "placeholder":
-                to_sort.append((-1, node.name))
+        for gi_input in node.kwargs.values():
+            if gi_input.op == "placeholder":
+                to_sort.append((-1, gi_input.name))
                 continue
-            example_value = node_metas[node.name]["val"]
-            src_rank = self.node_to_stage_idx[node.name]
+            example_value = node_metas[gi_input.name]["val"]
+            src_rank = gi_input.args[0].meta['stage_idx']
             global_src_rank = src_rank if self.pp_group is None else dist.get_global_rank(
                 self.pp_group, src_rank)
-            to_sort.append((global_src_rank, node.name, example_value))
+            to_sort.append((global_src_rank, gi_input.name, example_value))
 
         if is_forward:
             # receive lower rank first and in alphabetical order
@@ -379,7 +368,7 @@ class PipelineStage(RuntimeMixin):
         for rank, ph_list in recv_info.items():
             for ph in ph_list:
                 if isinstance(ph, RecevPlaceholder):
-                    composite_kwargs[ph.input_name] = ph.buffer
+                    composite_kwargs[ph.input_name] = ph.buffer.clone()  # NOTE: need clone here so that all micro-batches use different memory
                 else:
                     composite_kwargs[ph.input_name] = chunk_kwargs[ph.input_name]
 
@@ -403,8 +392,10 @@ class PipelineStage(RuntimeMixin):
 
         # Compute forward
         self.cur_fw_send_chunk = self.compiled_stage.forward(
-            self.activations_chunks[self.cur_fw_chunk_id],
-            self.outputs_chunks[self.cur_fw_chunk_id], **composite_kwargs_chunk)
+            self.saved_tensors_bw_chunks[self.cur_fw_chunk_id],
+            self.returns_chunks[self.cur_fw_chunk_id],
+            **composite_kwargs_chunk
+        )
         # Update runtime states
         self.cur_fw_chunk_id += 1
 
@@ -434,20 +425,19 @@ class PipelineStage(RuntimeMixin):
 
         # Compute backward
         self.cur_bw_send_chunk = self.compiled_stage.backward(
-            self.activations_chunks[self.cur_bw_chunk_id],
-            self.outputs_chunks[self.cur_bw_chunk_id], **composite_kwargs_chunk)
+            self.saved_tensors_bw_chunks[self.cur_bw_chunk_id],
+            self.grads_chunks[self.cur_bw_chunk_id],
+            **composite_kwargs_chunk
+        )
+
         if self.accumulate_grads_inplace:
-            grads_nodes = dict.fromkeys(self.compiled_meta.input_grads_unflatten.values())
-            to_pop = []
-            for k, v in self.outputs_chunks[self.cur_bw_chunk_id].items():
-                if k in grads_nodes:
-                    to_pop.append(k)
-                    if k in self.grads:
-                        self.grads[k] += v
-                    else:
-                        self.grads[k] = v
-            for k in to_pop:
-                self.outputs_chunks[self.cur_bw_chunk_id].pop(k)
+            for grad_node, grad in self.grads_chunks[self.cur_bw_chunk_id].items():
+                if grad_node in self.grads:
+                    self.grads[grad_node].add_(grad)
+                else:
+                    self.grads[grad_node] = grad
+            self.grads_chunks[self.cur_bw_chunk_id].clear()
+
         # Update runtime states
         self.cur_bw_chunk_id += 1
 
@@ -460,25 +450,10 @@ class PipelineStage(RuntimeMixin):
         return reqs
 
     def step(self):
-        self.compiled_stage.step(self.outputs_batch)
+        self.compiled_stage.step(self.grads)
 
-    def clear_runtime_states(self):
-        self.cur_fw_send_chunk = None
-        self.cur_bw_send_chunk = None
-        self.cur_fw_chunk_id = 0
-        self.cur_bw_chunk_id = 0
-        self.cur_step_chunk_id = 0
-        # Caching chunk outputs for final output merge or reduction
-        for kwargs_chunk in self.kwargs_chunks:
-            kwargs_chunk.clear()
-        for act_chunk in self.activations_chunks:
-            assert len(act_chunk) == 0, "Activations should be cleared"
-        # self.activations_chunks.clear()
-        for outputs_chunk in self.outputs_chunks:
-            outputs_chunk.clear()
-        self.outputs_batch.clear()
-        if self.accumulate_grads_inplace:
-            self.grads.clear()
+        for p in self.compiled_stage.fw_gm.node_states[StateType.PARAMS].values():
+            p.grad = None
 
     def split_input_kwargs(self, kwargs):
         return split_args_kwargs_into_chunks(
@@ -490,55 +465,77 @@ class PipelineStage(RuntimeMixin):
         )[1]
 
     @torch.no_grad
-    def merge_output_chunks(self) -> Dict[str, Any]:
-        params_nodes = dict.fromkeys(self.compiled_meta.output_params_nodes_unflatten.values())
-        buffers_nodes = dict.fromkeys(self.compiled_meta.output_buffers_nodes_unflatten.values())
-        optimstates_nodes = dict.fromkeys(self.compiled_meta.output_optimstates_nodes_flatten)
-        input_grads_nodes = dict.fromkeys(self.compiled_meta.input_grads_unflatten.values())
-        returns_names_flatten = dict.fromkeys(self.compiled_meta.returns_nodes_flatten)
+    def merge_and_assign_chunked_grads(self) -> None:
+        if not self.accumulate_grads_inplace:
+            self.grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, self.grads_chunks)
+            for chunk in self.grads_chunks:
+                chunk.clear()
 
-        params, buffers, optimstates, grads, rets = {}, {}, {}, [], []
-        for chunk in self.outputs_chunks:
-            grads_chunk, rets_chunk = {}, {node_name: None for node_name in returns_names_flatten}
-            for node_name, tensor in chunk.items():
-                if node_name in params_nodes:
-                    params[node_name] = tensor
-                elif node_name in buffers_nodes:
-                    buffers[node_name] = tensor
-                elif node_name in optimstates_nodes:
-                    optimstates[node_name] = tensor
-                elif node_name in input_grads_nodes:
-                    if not self.accumulate_grads_inplace:
-                        grads_chunk[node_name] = tensor
-                elif node_name in returns_names_flatten:
-                    rets_chunk[node_name] = tensor
-                else:
-                    raise RuntimeError(f"Unknown output {node_name}")
+        if self.step_node is not None:
+            for grad_name, grad in self.grads.items():
+                self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
+                    self.compiled_meta.input_node_to_step_input_grads.inv_get(grad_name)
+                ].grad = grad
+        else:
+            for grad_name, grad in self.grads.items():
+                self.compiled_stage.fw_gm.node_states[StateType.PARAMS][
+                    self.compiled_meta.input_params_map.get(self.compiled_meta.output_grads_map.inv_get(grad_name))
+                ].grad = grad
+            self.grads.clear()  # no step gm, assign grads and clear it
+
+    @torch.no_grad
+    def merge_chunked_returns(self) -> Tuple[Any, ...]:
+        for chunk in self.returns_chunks:
+            for node_name in self.returns_nodes_chunk_spec:
+                chunk[node_name] = chunk.get(node_name, None)
+
+        returns = merge_chunks(self.returns_chunks, self.returns_nodes_chunk_spec)
+
+        for chunk in self.returns_chunks:
             chunk.clear()
-            grads.append(grads_chunk)
-            rets.append(rets_chunk)
 
-        rets = merge_chunks(rets, self.returns_nodes_chunk_spec)
-        if self.accumulate_grads_inplace:
-            grads = self.grads
-        else:
-            grads = reduce(lambda a, b: {k: torch.add(a[k], b[k]) for k in a}, grads)
+        returns_all_gather = [None for _ in range(self.num_stages)]
+        dist.all_gather_object(returns_all_gather, returns, group=self.pp_group)
 
-        self.outputs_batch.update({**params, **buffers, **optimstates, **grads, **rets})
+        returns_dict = {}
+        for returns in returns_all_gather:
+            for k, v, in returns.items():
+                if v is not None:
+                    returns_dict[k] = v
+        return_tensors = [returns_dict[node_name] for node_name in self.compiled_meta.return_nodes_flatten]
 
-        return self.outputs_batch
+        return pytree.tree_unflatten(return_tensors, self.compiled_meta.return_nodes_spec)
 
-    def optimstate_dict(self, all_gather=False):
+    def _all_gather_inner(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        state_dicts = [None for _ in range(self.num_stages)]
+        dist.all_gather_object(state_dicts,
+                            state_dict,
+                            group=self.pp_group)
+        return reduce(lambda a, b: {**a, **b}, state_dicts)
+
+    def _optimizer_state_dict(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage._optimizer_state_dict()
         if all_gather:
-            return self._all_gather_optimstate_dict()
-        else:
-            return self.compiled_stage.optimizer_state_dict()
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
 
-    def state_dict(self, all_gather=False):
+    def state_dict(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.state_dict()
         if all_gather:
-            return self._all_gather_state_dict()
-        else:
-            return self.compiled_stage.state_dict()
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
+
+    def named_parameters(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.named_parameters()
+        if all_gather:
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
+
+    def named_buffers(self, all_gather=True) -> Dict[str, Any]:
+        state_dict = self.compiled_stage.named_buffers()
+        if all_gather:
+            state_dict = self._all_gather_inner(state_dict)
+        return state_dict
 
     def load_state_dict(self, state_dict, strict=True):
         self.compiled_stage.load_state_dict(state_dict, strict=strict)
@@ -546,46 +543,10 @@ class PipelineStage(RuntimeMixin):
     def load_optimizer_state_dict(self, state_dict, strict=True):
         self.compiled_stage.load_optimizer_state_dict(state_dict, strict=strict)
 
-    def _all_gather_state_dict(self):
-        state_dicts = [None for _ in range(self.num_stages)]
-        state_dict = self.compiled_stage.state_dict()  # gather spmd
-        dist.all_gather_object(state_dicts,
-                            state_dict,
-                            group=self.pp_group)
-        return reduce(lambda a, b: {**a, **b}, state_dicts)
-
-    def _all_gather_optimstate_dict(self):
-        optimizer_state_dicts = [None for _ in range(self.num_stages)]
-        optimizer_state_dict = self.compiled_stage.optimizer_state_dict()
-        dist.all_gather_object(
-            optimizer_state_dicts,
-            optimizer_state_dict,
-            group=self.pp_group)
-        return reduce(lambda a, b: {**a, **b}, optimizer_state_dicts)
-
-    def _all_gather_returns(self):
-        returns_all_gather = [None for _ in range(self.num_stages)]
-        returns_nodes_flatten = {
-            node_name: None
-            for node_name in self.compiled_meta.returns_nodes_flatten
-        }
-        returns_batch = {
-            node_name: val
-            for node_name, val in self.outputs_batch.items() if node_name in returns_nodes_flatten
-        }
-        dist.all_gather_object(returns_all_gather, returns_batch, group=self.pp_group)
-        all_returns = {}
-        for returns_stage in returns_all_gather:
-            for k, v, in returns_stage.items():
-                if v is not None:
-                    all_returns[k] = v
-        ret = graph_outputs_to_func_outputs(self.compiled_meta, all_returns, strict=False)[-1]
-        ret = pytree.tree_map_only(torch.Tensor, lambda x: x.to(self.device), ret)
-        return ret
 
     def __call__(self, *args, **kwargs) -> None:
         # Clean per iteration
-        self.clear_runtime_states()
+        self.reset_and_check_runtime_states()
 
         args_kwargs_vals_flatten, spec_val = pytree.tree_flatten((args, kwargs))
         args_kwargs_nodes_flatten, spec_node = pytree.tree_flatten(
@@ -603,13 +564,7 @@ class PipelineStage(RuntimeMixin):
 
         self.schedule()
 
-        if self.return_to_all_stages:
-            ret = self._all_gather_returns()
-        else:
-            ret = graph_outputs_to_func_outputs(self.compiled_meta,
-                                                self.outputs_batch,
-                                                strict=False)[-1]
-        return ret
+        return self.merge_chunked_returns()
 
     def run_with_graph(self, graph, *args,
                        **kwargs):  # TODO @botbw: could construct a partial graph here
@@ -622,7 +577,6 @@ def print_tensor_dict(chunk, di):
         print(f'{k} size {v.size()} mean {v.float().mean()}')
 
 
-# TODO @botbw: refactor to mixin
 class Schedule(RuntimeMixin):
 
     def __init__(self, pipeline_stage: PipelineStage):
@@ -651,25 +605,25 @@ class Schedule(RuntimeMixin):
 
     def forward_send_one_chunk(self) -> List[dist.Work]:
         return self.pipeline_stage.forward_send_one_chunk()
-    
+
     def forward_compute_one_chunk(self):
         return self.pipeline_stage.forward_compute_one_chunk()
-    
+
     def forward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         return self.pipeline_stage.forward_recv_one_chunk(wait=wait)
-    
+
     def backward_recv_one_chunk(self, wait=True) -> List[dist.Work]:
         return self.pipeline_stage.backward_recv_one_chunk(wait=wait)
-    
+
     def backward_compute_one_chunk(self):
         return self.pipeline_stage.backward_compute_one_chunk()
-    
+
     def backward_send_one_chunk(self) -> List[dist.Work]:
         return self.pipeline_stage.backward_send_one_chunk()
 
-    def merge_output_chunks(self) -> Dict[str, Any]:
-        return self.pipeline_stage.merge_output_chunks()
-    
+    def merge_and_assign_chunked_grads(self) -> Dict[str, Any]:
+        return self.pipeline_stage.merge_and_assign_chunked_grads()
+
     def step(self):
         return self.pipeline_stage.step()
 
@@ -695,7 +649,7 @@ class ScheduleGPipe(Schedule):
         for work in all_send_reqs:
             work.wait()
 
-        self.merge_output_chunks()
+        self.merge_and_assign_chunked_grads()
 
         if self.step_node is not None:
             self.step()
@@ -740,7 +694,7 @@ class ScheduleDAPPLE(Schedule):
         for work in all_send_reqs:
             work.wait()
 
-        self.merge_output_chunks()
+        self.merge_and_assign_chunked_grads()
 
         if self.step_node is not None:
             self.step()

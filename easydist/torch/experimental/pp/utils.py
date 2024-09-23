@@ -13,10 +13,17 @@
 # ==============================================================================
 
 import logging
-import torch.fx as fx
 import operator
+from copy import deepcopy
+from typing import Any, Dict, List
+
+import torch.fx as fx
+from torch.distributed._tensor import DTensor
+from torch.distributed._tensor.placement_types import Placement
 from torch.fx.passes.graph_drawer import FxGraphDrawer
+
 import easydist.config as mdconfig
+from easydist.torch.device_mesh import get_device_mesh
 
 
 def ordered_gi_users(node: fx.node):
@@ -38,3 +45,66 @@ def _to_tuple(x):
     if isinstance(x, tuple):
         return x
     return (x, )
+
+
+class OneToOneMap:
+    def __init__(self):
+        self._map: Dict[Any, Any]= {}
+        self._inv: Dict[Any, Any] = {}
+
+    def get(self, key: Any) -> Any:
+        return self._map[key]
+
+    def inv_get(self, key: Any) -> Any:
+        return self._inv[key]
+
+    def add(self, key: Any, value: Any) -> Any:
+        if key in self._map or value in self._map:
+            raise RuntimeError(f"{key}: {value} is not one to one mapping, found {key in self._map} {value in self._inv}")
+        self._map[key] = value
+        self._inv[value] = key
+
+    def items(self):
+        return self._map.items()
+
+    def keys(self):
+        return self._map.keys()
+
+    def inv_items(self):
+        return self._inv.items()
+
+    def inv_keys(self):
+        return self._inv.keys()
+
+    def apply(self, other: "OneToOneMap") -> "OneToOneMap":
+        mapping = OneToOneMap()
+        for k, v in self.items():
+            mapping.add(k, other.get(v))
+        return mapping
+
+    def map_dict_key(self, dictt: Dict) -> Dict:
+        ret = {}
+        for k, v in dictt.items():
+            ret[self._map[k]] = v
+        return ret
+
+    def inverse(self) -> "OneToOneMap":
+        inversed = deepcopy(self)
+        inversed._map, inversed._inv = inversed._inv, inversed._map
+        return inversed
+
+    def __repr__(self):
+        return f"{self._map=}\n{self._inv=}"
+
+    @staticmethod
+    def from_dict(dict: Dict) -> "OneToOneMap":
+        mapping = OneToOneMap()
+        for k, v in dict.items():
+            mapping.add(k, v)
+        return mapping
+
+
+def do_spmd_comm(tensor, src_specs: List[Placement], tgt_specs: List[Placement]):
+    device_mesh = get_device_mesh('spmd')
+    dtensor = DTensor.from_local(tensor, device_mesh, src_specs)
+    return dtensor.redistribute(device_mesh, tgt_specs).to_local()

@@ -18,8 +18,7 @@ import pickle
 import time
 import threading
 from functools import partial, reduce
-from typing import Any, Union, cast, Set, Dict, List, Tuple
-from contextlib import nullcontext
+from typing import Any, Union, Set, Dict, List, Tuple, Callable
 
 import rich
 import intervaltree
@@ -31,7 +30,6 @@ from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribut
 from torch.fx._pytree import tree_flatten_spec
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.graph_drawer import FxGraphDrawer
-from torch.nn.utils import stateless
 from torch._functorch.partitioners import default_partition
 
 import easydist.config as mdconfig
@@ -40,11 +38,11 @@ from easydist.metashard.metair import SPMD, VarSPMDStrategy
 from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
 from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
 from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
-from easydist.torch.experimental.pp.compile_pipeline import SplitPatcher, compile_pipeline
+from easydist.torch.experimental.pp.compile_pipeline import compile_pipeline
 from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.split_utils import clear_pp_compile_states, get_updated_params_states, set_backward_flag, set_step_flag, set_updated_params_states
+from easydist.torch.experimental.pp.split_utils import set_backward_flag, set_step_flag, set_updated_params_states
 from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.init_helper import (SetParaInitHelper, init_contiguous_buf, materialize_zero)
+from easydist.torch.init_helper import (init_contiguous_buf, materialize_zero)
 from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias, decouple_view,
                                    tile_comm, runtime_prof, fix_embedding, fix_meta_device,
                                    sharding_transform, sharding_transform_dtensor,
@@ -56,10 +54,9 @@ from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
 from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
 from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
 from easydist.torch.sharding_interpreter import EDTorchShardingAnn
-from easydist.torch.utils import (_enable_compile, _rematerialize_optimizer,
-                                  _sharding_ann_env, extract_tensor_meta_info)
-from easydist.utils import rgetattr, rsetattr
-from easydist.utils.testing import TorchMockDeviceMesh
+from easydist.torch.compile import ed_compile_func, stateless_func
+from easydist.torch.utils import (_enable_compile, _sharding_ann_env, extract_tensor_meta_info)
+from easydist.utils.testing.mock import TorchMockDeviceMesh
 from easydist.torch.mem_allocation_info import OutVar
 import easydist.torch.profiler.stream_tracer as ed_stream_tracer
 from easydist.torch.meta_allocator import profiling_allocator
@@ -168,14 +165,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             return global_strtg
 
         opt_strategy = reduce(reduce_fn, opt_strtg_per_dim)
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print(opt_strategy)
-
         sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
-
-        if mdconfig.log_level <= logging.DEBUG:
-            rich.print(sharding_strategy)
-
         args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]
                          for var_strategy in args_strategy]
@@ -186,6 +176,10 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
+
+    if mdconfig.log_level <= logging.DEBUG:
+        rich.print("opt_strategy", opt_strategy)
+        rich.print("sharding_strategy", sharding_strategy)
 
     return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
 
@@ -470,10 +464,11 @@ def _compile_auto(func,
                   num_chunks=1,
                   return_to_all_stages=True,
                   accumulate_grads_inplace=True,
-                  strict=True) -> Union[PipelineStage, Any]:
-    args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
-                                                             args_chunk_spec, kwargs_chunk_spec)
-    args, kwargs = args_split[0], kwargs_split[0]
+                  strict=True) -> Callable:
+    if schedule_cls is not None:
+        args_split, kwargs_split = split_args_kwargs_into_chunks(args, kwargs, num_chunks,
+                                                                args_chunk_spec, kwargs_chunk_spec)
+        args, kwargs = args_split[0], kwargs_split[0]
     module, opt = None, None
 
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -484,73 +479,8 @@ def _compile_auto(func,
             assert opt is None, "Only support single Optimizer in args now"
             opt = arg
 
-    params, buffers = {}, {}
-    if module is not None:
-        params = dict(module.named_parameters())
-        buffers = dict(module.named_buffers())
-
-        #print(f"initial params: {params}")
-        #print(f"initial buffers: {buffers}")
-        if isinstance(init_helper, SetParaInitHelper):
-            init_helper.module = module
-
-    named_states = {}
-
-    if opt is not None:
-        # assign grad and warm up optimizer
-        mode = nullcontext()
-        for name in dict(module.named_parameters()):
-            with torch.no_grad():
-                rsetattr(module, name + ".grad", torch.zeros_like(rgetattr(module, name).data))
-                if isinstance(rgetattr(module, name).data, FakeTensor):
-                    mode = rgetattr(module, name).data.fake_mode
-        with mode:
-            opt.step()
-            opt.zero_grad(True)
-
-        for n, p in params.items():
-            if p in opt.state:
-                named_states[n] = opt.state[p]  # type: ignore[index]
-                # if step in state, reduce one for warmup step.
-                if 'step' in named_states[n]:
-                    named_states[n]['step'] -= 1
-
-    flat_named_states, _ = pytree.tree_flatten(named_states)
-
-    # fix for sgd withtout momentum
-    if all(state is None for state in flat_named_states):
-        named_states = {}
-        flat_named_states, _ = pytree.tree_flatten(named_states)
-
-    state_tensor_num = len(params) + len(buffers) + len(flat_named_states)
-
-    def stateless_func(func, params, buffers, named_states, args, kwargs):
-        clear_pp_compile_states()
-        with stateless._reparametrize_module(
-                cast(torch.nn.Module, module), {
-                    **params,
-                    **buffers
-                }, tie_weights=True) if module else nullcontext(), _rematerialize_optimizer(
-                    opt, named_states, params) if opt else nullcontext():
-            ret = func(*args, **kwargs)
-        if (tup := get_updated_params_states()) != (None, None):
-            params, named_states = tup
-        grads = {k: v.grad for k, v in params.items()}
-        return params, buffers, named_states, grads, ret
-
-    with _enable_compile(), SplitPatcher(module, opt) if schedule_cls else nullcontext():
-        traced_graph = make_fx(partial(stateless_func, func),
-                               tracing_mode=tracing_mode,
-                               decomposition_table=EASYDIST_DECOMP_TABLE,
-                               _allow_non_fake_inputs=False)(params, buffers, named_states, args,
-                                                             kwargs)
-
-    assert len(list(traced_graph.buffers())) == 0, f"{set(traced_graph.named_buffers().keys())}"
-    traced_graph.graph.eliminate_dead_code()
+    params, buffers, named_states, state_tensor_num, traced_graph = ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt)
     traced_graph = preprocess_traced_graph(traced_graph)
-    traced_graph.recompile()
-
-    save_graphviz_dot(traced_graph, 'traced_graph')
 
     if mdconfig.dump_fx_graph:
         print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
@@ -580,8 +510,8 @@ def _compile_auto(func,
     rank = torch.distributed.get_rank()
 
     # Lansong(TODO) Currently send strategy by rpc. But broadcast way is more efficient.
-    master_address = os.environ["MASTER_ADDR"]
-    master_port = os.environ["MASTER_PORT"]
+    master_address = os.environ.get("MASTER_ADDR", "localhost")
+    master_port = os.environ.get("MASTER_PORT", "29400")
     rpc.init_rpc(f"ed_worker{rank}", rank=rank, world_size=world_size,rpc_backend_options=rpc.TensorPipeRpcBackendOptions(
             init_method=f"tcp://{master_address}:{master_port}",
             _transports=["uv", "shm"],
@@ -622,7 +552,6 @@ def _compile_auto(func,
         # override pytorch dtensor propagate rules to optimize dispater behavior
         if mdconfig.override_dtensor_rule is True:
             sharded_gm = rule_override_by_graph(sharded_gm, opt_strategy, shape_info)
-
 
     if mdconfig.log_level <= logging.DEBUG:
         sharded_gm.print_readable()
@@ -720,14 +649,12 @@ def _compile_auto(func,
         }
         sharded_gm = fix_node_order(sharded_gm)
         stateless_func_args = (params, buffers, named_states, args, kwargs)
-        save_graphviz_dot(sharded_gm, 'sharded_graph')
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
             sharded_gm,
             pp_size,
             stateless_func_args,
-            phs_stragegies=args_strategy,
+            tensors_spmd_strategies=args_strategy,
             strict=strict)
-        save_graphviz_dot(pp_local_gm, f'pp_local_gm')
         pipe = PipelineStage(
             schedule_cls=schedule_cls,
             local_gm=pp_local_gm,
@@ -838,10 +765,18 @@ def _compile_auto(func,
         def named_parameters(self):
             return params
 
+        def buffers(self):
+            return buffers.values()
+
+        def named_buffers(self):
+            return buffers
+
+        def _optimizer_state_dict(self):
+            return named_states
+
     # release all cuda memory from module here
     # the param maintain in the local of compiled function.
     if module is not None and not isinstance(module.parameters().__next__(), FakeTensor):
         module.to("meta")
 
     return EDCompiledFunc(sharded_gm)
-
