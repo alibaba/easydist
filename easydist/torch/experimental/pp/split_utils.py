@@ -22,7 +22,12 @@ from easydist.torch.utils import _rematerialize_optimizer
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
 from torch.nn.utils import stateless
-from easydist.torch.split_utils import _before_split, _after_split
+from easydist.torch.split_utils import (
+    list_before_split,
+    list_after_split,
+    _before_split,
+    _after_split,
+)
 
 '''
 The valid parameters types are: 
@@ -209,55 +214,6 @@ def split(ret):
     tensor_tuple_after_split: Tuple[torch.Tensor] = split_func_with_bw(tensor_tuple)
     ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
-
-
-@before_split_register(torch.Tensor)
-def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
-    return tuple([input])
-
-
-@after_split_register(torch.Tensor)
-def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
-    return output[0]
-
-
-@before_split_register(list)
-def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    ctx['is_tensor'] = []
-    ctx['non_tensor_vals'] = []
-    tup = []
-    for x in input:
-        ctx['is_tensor'].append(isinstance(x, torch.Tensor))
-        if ctx['is_tensor'][-1]:
-            tup.append(x)
-        else:
-            ctx['non_tensor_vals'].append(x)
-
-    return tuple(tup)
-
-
-@after_split_register(list)
-def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
-    ret = []
-    output = list(output)
-    for is_tensor in ctx['is_tensor']:
-        if is_tensor:
-            ret.append(output.pop(0))
-        else:
-            ret.append(ctx['non_tensor_vals'].pop(0))
-    return ret
-
-
-@before_split_register(tuple)
-def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    return list_before_split(ctx, list(input))
-
-
-@after_split_register(tuple)
-def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
-    return tuple(list_after_split(ctx, output))
-
-
 
 class SplitPatcher(_Patcher):
 

@@ -274,14 +274,14 @@ def build_scope_modules(
 ) -> torch.fx.GraphModule:
     graph_ids, graph_infos = extract_graphs(m)
 
+    if not graph_infos:
+        # only top level graph
+        return m
+
     #print(f"before remove marker:\n{m.graph}")
     for graph_info in graph_infos:
         remove_marker_nodes(graph_info)
     #print(f"after remove marker:\n{m.graph}")
-
-    if not graph_infos:
-        # only top level graph
-        return m
 
     assert len(graph_infos) > 1
 

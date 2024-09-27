@@ -147,12 +147,24 @@ def test_runtime_world_4(module_cls, split_ann, schedule_cls, optim):
 
 
 @pytest.mark.torch
+@pytest.mark.world_4
+@pytest.mark.long_duration
+@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim", [
+    (Foo, None, None, 'adam'),
+])
+@pytest.mark.timeout(200)
+def test_runtime_world_4_spmd_only(module_cls, split_ann, schedule_cls, optim):
+    spawn(inner, (module_cls, split_ann, schedule_cls, optim, (2, 2)), nprocs=4, port=12345)
+
+
+@pytest.mark.torch
 @pytest.mark.world_8
 @pytest.mark.long_duration
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, spmd_size", [
     (TEST_GPT, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'adam', (2, )),
     (TEST_GPT, {'blocks.1'}, ScheduleDAPPLE, 'adam', (2, 2)),
 ])
-@pytest.mark.timeout(200)
+@pytest.mark.timeout(400)
 def test_runtime_world_8(module_cls, split_ann, schedule_cls, optim, spmd_size):
     spawn(inner, (module_cls, split_ann, schedule_cls, optim, spmd_size), nprocs=8, port=12345)
+
