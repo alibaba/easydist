@@ -13,8 +13,8 @@
 # ==============================================================================
 
 import logging
-
 from copy import deepcopy
+from functools import cache
 from typing import Dict, Optional, Sequence, Union
 
 import torch
@@ -36,7 +36,7 @@ class NDDeviceMesh(DeviceMesh):
         self._binding = {}
         if self._device_mesh.mesh_dim_names is None:
             raise RuntimeError("mesh_dim_names is required")
-    
+
     def __check_valid_names(self, dim_names: Sequence[str]):
         for name in dim_names:
             if name not in self._device_mesh.mesh_dim_names:
@@ -45,7 +45,7 @@ class NDDeviceMesh(DeviceMesh):
     def __map_binding(self, dim_names: Union[str, Sequence[str]]) -> Sequence[str]:
         if isinstance(dim_names, str):
             dim_names = [dim_names]
-        
+
         if len(dim_names) == 1:
             name = dim_names[0]
             if name in self._binding:
@@ -58,6 +58,7 @@ class NDDeviceMesh(DeviceMesh):
     def __get_dims(self, dim_names: Sequence[str]) -> Sequence[int]:
         return [self._device_mesh.mesh_dim_names.index(name) for name in dim_names]
 
+    @cache
     def __getitem__(self, names: Union[str, Sequence[str]]) -> 'NDDeviceMesh':
         names = self.__map_binding(names)
         # self coordinates
@@ -115,6 +116,9 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
         for bind_func in __DEFAULT_BINDINGS:
             bind_func(__GLOBAL_ND_DEVICEMESH)
 
+    # TODO @botbw: better implementation for mesh initializtion
+    _ = get_device_mesh('spmd')
+
     logger.info(f"set_device_mesh: {torch_mesh}")
 
 def get_device_mesh(*dim_names) -> NDDeviceMesh:
@@ -123,6 +127,7 @@ def get_device_mesh(*dim_names) -> NDDeviceMesh:
 
     if len(dim_names) > 0:
         return __GLOBAL_ND_DEVICEMESH[dim_names]
+
     return __GLOBAL_ND_DEVICEMESH
 
 if __name__ == "__main__":
@@ -150,4 +155,3 @@ if __name__ == "__main__":
         print(mesh['pp'].get_coordinate())
         print(mesh['spmd'])
         print(get_device_mesh('spmd'))
-
