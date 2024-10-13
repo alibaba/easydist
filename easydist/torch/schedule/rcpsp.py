@@ -193,9 +193,9 @@ def rcpsp_data_select(task_data, select_mask):
     keys_selected = [raw_data[0] for raw_data in raw_data_selected]
 
     # dependency redundancies removal
-    data_selected = [(key, duration, [dp for dp in dependencies if dp in keys_selected], resource_uses)
-                        for (key, duration, dependencies, resource_uses) in raw_data_selected]
-                
+    data_selected = [(key, duration, [dp for dp in dependencies if dp in keys_selected], resource_uses, priority)
+                        for (key, duration, dependencies, resource_uses, priority) in raw_data_selected]
+
     return data_selected
 
 
@@ -285,6 +285,12 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
         blocks = [(odd_oven_points[i], odd_oven_points[i + 1]) for i in range(len(odd_oven_points) - 1)]
         block_num = len(blocks)
 
+        fused_adam_task_idx = -1
+        for idx, task_d in enumerate(_task_data):
+            if "_fused_adam" in task_d[0].target.__str__():
+                fused_adam_task_idx = idx
+                continue
+
         for _ in range(mdconfig.rcpsp_iter_round):
             # odd round
             # [block0, block1], [block2, block3] ...
@@ -293,9 +299,13 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
                     break
                 
                 # can be extended to support random node selection
-                select_mask = [0] * num_tasks
-                for i in range(blocks[b][0], blocks[b + 1][1]):
+                select_mask = np.array([0] * num_tasks)
+                for i in range(blocks[b][0], blocks[b + 1][1] + 1):
                     select_mask[i] = 1
+                select_mask[fused_adam_task_idx:] = 0
+
+                if select_mask.sum() == 0:
+                    continue
 
                 data_selected = rcpsp_data_select(_task_data, select_mask)
                 transformed_task_data = rcpsp_data_transform(data_selected, resource_to_id, resource_num)
@@ -311,9 +321,13 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
                 if b + 1 >= block_num:
                     break
 
-                select_mask = [0] * num_tasks
-                for i in range(blocks[b][0], blocks[b + 1][1]):
+                select_mask = np.array([0] * num_tasks)
+                for i in range(blocks[b][0], blocks[b + 1][1] + 1):
                     select_mask[i] = 1
+                select_mask[fused_adam_task_idx:] = 0
+
+                if select_mask.sum() == 0:
+                    continue
 
                 data_selected = rcpsp_data_select(_task_data, select_mask)
                 transformed_task_data = rcpsp_data_transform(data_selected, resource_to_id, resource_num)
