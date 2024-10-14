@@ -62,6 +62,7 @@ import easydist.torch.profiler.stream_tracer as ed_stream_tracer
 from easydist.torch.meta_allocator import profiling_allocator
 from easydist.torch.schedule.lifetime_info import mem_owner_tracer
 from easydist.torch.scope_auto.build_scope_modules import build_scope_modules
+from easydist.torch.reachability import ReachabilityMap
 
 # for pickle dump opt_strategy
 import sys
@@ -89,7 +90,8 @@ def preprocess_traced_graph(fx_module: torch.fx.GraphModule):
     return fx_module
 
 
-def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_signature, *args,
+def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
+                   reachability_map: ReachabilityMap, input_signature, *args,
                    **kwargs):
     # only called by rank 0
     if mdconfig.enable_compile_cache:
@@ -132,7 +134,8 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
                 rich.print(meta_graph) 
             
             # (3) construct AutoFlowSolver and run ILP
-            solver = AutoFlowSolver1D(dim_size, total_memery=total_memory)
+            solver = AutoFlowSolver1D(dim_size, mesh_dim=dim, total_memery=total_memory,
+                                      reachability_map=reachability_map)
 
             if mdconfig.enable_graph_coarsen:
                 logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
@@ -177,10 +180,6 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num, input_sign
             pickle.dump([shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map],
                         open(compiled_cache_file, "wb"))
             logger.info(f"compiled result saved in {compiled_cache_file}.")
-
-    if mdconfig.log_level <= logging.DEBUG:
-        rich.print("opt_strategy", opt_strategy)
-        rich.print("sharding_strategy", sharding_strategy)
 
     return shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map
 
@@ -488,7 +487,7 @@ def _compile_auto(func,
         drawer = FxGraphDrawer(traced_graph, "traced_fx", ignore_getattr=True)
         dot_graphs = drawer.get_all_dot_graphs()
         for name, dot_graph in dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_pdf(f"./tmp/{name}.pdf")
             dot_graph.write_raw(f"./tmp/{name}.txt")
 
         # seperate fwd/bwd graph
@@ -497,13 +496,13 @@ def _compile_auto(func,
         fwd_drawer = FxGraphDrawer(fwd_graph, "fwd_traced_fx", ignore_getattr=True)
         fwd_dot_graphs = fwd_drawer.get_all_dot_graphs()
         for name, dot_graph in fwd_dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_pdf(f"./tmp/{name}.pdf")
             dot_graph.write_raw(f"./tmp/{name}.txt")
 
         bwd_drawer = FxGraphDrawer(bwd_graph, "bwd_traced_fx", ignore_getattr=True)
         bwd_dot_graphs = bwd_drawer.get_all_dot_graphs()
         for name, dot_graph in bwd_dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_pdf(f"./tmp/{name}.pdf")
             dot_graph.write_raw(f"./tmp/{name}.txt")
 
 
@@ -518,10 +517,19 @@ def _compile_auto(func,
             _transports=["uv", "shm"],
             _channels=["basic"]
     ))
+    for idx, node in enumerate(traced_graph.graph.nodes):
+        node.unique_id = idx
+
+    reachability_map = ReachabilityMap(traced_graph.graph)
+    #if rank == 0:
+    #    print(f"reachability_map: {reachability_map.reachable_matrix}")
+    #    print(f"parallel_map: {reachability_map.parallel_matrix}")
+    #    print(f"{str(reachability_map)}")
+
     if rank == 0:
         shape_info, opt_strategy, sharding_strategy, args_strategy, state_io_map = easydist_shard(
-            traced_graph, state_tensor_num, input_signature, params, buffers, named_states, args,
-            kwargs)
+            traced_graph, state_tensor_num, reachability_map, input_signature, params, buffers,
+            named_states, args, kwargs)
 
         with sol_rdy_cond:
             global sharding_sol
@@ -535,7 +543,24 @@ def _compile_auto(func,
 
     rpc.shutdown()
 
-    #print(f"traced_graph._code: {traced_graph._code}")
+    #if rank == 0:
+    #    print(f"traced_graph._code: {traced_graph._code}")
+
+    if mdconfig.dump_strategy and rank==0:
+        nodes_shape_info = "shape info:\n"
+        for node in traced_graph.graph.nodes:
+            if hasattr(node, "meta") and 'val' in node.meta:
+                if hasattr(node.meta['val'], "shape"):
+                    nodes_shape_info += node.name + f": {node.meta['val'].shape}\n"
+        extra_info_str = nodes_shape_info + "\npython code:\n" + traced_graph._code + "\n"
+        formatted_str = extra_info_str + '\n'.join(f'{str(key)}: {str(value)}' for key, value in opt_strategy.items())
+        with open('./tmp/opt_strategy.txt', 'w') as strategy_file:
+            strategy_file.write(f'{formatted_str}\n')
+
+        formatted_str = extra_info_str + '\n'.join(f'{str(key)}: {str(value)}' for key, value in sharding_strategy.items())
+        with open('./tmp/sharding_strategy.txt', 'w') as strategy_file:
+            strategy_file.write(f'{formatted_str}\n')
+
     if mdconfig.use_dtensor:
         sharded_gm = sharding_transform_dtensor(traced_graph, sharding_strategy)
     else:
@@ -560,12 +585,21 @@ def _compile_auto(func,
         sharded_gm.print_readable()
 
     #print(f"sharded_gm._code: {sharded_gm._code}")
+    if mdconfig.dump_strategy and rank==0:
+        with open('./tmp/opt_strategy.txt', 'a') as strategy_file:
+            formatted_str = "\n\nsharded python code:\n" + traced_graph._code + "\n\n"
+            strategy_file.write(f'{formatted_str}\n')
+
+        with open('./tmp/sharding_strategy.txt', 'a') as strategy_file:
+            formatted_str = "\n\nsharded python code:\n" + traced_graph._code + "\n\n"
+            strategy_file.write(f'{formatted_str}\n')
+
     if mdconfig.dump_fx_graph:
         print(f"node num in sharded graph: {len(sharded_gm.graph.nodes)}")
         drawer = FxGraphDrawer(sharded_gm, f"shard_fx-{rank}", ignore_getattr=True)
         dot_graphs = drawer.get_all_dot_graphs()
         for name, dot_graph in dot_graphs.items():
-            dot_graph.write_jpg(f"./tmp/{name}.jpg")
+            dot_graph.write_pdf(f"./tmp/{name}.pdf")
             dot_graph.write_raw(f"./tmp/{name}.txt")
         if mdconfig.log_level <= logging.DEBUG:
             print(f"sharded_gm._code: {sharded_gm._code}")

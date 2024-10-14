@@ -80,8 +80,8 @@ nvlink_processor_usage = 0.15
 # Scheduling communication
 comm_optimization = os.environ.get("COMM_OPTIMIZATION", "False").upper() in ["1", "TRUE"]
 # 'general', 'odd_even'
-rcpsp_method = 'general'
-rcpsp_iter_round = 1 # odd_even rounds
+rcpsp_method = 'odd_even'
+rcpsp_iter_round = 4 # odd_even rounds
 override_dtensor_rule = False
 
 # runtime
@@ -115,3 +115,12 @@ allow_1d_fallback_sol = os.environ.get("ALLOW_1D_FALLBACK_SOL", "False").upper()
 experimental_sharding_transform = os.environ.get("EXPERIMENTAL_SHARDING_TRANSFORM", "greedy").upper()
 if experimental_sharding_transform not in ['REPLICATE', 'GREEDY', 'P2P']:
     raise RuntimeError(f"Expected EXPERIMENTAL_SHARDING_TRANSFORM in ['REPLICATE', 'GREEDY', 'P2P'], found {experimental_sharding_transform}")
+
+predict_comm_overlap = os.environ.get("PREDICT_COMM_OVERLAP", "False").upper() in ["1", "TRUE"]
+comm_overlap_ratio = float(os.environ.get("COMM_OVERLAP_RATIO", 0.8))
+
+# dump strategy
+dump_strategy = os.environ.get("DUMP_STRATEGY", "False").upper() in ["1", "TRUE"]
+dump_cluster = os.environ.get("DUMP_CLUSTER", "False").upper() in ["1", "TRUE"]
+dump_sharding_model = os.environ.get("DUMP_SHARDING_MODEL", "False").upper() in ["1", "TRUE"]
+

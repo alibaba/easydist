@@ -860,7 +860,7 @@ class MetaGraph:
         else:
             print("Lansong 2do: support more aggressive coarsening")
             # call cone cluster building instead
-            self.build_cone_clusters()
+            self.build_cone_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
 
         if mdconfig.log_level <= logging.DEBUG:
             for cluster in self.node_clusters:

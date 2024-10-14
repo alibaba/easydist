@@ -22,6 +22,7 @@ import mip
 from easydist.metashard.metair import (SPMD, MetaGraph, MetaNode, MetaNodeCluster, MetaVar,
                                        NodeSPMDStrategy, VarSPMDStrategy, VarSPMDStrategyGroup,
                                        ClusterStrategyPool)
+from easydist.torch.reachability import ReachabilityMap
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,9 @@ def get_idx_in_var_list(var: MetaVar, var_list: List[MetaVar]):
     return None
 
 
-def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
-                              strategy_out: VarSPMDStrategy, device_num):
+def calculate_raw_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
+                              strategy_out: VarSPMDStrategy,
+                              reachability_map: ReachabilityMap, device_num):
     var_size = var.get_var_size()
 
     all_gather = lambda x, ndevices: x * (ndevices - 1) / ndevices
@@ -53,7 +55,7 @@ def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
             factor = mdconfig.all_to_all_punish_factor
         return factor * x * (ndevices - 1) / ndevices / ndevices
 
-    resharding_cost = 0
+    raw_resharding_cost = 0
 
     strategy_in = strategy_in[0]
     strategy_out = strategy_out[0]
@@ -63,11 +65,32 @@ def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
             message_size /= device_num
             if strategy_out.is_shard():
                 if strategy_in.args != strategy_out.args:
-                    resharding_cost += all_to_all(message_size, device_num)
+                    raw_resharding_cost += all_to_all(message_size, device_num)
             else:
-                resharding_cost += all_gather(message_size, device_num)
+                raw_resharding_cost += all_gather(message_size, device_num)
         elif strategy_in.is_partial():
-            resharding_cost += all_reduce(message_size, device_num)
+            raw_resharding_cost += all_reduce(message_size, device_num)
+
+    parallel_peer_flops = reachability_map.get_parallel_peer_flops(var.name)
+
+    return (raw_resharding_cost, parallel_peer_flops)
+
+
+def adjust_resharding_cost(raw_resharding_cost, parallel_peer_flops):
+    if mdconfig.predict_comm_overlap and parallel_peer_flops > 0:
+        cost_ratio = 1.0 - mdconfig.comm_overlap_ratio
+        return raw_resharding_cost*cost_ratio
+
+    return raw_resharding_cost
+
+
+def calculate_resharding_cost(var: MetaVar, strategy_in: VarSPMDStrategy,
+                              strategy_out: VarSPMDStrategy,
+                              reachability_map: ReachabilityMap, device_num):
+    raw_resharding_cost, parallel_peer_flops = calculate_raw_resharding_cost(
+                  var, strategy_in, strategy_out, reachability_map, device_num)
+
+    resharding_cost = adjust_resharding_cost(raw_resharding_cost, parallel_peer_flops)
 
     return resharding_cost
 
@@ -94,6 +117,7 @@ def gen_comm_cost_matrix(
         var: MetaVar,
         up_strategy,  # list of VarSPMDStrategy
         down_strategy,  # list of VarSPMDStrategy
+        reachability_map: ReachabilityMap,
         device_mesh):
     comm_matrix = [[0 for _ in range(len(down_strategy))] for _ in range(len(up_strategy))]
 
@@ -102,7 +126,7 @@ def gen_comm_cost_matrix(
             var_up_strategy = up_strategy[i]
             var_down_strategy = down_strategy[j]
             comm_matrix[i][j] = calculate_resharding_cost(var, var_up_strategy, var_down_strategy,
-                                                          device_mesh)
+                                                          reachability_map, device_mesh)
 
     return comm_matrix
 
@@ -114,6 +138,7 @@ def generate_comm_matrix(
         down_strategy,  # list of NodeSPMDStrategy
         idx_for_up,
         idx_for_down,
+        reachability_map: ReachabilityMap,
         device_mesh):
     comm_matrix = [[0 for _ in range(len(down_strategy))] for _ in range(len(up_strategy))]
 
@@ -122,7 +147,7 @@ def generate_comm_matrix(
             var_up_strategy = up_strategy[i].out_strtg_group[idx_for_up]
             var_down_strategy = down_strategy[j].in_strtg_group[idx_for_down]
             comm_matrix[i][j] = calculate_resharding_cost(var, var_up_strategy, var_down_strategy,
-                                                          device_mesh)
+                                                          reachability_map, device_mesh)
 
     return comm_matrix
 
@@ -188,7 +213,8 @@ class ClusterEdgeMipInfo:
         self.mip_var = []
 
     def __str__(self) -> str:
-        res = str(self.edge)
+        res = "(edge: " + str(self.edge)
+        res += ", comm_matrix: " + str(self.comm_matrix) + ")"
         return res
 
     def __repr__(self) -> str:
@@ -199,18 +225,22 @@ class AutoFlowSolver1D:
 
     def __init__(self,
                  device_num=None,
+                 mesh_dim=0,
                  constraints=None,
                  memory_ratio=0.9,
-                 total_memery=None) -> None:
+                 total_memery=None,
+                 reachability_map=None) -> None:
         self.m = mip.Model("autoflow")
         self.nodes = {}
         self.edges = {}
         self.device_num = device_num
+        self.mesh_dim = mesh_dim
         self.constraints = constraints
 
         self.memory_ratio = memory_ratio
         self.total_memery = 32 * 1024 * 1024 * 1024 if total_memery is None else total_memery
         self.max_memory_constrain = self.memory_ratio * self.total_memery
+        self.reachability_map = reachability_map
 
         self.clusters = {}
         self.cluster_edges = {}
@@ -220,6 +250,14 @@ class AutoFlowSolver1D:
 
         for cluster in graph.node_clusters:
             self.add_cluster(cluster)
+
+        if mdconfig.dump_cluster:
+            with open(f'./tmp/cluster_{self.mesh_dim}.txt', 'w') as cluster_file:
+                cluster_file.write(f'{str(self.clusters)}\n')
+
+        if mdconfig.dump_sharding_model:
+            with open(f'./tmp/cluster_edges_{self.mesh_dim}.txt', 'w') as edge_file:
+                edge_file.write(f'{str(self.cluster_edges)}\n')
 
         if mdconfig.log_level <= logging.DEBUG:
             for mip_info in self.clusters.values():
@@ -328,13 +366,14 @@ class AutoFlowSolver1D:
             idx_for_up = self.cluster_edges[unique_key_].idx_for_up
             idx_for_down = self.cluster_edges[unique_key_].idx_for_down[-1]
 
-            self.cluster_edges[unique_key_].comm_matrix.append(
-                gen_comm_cost_matrix(
-                    self.cluster_edges[unique_key_].edge,
-                    up_out_strategy_list,
-                    down_in_strategy_list,
-                    self.device_num,
-                ))
+            comm_cost_matrix = gen_comm_cost_matrix(
+                self.cluster_edges[unique_key_].edge,
+                up_out_strategy_list,
+                down_in_strategy_list,
+                self.reachability_map,
+                self.device_num,
+            )
+            self.cluster_edges[unique_key_].comm_matrix.append(comm_cost_matrix)
 
             self.cluster_edges[unique_key_].mem_matrix.append(
                 gen_mem_cost_matrix(
@@ -403,6 +442,7 @@ class AutoFlowSolver1D:
                         down_strategy,  # list of NodeSPMDStrategy
                         idx_for_up,
                         idx_for_down,
+                        self.reachability_map,
                         self.device_num,
                     ))
 
@@ -676,8 +716,8 @@ class AutoFlowSolver1D:
         self.m.objective = mip.minimize(comm_cost + 0.00000001 * mem_cost)
 
         self.m.verbose = 0
-        #print("dump sharding model")
-        #self.m.write("./tmp/sharding.lp")
+        if mdconfig.dump_sharding_model:
+            self.m.write(f"./tmp/sharding_{self.mesh_dim}.lp")
 
         status = self.m.optimize(max_seconds_same_incumbent=mdconfig.max_seconds_same_incumbent)
         logger.info(f'[AutoFlowSolver.status]:\t {status}')
@@ -729,6 +769,8 @@ class AutoFlowSolver1D:
     def calc_graph_comm_cost(self, graph_strategy):
         total_comm_cost = 0
         default_strtg = [SPMD(SPMD.REPLICATE)]
+        total_non_overlapping_cost = 0
+        total_overlapping_cost = 0
         for node in self.graph.op_list:
             for in_idx, in_var in enumerate(node.invars):
                 if in_var.up_node.unique_key() in graph_strategy:
@@ -743,13 +785,29 @@ class AutoFlowSolver1D:
                 else:
                     var_down_strtg = VarSPMDStrategy(*default_strtg)
 
-                comm_cost = calculate_resharding_cost(in_var, var_up_strtg, var_down_strtg,
-                                                      self.device_num)
+                raw_comm_cost, parallel_peer_flops = calculate_raw_resharding_cost(
+                                                          in_var,
+                                                          var_up_strtg,
+                                                          var_down_strtg,
+                                                          self.reachability_map,
+                                                          self.device_num)
+                if raw_comm_cost > 0 and mdconfig.log_level <= logging.DEBUG:
+                    if parallel_peer_flops > 0:
+                        total_overlapping_cost += raw_comm_cost
+                        print(f"overlapping cost between {in_var.up_node.name} and {node.name} is {raw_comm_cost}")
+                    else:
+                        total_non_overlapping_cost += raw_comm_cost
+                        print(f"non-overlapping cost between {in_var.up_node.name} and {node.name} is {raw_comm_cost}")
 
+                comm_cost = adjust_resharding_cost(raw_comm_cost, parallel_peer_flops)
                 total_comm_cost += comm_cost
                 if mdconfig.log_level <= logging.DEBUG:
                     if comm_cost > 0:
                         print(("cost between {} and {} is {}").format(in_var.up_node.name, node.name, comm_cost))
+
+        if mdconfig.log_level <= logging.DEBUG:
+            print(f"total non-overlapping cost: {total_non_overlapping_cost}")
+            print(f"total overlapping cost: {total_overlapping_cost}")
 
         return total_comm_cost
 
