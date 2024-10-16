@@ -125,10 +125,12 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
         spmd_mesh = get_device_mesh('spmd')
         total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
 
-        opt_strtg_per_dim = []
+        opt_strtg_per_mesh_dim = []
         for dim, dim_size in enumerate(spmd_mesh.shape):
             # (2) translate fx.GraphModule into MetaGraph
-            meta_graph = torch2meta_graph(fx_module, state_tensor_num, sharding_info, shape_info, opt_strtg_per_dim)
+            meta_graph = torch2meta_graph(fx_module, state_tensor_num,
+                                          sharding_info, shape_info,
+                                          opt_strtg_per_mesh_dim, dim_size)
 
             if mdconfig.log_level <= logging.DEBUG:
                 rich.print(meta_graph) 
@@ -141,7 +143,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
                 logger.info(f"enable graph coarsen with level {mdconfig.coarsen_level}.")
                 solver.add_coarsen_graph(meta_graph)
             else:
-                solver.add_graph(meta_graph, opt_strtg_per_dim)
+                solver.add_graph(meta_graph, opt_strtg_per_mesh_dim)
 
             start_t = time.perf_counter()
             if mdconfig.enable_graph_coarsen:
@@ -150,7 +152,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
                 opt_strategy_cur_dim = solver.ilp_optimize()
             logger.info(f"[AutoFlowSolver.time]:\t {dim} round {time.perf_counter() - start_t} s.")
 
-            opt_strtg_per_dim.append(opt_strategy_cur_dim)
+            opt_strtg_per_mesh_dim.append(opt_strategy_cur_dim)
 
         def reduce_fn(global_strtg, cur_dim_opt_strgt):
             for k in global_strtg.keys():
@@ -168,7 +170,7 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
                             global_strtg[k]['strategy'].out_strtg_group[i] += VarSPMDStrategy(SPMD(SPMD.REPLICATE))
             return global_strtg
 
-        opt_strategy = reduce(reduce_fn, opt_strtg_per_dim)
+        opt_strategy = reduce(reduce_fn, opt_strtg_per_mesh_dim)
         sharding_strategy = get_torch_sharding_strategy(fx_module, opt_strategy)
         args_strategy = meta_graph.get_input_strategy(opt_strategy, spmd_mesh.mesh.shape)
         args_strategy = [[to_torch_spmd(i) for i in var_strategy]

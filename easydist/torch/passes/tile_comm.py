@@ -104,6 +104,8 @@ def get_arg_tile_axis(node: torch.fx.Node, tile_axis, arg_index) -> int:
     if node.target in [all_gather_start, all_reduce_start, all_to_all_start]:
         return tile_axis
 
+    #print(f"debug: node: {node}, node.op: {node.op}, node.target: {node.target}, node.ed_info.spmd_annotation: {node.ed_info.spmd_annotation}")
+    #print(f"debug: node: {node}, node.op: {node.op}, node.target: {node.target}, node.ed_info.spmd_annotation['combination_ann']: {node.ed_info.spmd_annotation['combination_ann']}")
     for shard_dim_id, combine_func in node.ed_info.spmd_annotation['combination_ann'].items():
         if isinstance(combine_func, list):
             combine_func = combine_func[0]

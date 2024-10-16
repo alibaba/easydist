@@ -141,6 +141,13 @@ class NodeSPMDStrategy:
     def get_outvar_strtg(self, outvar_idx: int) -> VarSPMDStrategy:
         return self.out_strtg_group.get_var_strtg(outvar_idx)
 
+    def is_replicated(self):
+        for out_var_strtg in self.out_strtg_group:
+            for spmd in out_var_strtg.var_spmd_strategy:
+                if not spmd.is_replicate():
+                    return False
+        return True
+
     def __str__(self) -> str:
         return (f"NodeSPMDStrategy(in_strtg_group: {self.in_strtg_group}, "
                 f"out_strtg_group: {self.out_strtg_group})")
@@ -186,6 +193,7 @@ def get_sharding_strategy(sharding_anns, shard_dim_id):
         for dim_idx, dim_ann in enumerate(tensor_ann):
             if dim_ann.shard_dim_id == shard_dim_id:
                 shard_dim_ = dim_idx
+                break
         if shard_dim_ is not None:
             spmd_strategy.append(VarSPMDStrategy(SPMD(SPMD.SHARD, {"dim": shard_dim_})))
         else:
@@ -268,7 +276,9 @@ class MetaVar:
         return self.__str__()
 
 
-# (TODO) need to automatic find the heavy ops during MetaSPMD annotation.
+# (TODO) need to automatic find the heavy ops by one of following ways:
+# 1. during MetaSPMD annotation.
+# 2. aligned with torch.utils.flop_counter.flop_registry
 _heavy_ops = [
     "convolution",
     "scaled_dot_product",
@@ -347,7 +357,7 @@ class MetaNode:
 
     def _replicate_strategy(self):
         invars_strategy = VarSPMDStrategyGroup()
-        # placeholder has not invars
+        # placeholder has no invars
         if "placeholder" in self.op_name:
             for _ in self.outvars:
                 invars_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
@@ -363,7 +373,7 @@ class MetaNode:
         assert self.strtg_pool
         return self.strtg_pool.get_strtg(idx)
 
-    def get_strtg_pool(self, opt_strtg_per_dim: List[Dict]) -> NodeSPMDStrategyPool:
+    def build_or_get_strtg_pool(self, opt_strtg_per_mesh_dim: List[Dict], split_num: int) -> NodeSPMDStrategyPool:
         if self.strtg_pool is not None:
             return self.strtg_pool
 
@@ -372,24 +382,65 @@ class MetaNode:
         sharding_anns = self.sharding_info['sharding_ann']
         comm_anns = self.sharding_info['combination_ann']
 
+        if mdconfig.log_level <= logging.DEBUG:
+            print(f"sharding_info of {self.name}: {str(self.sharding_info)}")
+
         # some ops like torch.ops.aten.scalar_tensor.default have no invars
         if len(comm_anns) == 0 and len(self.invars) == 0:
             self.strtg_pool = NodeSPMDStrategyPool()
             return self.strtg_pool
 
+        has_replicated = False
         for shard_idx in comm_anns:
-            in_strtg_group = get_sharding_strategy(sharding_anns, shard_idx)    
-            out_strtg_group = combination_to_sharding_strategy(comm_anns[shard_idx])
+            in_strtg_group = get_sharding_strategy(sharding_anns, shard_idx)  # get a VarSPMDStrategyGroup object
             # skip the possible solution when it has appeared in previous dim solution
             if (
                 not mdconfig.allow_1d_fallback_sol
-                and any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_dim)
+                and any(in_strtg_group == x[self.name]['strategy'].in_strtg_group for x in opt_strtg_per_mesh_dim)
             ):
                 continue
-            strategy_list_1d.append(NodeSPMDStrategy(in_strtg_group, out_strtg_group))
 
-        if all(op not in self.op_name for op in _heavy_ops) or len(strategy_list_1d) == 0:
+            # check the dim to be splitted is divisible by split num
+            valid = True
+            for in_var_idx, in_var_strtg in enumerate(in_strtg_group):  # in_var_strtg is a VarSPMDStrategy
+                for spmd_ in in_var_strtg.var_spmd_strategy:
+                    if spmd_.args:
+                        split_dim = spmd_.args["dim"]
+                        if self.is_placeholder:
+                            in_var = self.outvars[in_var_idx]
+                        else:
+                            in_var = self.invars[in_var_idx]
+
+                        in_var_shape = in_var.shape
+                        split_dim_size = in_var_shape[split_dim]
+
+                        if split_dim_size % split_num != 0:
+                            valid = False
+                            logger.debug(
+                                f"Don't split input {in_var_idx} "
+                                f"(shape: {in_var_shape}) of node {self.name} "
+                                f"on dim {split_dim} with dim value "
+                                f"{split_dim_size}, because it is not divisible"
+                                f" by split num {split_num}.")
+                            break
+
+                if not valid:
+                    break
+            if not valid:
+                continue
+
+            out_strtg_group = combination_to_sharding_strategy(comm_anns[shard_idx])
+
+            node_spmd_strtg = NodeSPMDStrategy(in_strtg_group, out_strtg_group)
+            if node_spmd_strtg.is_replicated():
+                has_replicated = True
+            strategy_list_1d.append(node_spmd_strtg)
+
+        if len(strategy_list_1d) == 0:
             strategy_list_1d.append(self._replicate_strategy())
+        #elif all(op not in self.op_name for op in _heavy_ops) and not has_replicated:
+        #    print(f"add replicated strategy for {self.name}")
+        #    strategy_list_1d.append(self._replicate_strategy())
 
         # (FIXME) modify stratgy here, need remove
         #     if "batch_norm" in self.name:
@@ -606,7 +657,9 @@ class MetaNodeCluster:
         meta_node.cluster_id = self.unique_id
 
     def back_build_strategy(self, nd: MetaNode, nd_strtg_idx: int,
-                            cluster_strtg: ClusterStrategy, opt_strtg_per_dim: List[Dict]) -> bool:
+                            cluster_strtg: ClusterStrategy,
+                            opt_strtg_per_mesh_dim: List[Dict],
+                            split_num: int) -> bool:
         succ = True
         for invar_idx, invar in enumerate(nd.invars):
             if not invar:
@@ -628,19 +681,24 @@ class MetaNodeCluster:
             nd_strtg = nd.strtg_pool.get_strtg(nd_strtg_idx)
             expected_var_strtg = nd_strtg.get_invar_strtg(invar_idx)
 
-            up_nd_strtg_pool = up_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
+            up_nd_strtg_pool = up_node.build_or_get_strtg_pool(
+                                opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim,
+                                split_num=split_num)
             up_nd_strtg_idx = up_nd_strtg_pool.find_matched_out(idx_for_up, expected_var_strtg)
             if up_nd_strtg_idx >= 0:
                 up_nd_strtg = up_nd_strtg_pool.get_strtg(up_nd_strtg_idx)
                 cluster_strtg.set_node_strategy(up_node.unique_id, up_nd_strtg_idx, up_nd_strtg)
-                if not self.back_build_strategy(up_node, up_nd_strtg_idx, cluster_strtg, opt_strtg_per_dim):
+                if not self.back_build_strategy(up_node, up_nd_strtg_idx,
+                                                cluster_strtg,
+                                                opt_strtg_per_mesh_dim,
+                                                split_num):
                     succ = False
             else:
                 succ = False
 
         return succ
 
-    def finalize(self, opt_strtg_per_dim: List[Dict]) -> None:
+    def finalize(self, opt_strtg_per_mesh_dim: List[Dict], split_num: int) -> None:
         for node in self.nodes.values():
             if node.invars:
                 for idx, invar in enumerate(node.invars):
@@ -681,14 +739,17 @@ class MetaNodeCluster:
 
         # build strategy candidates for cluster
         self.strategy_pool = ClusterStrategyPool(self)
-        out_strtg_pool = out_node.get_strtg_pool(opt_strtg_per_dim=opt_strtg_per_dim)
+        out_strtg_pool = out_node.build_or_get_strtg_pool(
+                            opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim,
+                            split_num=split_num)
 
         for out_strtg_idx in range(out_strtg_pool.strtg_num()):
             cluster_strtg = ClusterStrategy()
             out_strtg = out_node.get_strtg(out_strtg_idx)
             cluster_strtg.set_node_strategy(out_node.unique_id, out_strtg_idx, out_strtg)
 
-            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg, opt_strtg_per_dim):
+            if self.back_build_strategy(out_node, out_strtg_idx, cluster_strtg,
+                                        opt_strtg_per_mesh_dim, split_num):
                 assert len(cluster_strtg.node_strategies) == len(self.nodes)
                 self.strategy_pool.add_strategy(cluster_strtg)
             else:
@@ -720,8 +781,9 @@ class MetaNodeCluster:
 
 class MetaGraph:
 
-    def __init__(self, ori_struct) -> None:
+    def __init__(self, ori_struct, split_num: int) -> None:
         self.ori_struct = ori_struct
+        self.split_num = split_num
         self.input_list = []
         self.op_list = []
         self.output_list = []
@@ -777,12 +839,13 @@ class MetaGraph:
 
         return liveness_list
 
-    def build_fine_grain_clusters(self, opt_strtg_per_dim: List[Dict]):
+    def build_fine_grain_clusters(self, opt_strtg_per_mesh_dim: List[Dict]):
         cluster_id = 0
         for node in self.op_list:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             cluster.add_node(node)
-            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
+            cluster.finalize(opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim,
+                             split_num=self.split_num)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
@@ -835,7 +898,7 @@ class MetaGraph:
                 if in_var.up_node.unique_id not in root_ids:
                     self.build_cone_cluster(in_var.up_node, root_ids, cluster)
 
-    def build_cone_clusters(self, opt_strtg_per_dim: List[Dict]):
+    def build_cone_clusters(self, opt_strtg_per_mesh_dim: List[Dict]):
         cone_roots = self.find_cone_roots()
         logger.debug("root num: %d" % len(cone_roots))
         logger.debug(cone_roots)
@@ -848,19 +911,20 @@ class MetaGraph:
         for cone_root in cone_roots:
             cluster = MetaNodeCluster(unique_id=cluster_id)
             self.build_cone_cluster(cone_root, root_ids, cluster)
-            cluster.finalize(opt_strtg_per_dim=opt_strtg_per_dim)
+            cluster.finalize(opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim,
+                             split_num=self.split_num)
             self.node_clusters.append(cluster)
             cluster_id += 1
 
-    def coarsen(self, coarsen_level: int, opt_strtg_per_dim: List[Dict]):
+    def coarsen(self, coarsen_level: int, opt_strtg_per_mesh_dim: List[Dict]):
         if coarsen_level == 0:
-            self.build_fine_grain_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
+            self.build_fine_grain_clusters(opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim)
         elif coarsen_level == 1:
-            self.build_cone_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
+            self.build_cone_clusters(opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim)
         else:
             print("Lansong 2do: support more aggressive coarsening")
             # call cone cluster building instead
-            self.build_cone_clusters(opt_strtg_per_dim=opt_strtg_per_dim)
+            self.build_cone_clusters(opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim)
 
         if mdconfig.log_level <= logging.DEBUG:
             for cluster in self.node_clusters:

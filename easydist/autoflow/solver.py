@@ -318,7 +318,7 @@ class AutoFlowSolver1D:
     def add_node(self, node: MetaNode, opt_strtg_per_dim: List[Dict]) -> None:
         unique_key_ = node.unique_key()
 
-        strategies = node.get_strtg_pool(opt_strtg_per_dim).strategies
+        strategies = node.build_or_get_strtg_pool(opt_strtg_per_dim, self.device_num).strategies
         if len(strategies) > 0:
             self.nodes[unique_key_] = {
                 "node": node,

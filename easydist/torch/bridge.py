@@ -50,26 +50,27 @@ def materialize(x, device):
 
 
 def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding_info,
-                     shape_info, opt_strtg_per_dim: List[Dict]) -> MetaGraph:
-    meta_graph = MetaGraph(fx_module)
+                     shape_info, opt_strtg_per_mesh_dim: List[Dict],
+                     cur_mesh_dim_val: int) -> MetaGraph:
+    meta_graph = MetaGraph(fx_module, cur_mesh_dim_val)
     meta_node_map = {}
     meta_var_map = {}
     MetaNode.clear_id_counter()
     MetaVar.clear_id_counter()
     output_names = []
 
-    def apply_previous_sharding(shape_info, node, opt_strtg_per_dim):
+    def apply_previous_sharding(shape_info, node, opt_strtg_per_mesh_dim):
         shape = list(shape_info[node.name]["shape"])
         if len(shape) == 0:  # for scalar tensor
             return torch.Size(shape)
         node_name = node.name
         spmd_mesh = get_device_mesh("spmd")
 
-        for device_num, dim_strtg in zip(spmd_mesh.mesh.shape, opt_strtg_per_dim):
+        for device_num, dim_strtg in zip(spmd_mesh.mesh.shape, opt_strtg_per_mesh_dim):
             if node.target is operator.getitem: # getitem is not node in meta graph
                 assert len(dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]) == 1, "var should have single input and single output"
                 spmd_strtg = dim_strtg[node.args[0].name]['strategy'].out_strtg_group[node.args[1]]
-            elif node_name in dim_strtg:  # some ops like torch.ops.aten.scalar_tensor.default have no invars, thus no strategy (see MetaNode.get_strtg_pool)
+            elif node_name in dim_strtg:  # some ops like torch.ops.aten.scalar_tensor.default have no invars, thus no strategy (see MetaNode.build_or_get_strtg_pool)
                 assert len(dim_strtg[node_name]['strategy'].out_strtg_group) == 1, "var should have single input and single output"
                 spmd_strtg = dim_strtg[node_name]['strategy'].out_strtg_group[0]
             else:
@@ -105,9 +106,9 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
                 compact_out_idx_tbl = [0]
                 # apply previous sharding over the var
                 # if node.target is operator.getitem:
-                #     shape = apply_previous_sharding(shape_info, node.args[0], opt_strtg_per_dim)
+                #     shape = apply_previous_sharding(shape_info, node.args[0], opt_strtg_per_mesh_dim)
                 # else:
-                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_mesh_dim)
                 meta_var = MetaVar(name=node.name,
                                    shape=shape,
                                    dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
@@ -157,7 +158,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
         elif node.op in ["placeholder", "get_attr"]:
             if shape_info[node.name] != {}:
                 # 1.1. create MetaVar
-                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_dim)
+                shape = apply_previous_sharding(shape_info, node, opt_strtg_per_mesh_dim)
                 meta_var = MetaVar(name=node.name,
                                    shape=shape,
                                    dtype=ABSTRACT_DTYPE[shape_info[node.name]["dtype"]])
@@ -219,7 +220,7 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
         state_io_map[meta_graph.input_list[i]] = meta_graph.output_list[i]
     meta_graph.state_io_map = state_io_map
 
-    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level, opt_strtg_per_dim=opt_strtg_per_dim)
+    meta_graph.coarsen(coarsen_level=mdconfig.coarsen_level, opt_strtg_per_mesh_dim=opt_strtg_per_mesh_dim)
 
     return meta_graph
 

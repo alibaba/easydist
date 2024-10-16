@@ -19,6 +19,7 @@ from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch.distributed._tensor import DeviceMesh
+from functools import lru_cache
 
 if torch.__version__ >= (2, 3):
     from torch.distributed._tensor.device_mesh import _mesh_resources as mesh_resources
@@ -135,6 +136,7 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
 
     logger.info(f"set_device_mesh: {torch_mesh}")
 
+@lru_cache(maxsize=1024)
 def get_device_mesh(*dim_names) -> NDDeviceMesh:
     if __GLOBAL_ND_DEVICEMESH is None:
         raise RuntimeError("Device mesh hasn't been set, please set a Torch device mesh first.")

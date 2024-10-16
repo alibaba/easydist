@@ -181,7 +181,7 @@ def main():
     torch.distributed.init_process_group(backend="nccl")
     world_size = int(os.environ["WORLD_SIZE"])
     if spmd0 * spmd1 != world_size:
-        raise ValueError("spmd0 * spmd1 should be equal to world_size")
+        raise ValueError(f"spmd0({spmd0}) * spmd1({spmd1}) should be equal to world_size({world_size})")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device_mesh = DeviceMesh('cuda', torch.arange(world_size).reshape(spmd0, spmd1), mesh_dim_names=['spmd0', 'spmd1'])
