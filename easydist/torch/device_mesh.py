@@ -34,6 +34,11 @@ class NDDeviceMesh(DeviceMesh):
     def __init__(self, torch_mesh: DeviceMesh):
         self._device_mesh = torch_mesh
         self._binding = {}
+
+        for name, dim_sz in zip(torch_mesh.mesh_dim_names, torch_mesh.mesh.shape):
+            if dim_sz <= 1:
+                raise RuntimeError(f"{name} dimenstion size must be greater than 1")
+
         if self._device_mesh.mesh_dim_names is None:
             raise RuntimeError("mesh_dim_names is required")
 
@@ -68,7 +73,12 @@ class NDDeviceMesh(DeviceMesh):
             coord_cp[dim] = slice(None)
         submesh_mesh = self._device_mesh.mesh[coord_cp]
 
-        submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names)
+        if torch.__version__ < (2, 3):
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_process_groups=False)
+        elif torch.__version__ == (2, 3, 0):
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names)
+        else:
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_backend=False)
 
         submesh._dim_group_infos = [self._device_mesh._dim_group_infos[i] for i in target_dims]
         mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
@@ -134,7 +144,7 @@ if __name__ == "__main__":
     import os
     rank = int(os.environ.get("RANK"))
 
-    set_device_mesh(DeviceMesh("cpu", [
+    set_device_mesh(DeviceMesh("cuda", [
         [
             [0, 1], # spmd1 ->
             [2, 3]
