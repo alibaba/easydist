@@ -602,7 +602,7 @@ def do_p2p_comm_wrapper(global_shape: torch.Size, src_placements: VarSPMDStrateg
         return local_tensor
     return inner
 
-
+# modified from https://github.com/pytorch/pytorch/blob/46525abb714ad2a9791dfdecad5a0279a76d405e/torch/distributed/tensor/_redistribute.py#L30
 def _gen_transform_infos_greedy(
     src_placements: VarSPMDStrategy,
     dst_placements: VarSPMDStrategy,
@@ -627,9 +627,9 @@ def _gen_transform_infos_greedy(
             if current_mesh_sharding != target_mesh_sharding:
                 dst = SPMD(SPMD.REPLICATE)
 
-            if cur != dst:
-                transform_infos.append((i, cur, dst))
-                cur_placements[i] = dst
+        if cur != dst:
+            transform_infos.append((i, cur, dst))
+            cur_placements[i] = dst
 
     for i, (cur, dst) in enumerate(zip(cur_placements, dst_placements)):
         if cur != dst:
