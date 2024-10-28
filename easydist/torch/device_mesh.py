@@ -13,8 +13,8 @@
 # ==============================================================================
 
 import logging
-
 from copy import deepcopy
+from functools import cache
 from typing import Dict, Optional, Sequence, Union
 
 import torch
@@ -34,9 +34,14 @@ class NDDeviceMesh(DeviceMesh):
     def __init__(self, torch_mesh: DeviceMesh):
         self._device_mesh = torch_mesh
         self._binding = {}
+
+        for name, dim_sz in zip(torch_mesh.mesh_dim_names, torch_mesh.mesh.shape):
+            if dim_sz <= 1:
+                raise RuntimeError(f"{name} dimenstion size must be greater than 1")
+
         if self._device_mesh.mesh_dim_names is None:
             raise RuntimeError("mesh_dim_names is required")
-    
+
     def __check_valid_names(self, dim_names: Sequence[str]):
         for name in dim_names:
             if name not in self._device_mesh.mesh_dim_names:
@@ -45,7 +50,7 @@ class NDDeviceMesh(DeviceMesh):
     def __map_binding(self, dim_names: Union[str, Sequence[str]]) -> Sequence[str]:
         if isinstance(dim_names, str):
             dim_names = [dim_names]
-        
+
         if len(dim_names) == 1:
             name = dim_names[0]
             if name in self._binding:
@@ -58,6 +63,7 @@ class NDDeviceMesh(DeviceMesh):
     def __get_dims(self, dim_names: Sequence[str]) -> Sequence[int]:
         return [self._device_mesh.mesh_dim_names.index(name) for name in dim_names]
 
+    @cache
     def __getitem__(self, names: Union[str, Sequence[str]]) -> 'NDDeviceMesh':
         names = self.__map_binding(names)
         # self coordinates
@@ -67,7 +73,12 @@ class NDDeviceMesh(DeviceMesh):
             coord_cp[dim] = slice(None)
         submesh_mesh = self._device_mesh.mesh[coord_cp]
 
-        submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names)
+        if torch.__version__ < (2, 3):
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_process_groups=False)
+        elif torch.__version__ == (2, 3, 0):
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names)
+        else:
+            submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_backend=False)
 
         submesh._dim_group_infos = [self._device_mesh._dim_group_infos[i] for i in target_dims]
         mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
@@ -115,6 +126,9 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
         for bind_func in __DEFAULT_BINDINGS:
             bind_func(__GLOBAL_ND_DEVICEMESH)
 
+    # TODO @botbw: better implementation for mesh initializtion
+    _ = get_device_mesh('spmd')
+
     logger.info(f"set_device_mesh: {torch_mesh}")
 
 def get_device_mesh(*dim_names) -> NDDeviceMesh:
@@ -123,13 +137,14 @@ def get_device_mesh(*dim_names) -> NDDeviceMesh:
 
     if len(dim_names) > 0:
         return __GLOBAL_ND_DEVICEMESH[dim_names]
+
     return __GLOBAL_ND_DEVICEMESH
 
 if __name__ == "__main__":
     import os
     rank = int(os.environ.get("RANK"))
 
-    set_device_mesh(DeviceMesh("cpu", [
+    set_device_mesh(DeviceMesh("cuda", [
         [
             [0, 1], # spmd1 ->
             [2, 3]
@@ -150,4 +165,3 @@ if __name__ == "__main__":
         print(mesh['pp'].get_coordinate())
         print(mesh['spmd'])
         print(get_device_mesh('spmd'))
-
