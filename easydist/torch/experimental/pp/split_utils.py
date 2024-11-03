@@ -215,6 +215,7 @@ def split(ret):
     ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
 
+fw_bw_splitted = False
 class SplitPatcher(_Patcher):
 
     def __init__(self, module: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -232,11 +233,16 @@ class SplitPatcher(_Patcher):
                              retain_graph: bool = None,
                              create_graph: bool = False,
                              inputs: Optional[Sequence[torch.Tensor]] = None):
-            tensor_list = [self] + (inputs or [])
-            tensor_list = split_func_without_bw(tensor_list)
-            self, inputs = tensor_list[0], tensor_list[1:]
-            if len(inputs) == 0:
-                inputs = None
+            global fw_bw_splitted
+            if not fw_bw_splitted:
+                # NOTE: temp fix because backward() may be called more than one
+                #       time in torch 2.5
+                tensor_list = [self] + (inputs or [])
+                tensor_list = split_func_without_bw(tensor_list)
+                self, inputs = tensor_list[0], tensor_list[1:]
+                fw_bw_splitted = True
+                if len(inputs) == 0:
+                    inputs = None
             orig_backward(self, gradient, retain_graph, create_graph, inputs)
             set_backward_flag(True)
 

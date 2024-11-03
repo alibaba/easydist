@@ -27,13 +27,22 @@ import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed._functional_collectives import _expand_group
 from torch.distributed._tensor import DTensor, Replicate
-from torch.distributed._tensor.ops.view_ops import (
-    compute_local_shape,
-    expand,
-    normalize_sizes,
-    propagate_shape_and_sharding,
-    view_groups,
-)
+if torch.__version__ >= (2, 4):
+    from torch.distributed.tensor._utils import compute_local_shape
+    from torch.distributed.tensor._ops._view_ops import (
+        expand,
+        normalize_sizes,
+        propagate_shape_and_sharding,
+        view_groups,
+    )
+else:
+    from torch.distributed._tensor.ops.view_ops import (
+        compute_local_shape,
+        expand,
+        normalize_sizes,
+        propagate_shape_and_sharding,
+        view_groups,
+    )
 from torch.fx.node import Node, map_arg
 
 import easydist.config as mdconfig
@@ -810,16 +819,28 @@ def override_args(node, invars_strategy):
         input_dtensor_spec = [to_torch_spmd(i) for i in invars_strategy[0]]
         rules = view_op_map[node.target](global_in_shape, node.args[shape_argnum])
 
-        (
-            global_out_shape,
-            shard_out,
-            shardable_dims,
-        ) = propagate_shape_and_sharding(
-            input_dtensor_spec,
-            tuple(global_in_shape),
-            rules,
-            tuple(spmd_mesh.mesh.shape),
-        )
+        if torch.__version__ >= (2, 4):
+            global_out_shape = node.meta['val'].shape
+            (
+                _,
+                shard_out,
+            ) = propagate_shape_and_sharding(
+                input_dtensor_spec,
+                tuple(global_in_shape),
+                rules,
+                tuple(spmd_mesh.mesh.shape),
+            )
+        else:
+            (
+                global_out_shape,
+                shard_out,
+                shardable_dims,
+            ) = propagate_shape_and_sharding(
+                input_dtensor_spec,
+                tuple(global_in_shape),
+                rules,
+                tuple(spmd_mesh.mesh.shape),
+            )
 
         if shard_out is None:  # no need to reshard
             shard_out = input_dtensor_spec

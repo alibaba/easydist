@@ -162,7 +162,10 @@ class CompiledFuncWrapper:
                 if importlib.util.find_spec("torch.distributed._functional_collectives"):
                     # wait all AsyncCollectiveTensor and unwrap AsyncCollectiveTensor
                     from torch.distributed._functional_collectives import AsyncCollectiveTensor
-                    from torch.distributed._functional_collectives_impl import _wait_all
+                    if torch.__version__ >= (2, 4):
+                        from torch.distributed.rpc.api import _wait_all
+                    else:
+                        from torch.distributed._functional_collectives_impl import _wait_all
                     _wait_all()
 
                     def wait_unwarp_fn(async_coll_tensor_):

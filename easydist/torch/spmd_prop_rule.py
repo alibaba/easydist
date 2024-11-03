@@ -10,11 +10,19 @@ from typing import cast
 
 import torch
 from torch._meta_registrations import calc_conv_nd_return_shape
-from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
-from torch.distributed._tensor.ops.common_rules import pointwise_rule
-from torch.distributed._tensor.ops.tensor_ops import prop_index
-from torch.distributed._tensor.ops.utils import register_prop_rule
-from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate, Shard, _Partial)
+if torch.__version__ >= (2, 4):
+    from torch.distributed.tensor._op_schema import OpSchema, OutputSharding
+    from torch.distributed.tensor._ops._common_rules import pointwise_rule
+    from torch.distributed.tensor._ops._tensor_ops import prop_index
+    from torch.distributed.tensor._ops.utils import register_prop_rule
+    from torch.distributed._tensor.placement_types import DTensorSpec
+    from torch.distributed.tensor.placement_types import (Replicate, Shard, _Partial)
+else:
+    from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
+    from torch.distributed._tensor.ops.common_rules import pointwise_rule
+    from torch.distributed._tensor.ops.tensor_ops import prop_index
+    from torch.distributed._tensor.ops.utils import register_prop_rule
+    from torch.distributed._tensor.placement_types import (DTensorSpec, Replicate, Shard, _Partial)
 from easydist.torch.utils import get_dtensor_spec
 
 aten = torch.ops.aten

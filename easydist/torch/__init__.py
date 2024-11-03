@@ -16,7 +16,10 @@ import os
 
 import torch
 from torch._functorch import config
-from torch.distributed._tensor.op_schema import OpSchema
+if torch.__version__ >= (2, 4):
+    from torch.distributed.tensor._op_schema import OpSchema
+else:
+    from torch.distributed._tensor.op_schema import OpSchema
 
 from .api import easydist_compile
 from .bridge import torch2meta_graph

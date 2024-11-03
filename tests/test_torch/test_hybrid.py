@@ -16,6 +16,7 @@ from copy import deepcopy
 from functools import reduce
 
 import pytest
+import functools
 import torch.distributed as dist
 
 import easydist.config as mdconfig
@@ -60,7 +61,11 @@ def inner(module_cls, split_ann, schedule_cls, optim, spmd_size):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
-    set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(-1, *spmd_size), mesh_dim_names=['pp', *[f'spmd{i}' for i in range(len(spmd_size))]]))
+    spmd_world_size = functools.reduce((lambda x, y: x * y), spmd_size)
+    if spmd_world_size == world_size:
+        set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(*spmd_size), mesh_dim_names=[*[f'spmd{i}' for i in range(len(spmd_size))]]))
+    else:
+        set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(-1, *spmd_size), mesh_dim_names=['pp', *[f'spmd{i}' for i in range(len(spmd_size))]]))
 
     device = torch.device("cuda")
     module_torch = module_cls().to(device)
@@ -163,6 +168,7 @@ def test_runtime_world_4_spmd_only(module_cls, split_ann, schedule_cls, optim):
 @pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, spmd_size", [
     (TEST_GPT, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'adam', (2, )),
     (TEST_GPT, {'blocks.1'}, ScheduleDAPPLE, 'adam', (2, 2)),
+    (TEST_GPT, None, None, 'adam', (2, 4)),
 ])
 @pytest.mark.timeout(400)
 def test_runtime_world_8(module_cls, split_ann, schedule_cls, optim, spmd_size):

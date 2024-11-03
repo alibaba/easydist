@@ -17,7 +17,10 @@ import logging
 import torch
 import torch.utils._pytree as pytree
 from torch.fx.node import _get_qualified_name
-from torch.distributed._functional_collectives_impl import _wait_all
+if torch.__version__ >= (2, 4):
+    from torch.distributed.rpc.api import _wait_all
+else:
+    from torch.distributed._functional_collectives_impl import _wait_all
 
 import easydist.config as mdconfig
 from easydist.torch.utils import EDNodeType

@@ -82,7 +82,10 @@ class NDDeviceMesh(DeviceMesh):
             submesh = DeviceMesh(device_type=self._device_mesh.device_type, mesh=submesh_mesh, mesh_dim_names=names, _init_backend=False)
 
         submesh._dim_group_infos = [self._device_mesh._dim_group_infos[i] for i in target_dims]
-        mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
+        if torch.__version__ >= (2, 4):
+            mesh_resources.child_to_root_mapping[self._device_mesh] = submesh
+        else:
+            mesh_resources.child_to_parent_mapping[self._device_mesh] = submesh
 
         return NDDeviceMesh(submesh)
 

@@ -24,11 +24,15 @@ from dataclasses import dataclass
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 import torch.distributed.distributed_c10d as c10d
-import torch.distributed._tensor as spmd
+if torch.__version__ >= (2, 4):
+    import torch.distributed.tensor as spmd
+    from torch.distributed.tensor._utils import compute_local_shape
+else:
+    import torch.distributed._tensor as spmd
+    from torch.distributed._tensor.ops.view_ops import compute_local_shape
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.utils._mode_utils import no_dispatch
 import torch.utils._pytree as pytree
-from torch.distributed._tensor.ops.view_ops import compute_local_shape
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch._guards import detect_fake_mode
 

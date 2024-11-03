@@ -17,8 +17,12 @@ from typing import Dict, Tuple
 
 import torch
 from torch.distributed._tensor.api import DTensor
-from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
-from torch.distributed._tensor.placement_types import (Replicate, Shard, _Partial)
+if torch.__version__ >= (2, 4):
+    from torch.distributed.tensor._op_schema import OpSchema, OutputSharding
+    from torch.distributed.tensor.placement_types import (Replicate, Shard, _Partial)
+else:
+    from torch.distributed._tensor.op_schema import OpSchema, OutputSharding
+    from torch.distributed._tensor.placement_types import (Replicate, Shard, _Partial)
 from torch.fx.node import _get_qualified_name
 
 from easydist.torch.device_mesh import get_device_mesh
